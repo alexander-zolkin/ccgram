@@ -119,18 +119,18 @@ When creating a topic via the directory browser, users can choose the provider (
 
 ### Provider Capability Matrix
 
-| Capability       | Claude                          | Codex                          | Gemini                                                           | Pi                              | Shell                       |
-| ---------------- | ------------------------------- | ------------------------------ | ---------------------------------------------------------------- | ------------------------------- | --------------------------- |
-| Hook events      | Yes (all supported event types) | Yes (`SessionStart`, `Stop`)   | Yes (`SessionStart`, `AfterAgent`, `SessionEnd`, `Notification`) | Yes via hook-runner             | No                          |
-| Resume           | Yes (`--resume`)                | Yes (`resume`)                 | Yes (`--resume idx/latest`)                                      | Yes (`--session <path>`)        | No                          |
-| Continue         | Yes                             | Yes                            | Yes                                                              | Yes                             | No                          |
-| Transcript       | JSONL                           | JSONL                          | JSONL (incremental)                                              | JSONL (v3)                      | None                        |
-| Incremental read | Yes                             | Yes                            | Yes                                                              | Yes                             | No                          |
-| Commands         | Yes                             | Yes                            | Yes                                                              | Yes (builtins + skills)         | No                          |
-| Status detection | Hook events + pyte + spinner    | Stop hook + activity heuristic | AfterAgent hook + pane title                                     | Stop hook + transcript activity | Shell prompt idle detection |
-| YOLO auto-accept | Yes                             | No                             | No                                                               | No                              | No                          |
-| Mode scraping    | Yes (mode-line parse)           | No                             | No                                                               | No                              | No                          |
-| RC feedback      | Yes (probe after `/remote-control`) | No                         | No                                                               | No                              | No                          |
+| Capability       | Claude                              | Codex                          | Gemini                                                           | Pi                              | Shell                       |
+| ---------------- | ----------------------------------- | ------------------------------ | ---------------------------------------------------------------- | ------------------------------- | --------------------------- |
+| Hook events      | Yes (all supported event types)     | Yes (`SessionStart`, `Stop`)   | Yes (`SessionStart`, `AfterAgent`, `SessionEnd`, `Notification`) | Yes via hook-runner             | No                          |
+| Resume           | Yes (`--resume`)                    | Yes (`resume`)                 | Yes (`--resume idx/latest`)                                      | Yes (`--session <path>`)        | No                          |
+| Continue         | Yes                                 | Yes                            | Yes                                                              | Yes                             | No                          |
+| Transcript       | JSONL                               | JSONL                          | JSONL (incremental)                                              | JSONL (v3)                      | None                        |
+| Incremental read | Yes                                 | Yes                            | Yes                                                              | Yes                             | No                          |
+| Commands         | Yes                                 | Yes                            | Yes                                                              | Yes (builtins + skills)         | No                          |
+| Status detection | Hook events + pyte + spinner        | Stop hook + activity heuristic | AfterAgent hook + pane title                                     | Stop hook + transcript activity | Shell prompt idle detection |
+| YOLO auto-accept | Yes                                 | No                             | No                                                               | No                              | No                          |
+| Mode scraping    | Yes (mode-line parse)               | No                             | No                                                               | No                              | No                          |
+| RC feedback      | Yes (probe after `/remote-control`) | No                             | No                                                               | No                              | No                          |
 
 Capabilities gate UX per-window: recovery keyboard only shows Continue/Resume buttons when supported; `ccgram doctor` checks managed hook installs for Claude, Codex, and Gemini. Pi hook support is supplied by cc-thingz hook-runner; transcript/process detection remains fallback for all non-shell agents.
 

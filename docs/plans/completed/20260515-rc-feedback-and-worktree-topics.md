@@ -16,6 +16,7 @@ Two user-visible features that share a release. Both shipped together as v3.1.0.
 **Files / components involved:**
 
 Feature 1 — RC feedback:
+
 - `src/ccgram/handlers/status/status_bar_actions.py` — `_handle_remote_control` (line ~208) — status-bubble button entry
 - `src/ccgram/handlers/commands/forward.py` — `forward_command_handler` `cc_name in ("remote-control", "rc")` branch (line ~133) — forwarded-slash entry
 - `src/ccgram/handlers/polling/polling_state.py` — `TerminalScreenBuffer.is_rc_active(window_id)` already exists as a fallback signal
@@ -24,6 +25,7 @@ Feature 1 — RC feedback:
 - `src/ccgram/handlers/messaging_pipeline/message_sender.py` — `safe_send` for final reply
 
 Feature 2 — worktree:
+
 - `src/ccgram/handlers/topics/directory_browser.py` — `build_provider_picker`, `build_mode_picker` (current 5-step flow stops at provider/mode)
 - `src/ccgram/handlers/topics/directory_callbacks.py` — `handle_directory_callback` dispatcher (line ~68), `_handle_confirm` (line ~91)
 - `src/ccgram/handlers/callback_data.py` — `CB_DIR_*`, `CB_PROV_SELECT`, `CB_MODE_SELECT` constants live here
@@ -31,6 +33,7 @@ Feature 2 — worktree:
 - `src/ccgram/window_state_store.py` — `WindowState` dataclass + atomic serialization
 
 **Related patterns:**
+
 - Inline-keyboard flow with callback prefixes (e.g. `CB_DIR_SELECT`, `CB_PROV_SELECT`) dispatched via `callback_registry` — same pattern for new worktree callbacks.
 - `TelegramClient` Protocol throughout handlers — no `telegram.Bot` import. New handler code must follow.
 - Read path: `window_query` / `session_query` for reads; `session_manager.<attr>` only for documented writes (codified by `tests/ccgram/test_query_layer_only_for_handlers.py`).
@@ -38,6 +41,7 @@ Feature 2 — worktree:
 - Tests mirror source layout under `tests/ccgram/`; integration tests under `tests/integration/`. `asyncio_mode = "auto"`. No comments/docstrings in tests.
 
 **Dependencies identified:**
+
 - No new third-party packages. Worktree feature uses `subprocess.run` against `git` (already a runtime requirement of the host).
 - Existing dependencies sufficient: structlog, telegram (PTB), pathlib, asyncio.
 
@@ -91,12 +95,14 @@ A new step in the new-topic flow. Inserted between directory-confirm and provide
 ### Feature 1 — RC probe
 
 **`arm_rc_probe(window_id: str, client: TelegramClient) -> None`** in `handlers/status/rc_probe.py`:
+
 - ⚠️ Signature deviation from original plan: takes an explicit `client: TelegramClient`. There is no global bot accessor in the codebase, and F5 mandates explicit `TelegramClient` threading. Both Task 2 entry points already have a bot (`query.get_bot()` / `context.bot`) to wrap in `PTBTelegramClient`. The probe still "owns" its send path via `safe_send`.
 - Reads existing `rc_probe_state` from `WindowState`. If `armed`, returns early (double-tap guard).
 - Sets `rc_probe_state = "armed"`, `rc_armed_at = monotonic()`.
 - Schedules `_classify_loop(window_id)` via `asyncio.create_task`.
 
 **`_classify_loop(window_id: str)`** coroutine:
+
 - Sleeps 1.5s before first capture (gives Claude time to render the RC banner).
 - Captures pane via `tmux_manager.capture_pane`, scans the last ~30 lines.
 - Classifier (pure function `classify_rc_output(text: str) -> RCOutcome`):
@@ -108,6 +114,7 @@ A new step in the new-topic flow. Inserted between directory-confirm and provide
 - On any non-PENDING outcome OR on timeout: send the reply, set `rc_probe_state = "classified"`.
 
 **Reply formatting** (via `safe_send`, owns its own `TelegramClient`):
+
 - success with URL: `📡 Remote Control active — <code>URL</code>` (monospace formatting via existing entity helpers)
 - success without URL: `📡 Remote Control active.`
 - unavailable: `📡 Remote Control unavailable — <one-line reason>.`
@@ -115,6 +122,7 @@ A new step in the new-topic flow. Inserted between directory-confirm and provide
 - timeout: `📡 No response from /remote-control — check the pane.`
 
 **State on WindowState** (`window_state_store.py`):
+
 - `rc_probe_state: Literal["armed", "classified"] | None = None`
 - `rc_armed_at: float | None = None`
 
@@ -160,12 +168,14 @@ def build_worktree_confirm(
 ```
 
 **Callbacks added in `callback_data.py`:**
+
 - `CB_WT_USE_CURRENT = "wt:cur"` — keep current branch, fall through to provider picker (no worktree created)
 - `CB_WT_NEW = "wt:new"` — show confirm/edit screen with suggested branch
 - `CB_WT_CONFIRM = "wt:ok"` — create the worktree, fall through to provider picker with worktree path as cwd
 - `CB_WT_EDIT_NAME = "wt:ed"` — prompt for branch name via text reply, validate, then create
 
 **User-state keys added in `handlers/user_state.py`:**
+
 - `PENDING_WORKTREE_REPO` — selected repo path while in worktree flow
 - `PENDING_WORKTREE_BRANCH` — suggested or user-edited branch name
 - `PENDING_WORKTREE_PATH` — computed worktree path
@@ -174,6 +184,7 @@ def build_worktree_confirm(
 **`directory_callbacks._handle_confirm` change:** after directory is confirmed, call `check_worktree_eligibility(path)`. If eligible, edit-message to the worktree picker. If not, behave exactly as today (jump straight to provider picker).
 
 **`WindowState` extension** (`window_state_store.py`):
+
 - `worktree_path: str | None = None`
 - `worktree_branch: str | None = None`
 
@@ -191,6 +202,7 @@ Set on window creation in `topic_orchestration.py` when the flow took the worktr
 ### Task 1: RC probe — module + state fields
 
 **Files:**
+
 - Create: `src/ccgram/handlers/status/rc_probe.py`
 - Modify: `src/ccgram/window_state_store.py`
 - Create: `tests/ccgram/handlers/status/test_rc_probe.py`
@@ -207,13 +219,14 @@ Set on window creation in `topic_orchestration.py` when the flow took the worktr
 ### Task 2: Wire RC probe into both trigger paths
 
 **Files:**
+
 - Modify: `src/ccgram/handlers/status/status_bar_actions.py`
 - Modify: `src/ccgram/handlers/commands/forward.py`
 - Modify: `tests/ccgram/handlers/status/test_rc_probe.py` (extend)
 - Modify or create: `tests/ccgram/handlers/status/test_status_bar_actions.py`
 - Modify or create: `tests/ccgram/handlers/commands/test_forward.py`
 
-- [x] in `_handle_remote_control`: after `send_to_window(...)`, call `arm_rc_probe(window_id, PTBTelegramClient(query.get_bot()))` with a lazy-import marker (rc_probe pulls providers/__init__ — same deferral reason as `_handle_status_recall`). Signature deviation from Task 1 carried through: explicit `client` arg, no global bot accessor
+- [x] in `_handle_remote_control`: after `send_to_window(...)`, call `arm_rc_probe(window_id, PTBTelegramClient(query.get_bot()))` with a lazy-import marker (rc_probe pulls providers/**init** — same deferral reason as `_handle_status_recall`). Signature deviation from Task 1 carried through: explicit `client` arg, no global bot accessor
 - [x] in `forward.py`: extracted to helper `_arm_rc_probe_if_remote_control(update, window_id, cc_name)` (kept `forward_command_handler` under the C901 complexity-10 cap — mirrors the existing `_handle_clear_command` helper pattern); helper gates on `cc_name in ("remote-control", "rc")`, calls `arm_rc_probe(window_id, PTBTelegramClient(update.get_bot()))`, docstring states the Claude-only capability gate is internal
 - [x] unit tests in `test_status_bar_actions.py`: `test_arms_rc_probe_after_activation` (fake terminal_screen_buffer inactive → arm invoked with `@0` + `PTBTelegramClient`) and `test_does_not_arm_probe_when_already_active` (rc-active → not armed)
 - [x] unit tests in `test_forward.py`: `test_arms_rc_probe_for_claude_remote_control`, `test_arms_rc_probe_for_rc_alias`, `test_no_rc_probe_for_non_rc_command`, `test_no_rc_probe_for_codex_rejected_remote_control` (codex `/remote-control` rejected by `_command_known_in_other_provider` → arm not invoked, send not called)
@@ -222,6 +235,7 @@ Set on window creation in `topic_orchestration.py` when the flow took the worktr
 ### Task 3: Worktree helpers module
 
 **Files:**
+
 - Create: `src/ccgram/handlers/topics/worktree.py`
 - Create: `tests/ccgram/handlers/topics/test_worktree.py`
 
@@ -239,6 +253,7 @@ Set on window creation in `topic_orchestration.py` when the flow took the worktr
 ### Task 4: Worktree picker keyboards and callback constants
 
 **Files:**
+
 - Modify: `src/ccgram/handlers/callback_data.py`
 - Modify: `src/ccgram/handlers/topics/directory_browser.py`
 - Modify: `src/ccgram/handlers/user_state.py`
@@ -254,6 +269,7 @@ Set on window creation in `topic_orchestration.py` when the flow took the worktr
 ### Task 5: Wire worktree picker into directory flow
 
 **Files:**
+
 - Modify: `src/ccgram/handlers/topics/directory_callbacks.py`
 - Modify: `src/ccgram/handlers/topics/topic_orchestration.py`
 - Modify: `src/ccgram/window_state_store.py`
@@ -261,7 +277,7 @@ Set on window creation in `topic_orchestration.py` when the flow took the worktr
 - Modify: `tests/ccgram/handlers/topics/test_directory_callbacks.py` (or create)
 
 - [x] add `worktree_path: str | None = None`, `worktree_branch: str | None = None` to `WindowState`; serialize and load (backward-compat for old state.json) — `to_dict` omits when unset, `from_dict` uses `.get()` for old files
-- [x] in `handle_directory_callback`, add prefix dispatches for the four new CB_WT_* constants — routed via one `_handle_worktree_callback` sub-dispatcher (keeps `handle_directory_callback` under the PLR0912 branch cap) + added to the `@register(...)` list
+- [x] in `handle_directory_callback`, add prefix dispatches for the four new CB*WT*\* constants — routed via one `_handle_worktree_callback` sub-dispatcher (keeps `handle_directory_callback` under the PLR0912 branch cap) + added to the `@register(...)` list
 - [x] in `_handle_confirm`: after directory is confirmed, call `check_worktree_eligibility`. If eligible → store repo path + dirty flag in user_data and edit-message to worktree picker. If not → fall through to provider picker as today (extracted `_show_provider_picker` helper)
 - [x] implement `_handle_wt_use_current`: clear worktree user_data, fall through to provider picker with the original directory as cwd
 - [x] implement `_handle_wt_new`: suggest branch name, store in user_data, edit-message to worktree confirm (dirty cached from `_handle_confirm` via `PENDING_WORKTREE_DIRTY` — no re-probe)
@@ -288,6 +304,7 @@ Set on window creation in `topic_orchestration.py` when the flow took the worktr
 ### Task 7: Update documentation
 
 **Files:**
+
 - Modify: `CLAUDE.md`
 - Modify: `.claude/rules/architecture.md`
 - Modify: `.claude/rules/topic-architecture.md`
@@ -301,9 +318,10 @@ Set on window creation in `topic_orchestration.py` when the flow took the worktr
 
 ## Post-Completion
 
-*Items requiring manual intervention or external systems — no checkboxes, informational only.*
+_Items requiring manual intervention or external systems — no checkboxes, informational only._
 
 **Manual verification:**
+
 - Launch a dev bot instance, trigger `/remote-control` in a real Claude session, confirm the status reply renders with the URL as monospace and is tap-to-copy on mobile.
 - Confirm RC button → reply path and forwarded slash → reply path produce identical messages.
 - Trigger `/remote-control` on a Claude account without RC entitlement; confirm "📡 Remote Control unavailable — …" message appears.
@@ -312,6 +330,7 @@ Set on window creation in `topic_orchestration.py` when the flow took the worktr
 - Verify `state.json` round-trip with the new `worktree_path`/`worktree_branch` fields (kill bot, restart, confirm topic still resolves).
 
 **Release after merge:**
+
 - Bump to v3.1.0 via the existing release workflow (`git cliff --tag v3.1.0 --output CHANGELOG.md`, commit, tag, push). PyPI + Homebrew + GitHub Release auto-publish via `release.yml`.
 - Add v3.1.0 release notes highlighting both features with screenshots of the Telegram UI.
 
