@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.2] - 2026-06-02
+
+### Added
+
+- Pi-only `/followup <message>` command for queuing a follow-up in the active Pi prompt without submitting the current turn.
+
+### Changed
+
+- Align Pi slash-command forwarding and topic menus with current Pi commands, including `/new` and Telegram-safe `/scoped_models`.
+- Move ccgram's welcome/help flow to `/start`, keeping Pi `/clear` only as a hidden compatibility alias for `/new`.
+
+### Fixed
+
+- Prevent stale `dead` autoclose timers from deleting live Telegram topics after a session recovers or receives new user input.
+- Refresh stale Pi transcript paths when provider sessions rotate, so Telegram delivery and status tracking stay bound to the live session.
+- Label the README Caddy configuration fence for clearer rendered documentation.
+
 ## [3.5.1] - 2026-05-31
 
 ### Removed
