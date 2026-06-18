@@ -340,12 +340,19 @@ async def _rebind_existing_topic_by_name(
         )
         return False
     if exists is None:
+        # CCGRAM-HOTFIX:no-dup-on-probe-timeout — a Telegram probe that TimedOut
+        # ('exists is None') is INCONCLUSIVE, not 'dead'. Upstream falls through
+        # and creates a NEW topic, which spawns an orphan duplicate whenever
+        # Telegram is briefly slow (common during session resume). Prefer reusing
+        # the known same-name binding; if it really is dead, the dead-topic path
+        # ("Topic gone ... use /sync") recovers it later without a duplicate.
         logger.info(
-            "Could not probe same-name topic thread %d for stale window %s; not rebinding",
+            "Probe inconclusive for same-name topic thread %d (stale window %s); "
+            "rebinding optimistically to avoid duplicate (CCGRAM-HOTFIX)",
             thread_id,
             old_window_id,
         )
-        return False
+        # fall through to the rebind below instead of returning False
 
     thread_router.bind_thread(
         user_id, thread_id, event.window_id, window_name=topic_name

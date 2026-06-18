@@ -44,7 +44,11 @@ from .sessions_dashboard import sessions_command
 from .sync_command import sync_command
 from .text.text_handler import text_handler
 from .topics import new_command
-from .topics.topic_lifecycle import topic_closed_handler, topic_edited_handler
+from .topics.topic_lifecycle import (
+    topic_closed_handler,
+    topic_created_handler,  # CCGRAM-HOTFIX:sticky-create-name
+    topic_edited_handler,
+)
 from .upgrade import upgrade_command
 from .voice import handle_voice_message
 
@@ -104,6 +108,14 @@ def register_all(
         MessageHandler(
             filters.StatusUpdate.FORUM_TOPIC_CLOSED & group_filter,
             topic_closed_handler,
+        )
+    )
+    # CCGRAM-HOTFIX:sticky-create-name — capture the user's chosen topic name at
+    # creation so the first directory-bind doesn't clobber it with the cwd basename.
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.FORUM_TOPIC_CREATED & group_filter,
+            topic_created_handler,
         )
     )
     application.add_handler(

@@ -76,7 +76,7 @@ from .worktree import (
 )
 from ..callback_registry import register
 from ..messaging_pipeline.message_sender import safe_edit, safe_send
-from ..status.topic_emoji import format_topic_name_for_mode
+from ..status.topic_emoji import format_topic_name_for_mode, get_stored_topic_name
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
     PENDING_THREAD_ID,
@@ -382,7 +382,7 @@ def _subdir_within_repo(selected_path: str, repo_path: Path) -> str:
     """
     try:
         rel = Path(selected_path).resolve().relative_to(repo_path.resolve())
-    except ValueError, OSError:
+    except (ValueError, OSError):
         return ""
     return str(rel) if rel.parts else ""
 
@@ -922,11 +922,16 @@ async def _create_window_and_bind(  # noqa: PLR0915
         await safe_edit(query, f"✅ {message}")
         return
 
+    # CCGRAM-HOTFIX:sticky-bind-name — never clobber an existing topic title with
+    # the cwd/tmux window name on (re)bind. Prefer the sticky stored name; fall
+    # back to created_wname only for a genuinely new topic (no stored name yet).
+    _chat_id = thread_router.resolve_chat_id(user_id, pending_thread_id)
+    _label = get_stored_topic_name(_chat_id, pending_thread_id) or created_wname
     try:
         await context.bot.edit_forum_topic(
-            chat_id=thread_router.resolve_chat_id(user_id, pending_thread_id),
+            chat_id=_chat_id,
             message_thread_id=pending_thread_id,
-            name=format_topic_name_for_mode(created_wname, approval_mode),
+            name=format_topic_name_for_mode(_label, approval_mode),
         )
     except TelegramError as e:
         logger.debug("Failed to rename topic: %s", e)

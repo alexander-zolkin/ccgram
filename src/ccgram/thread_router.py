@@ -332,11 +332,20 @@ class ThreadRouter:
         for window_id, window_name in live_windows:
             old = self.window_display_names.get(window_id)
             if old and old != window_name:
-                self.window_display_names[window_id] = window_name
-                changed = True
+                # CCGRAM-HOTFIX:freeze-topic-name — Alexander does NOT want the
+                # topic to rename itself when the underlying tmux window gets
+                # renamed (by the harness / a new session). The Telegram topic
+                # name is the source of truth: only explicit set_display_name
+                # (manual TG rename via forum_topic_edited, or first bind) may
+                # change it. So we IGNORE tmux-side renames here instead of
+                # propagating them to the topic title.
                 logger.debug(
-                    "Synced display name: %s %s → %s", window_id, old, window_name
+                    "Ignoring tmux rename (frozen): %s %s → %s (topic title kept)",
+                    window_id,
+                    old,
+                    window_name,
                 )
+                continue
         if changed:
             self._schedule_save()
         return changed

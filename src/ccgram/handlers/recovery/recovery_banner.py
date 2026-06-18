@@ -48,7 +48,7 @@ from ..callback_data import (
 )
 from ..callback_helpers import get_thread_id
 from ..messaging_pipeline.message_sender import safe_edit, safe_send
-from ..status.topic_emoji import format_topic_name_for_mode
+from ..status.topic_emoji import format_topic_name_for_mode, get_stored_topic_name
 from ..user_state import (
     PENDING_THREAD_ID,
     PENDING_THREAD_TEXT,
@@ -147,7 +147,15 @@ def render_banner(banner: RecoveryBanner) -> tuple[str, InlineKeyboardMarkup]:
     keyboard = build_recovery_keyboard(banner.window_id)
     help_text = _recovery_help_text(banner.window_id)
     cwd_line = f"\n\U0001f4c2 `{banner.cwd}`" if banner.cwd else ""
-    label = banner.display or banner.window_id
+    # CCGRAM-HOTFIX:ended-banner-sticky-name — prefer the sticky stored topic
+    # name over the tmux/cwd-derived display, so "Session … ended." (and the
+    # restore/resume banners) read the user's topic title (e.g. "Test"), not the
+    # drifted window name ("workspace"). Mirrors the bind paths below.
+    label = (
+        get_stored_topic_name(banner.chat_id, banner.thread_id)
+        or banner.display
+        or banner.window_id
+    )
 
     if banner.mode == "restore":
         title = f"\U0001f504 Restore `{label}`."
@@ -265,6 +273,14 @@ async def _create_and_bind_window(
         await query.answer("Failed")
         return False
 
+    # CCGRAM-HOTFIX:fresh-no-dup-topic — mirror the directory flow's MC-2967
+    # race-guard. The awaits below (wait_for_session_map_entry) yield the event
+    # loop; without this tag SessionMonitor's poll sees the new unbound window
+    # and auto-creates a DUPLICATE topic named after the tmux window
+    # ("workspace-3") before bind_thread() runs. Cleared right after the bind.
+    from ..topics import topic_orchestration
+    topic_orchestration.register_pending_creation(created_wid)
+
     if provider.capabilities.supports_hook:
         await session_map_sync.wait_for_session_map_entry(created_wid)
 
@@ -275,16 +291,22 @@ async def _create_and_bind_window(
     thread_router.bind_thread(
         user_id, thread_id, created_wid, window_name=created_wname
     )
+    # CCGRAM-HOTFIX:fresh-no-dup-topic — bind is durable; release the race-guard
+    # so late SessionMonitor polls take the already-bound branch.
+    topic_orchestration.clear_pending_creation(created_wid)
     chat = query.message.chat if query.message else None
     if chat and chat.type in ("group", "supergroup"):
         thread_router.set_group_chat_id(user_id, thread_id, chat.id)
 
     client = PTBTelegramClient(context.bot)
+    # CCGRAM-HOTFIX:sticky-bind-name — keep an existing topic title on recovery bind.
+    _chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+    _label = get_stored_topic_name(_chat_id, thread_id) or created_wname
     try:
         await client.edit_forum_topic(
-            chat_id=thread_router.resolve_chat_id(user_id, thread_id),
+            chat_id=_chat_id,
             message_thread_id=thread_id,
-            name=format_topic_name_for_mode(created_wname, approval_mode),
+            name=format_topic_name_for_mode(_label, approval_mode),
         )
     except TelegramError as e:
         logger.debug("Failed to rename topic: %s", e)

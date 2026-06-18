@@ -35,7 +35,7 @@ from .directory_browser import (
 )
 from ..callback_registry import register
 from ..messaging_pipeline.message_sender import safe_edit, safe_send
-from ..status.topic_emoji import format_topic_name_for_mode
+from ..status.topic_emoji import format_topic_name_for_mode, get_stored_topic_name
 from ..user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
 
 if TYPE_CHECKING:
@@ -228,12 +228,16 @@ async def _handle_bind(
         thread_id=thread_id,
     )
 
+    # CCGRAM-HOTFIX:sticky-bind-name — preserve an existing topic title on adopt;
+    # prefer the sticky stored name over the adopted window's name.
+    _chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+    _label = get_stored_topic_name(_chat_id, thread_id) or display
     try:
         await client.edit_forum_topic(
-            chat_id=thread_router.resolve_chat_id(user_id, thread_id),
+            chat_id=_chat_id,
             message_thread_id=thread_id,
             name=format_topic_name_for_mode(
-                display, window_query.get_approval_mode(selected_wid)
+                _label, window_query.get_approval_mode(selected_wid)
             ),
         )
     except TelegramError as e:

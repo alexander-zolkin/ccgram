@@ -285,6 +285,43 @@ async def topic_closed_handler(
         )
 
 
+async def topic_created_handler(
+    update: Update, _context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """CCGRAM-HOTFIX:sticky-create-name — seed the sticky topic-name store the
+    moment a forum topic is created, so a user-chosen name survives the FIRST
+    directory-bind (which would otherwise clobber it with the cwd basename,
+    because nothing is stored yet). Symmetric to topic_edited_handler; needs no
+    window binding — update_stored_topic_name only writes the (chat,thread) store.
+    """
+    user = update.effective_user
+    if not user or not config.is_user_allowed(user.id):
+        return
+    if not update.message or not update.message.forum_topic_created:
+        return
+
+    name = update.message.forum_topic_created.name
+    if not name:
+        return
+
+    # Lazy: handlers.callback_helpers / handlers.status cycle
+    from ..callback_helpers import get_thread_id
+    from ..status.topic_emoji import strip_emoji_prefix, update_stored_topic_name
+
+    thread_id = get_thread_id(update)
+    if thread_id is None:
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+
+    clean_name = strip_emoji_prefix(name)
+    update_stored_topic_name(chat_id, thread_id, clean_name)
+    logger.info(
+        "Topic created: seeded sticky name %r (thread=%d)", clean_name, thread_id
+    )
+
+
 async def topic_edited_handler(
     update: Update, _context: ContextTypes.DEFAULT_TYPE
 ) -> None:

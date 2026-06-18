@@ -15,6 +15,8 @@ Key functions:
   - clear_topic_emoji_state: Clean up tracking for a topic
 """
 
+import json
+import os
 import time
 
 import structlog
@@ -101,21 +103,70 @@ _topic_names: dict[tuple[int, int], str] = {}
 # Chats where editForumTopic is disabled due to permission errors
 _disabled_chats: set[int] = set()
 
+# CCGRAM-HOTFIX:sticky-topic-name — persist base topic names keyed by the STABLE
+# (chat_id, thread_id) so they survive daemon restarts and new tmux windows.
+# Alexander owns the topic text; ccgram only manages the leading status emoji.
+# The tmux window name must never re-impose itself on the title. Only a genuine
+# Telegram rename (forum_topic_edited → update_stored_topic_name) changes text.
+_TOPIC_NAMES_PATH = os.path.expanduser("~/.ccgram/topic_base_names.json")
+
+
+def _persist_topic_names() -> None:
+    """Atomically write the clean base-name cache to disk."""
+    try:
+        data = {f"{c}:{t}": n for (c, t), n in _topic_names.items()}
+        tmp = f"{_TOPIC_NAMES_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, _TOPIC_NAMES_PATH)
+    except OSError as e:
+        logger.debug("Could not persist topic base names: %s", e)
+
+
+def _load_topic_names() -> None:
+    """Seed the in-memory base-name cache from disk on startup."""
+    try:
+        with open(_TOPIC_NAMES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    for k, v in data.items():
+        c, _, t = k.partition(":")
+        try:
+            _topic_names[(int(c), int(t))] = v
+        except ValueError:
+            continue
+
+
+_load_topic_names()
+
+
+def get_stored_topic_name(chat_id: int, thread_id: int) -> str | None:
+    """CCGRAM-HOTFIX:sticky-bind-name — return the sticky clean base name for a
+    topic, or None if never seen.
+
+    Lets the (re)bind paths (directory-browser, window-adopt, autoresume) avoid
+    clobbering an existing topic title with the tmux/cwd window name. Mirrors the
+    sticky-topic-name rule: the Telegram topic TEXT is source of truth; the window
+    name must never re-impose itself.
+    """
+    return _topic_names.get((chat_id, thread_id))
+
 
 def _resolve_topic_name(key: tuple[int, int], display_name: str) -> tuple[str, bool]:
-    """Return the clean topic name and whether it changed.
+    """Return the sticky clean topic name and whether it changed.
 
-    On first call, strips emoji and stores the clean name. On subsequent calls,
-    if the incoming display_name (stripped) differs from the stored name,
-    overwrites the cache so tmux renames propagate to Telegram.
+    CCGRAM-HOTFIX:sticky-topic-name — first sight of a topic seeds the base name
+    from the current title and persists it. Thereafter the tmux-derived
+    ``display_name`` is IGNORED: ccgram never re-imposes the window name onto the
+    topic. Only ``update_stored_topic_name`` (a genuine Telegram rename) mutates
+    the stored text.
     """
-    clean = strip_emoji_prefix(display_name)
     cached = _topic_names.get(key)
     if cached is None:
+        clean = strip_emoji_prefix(display_name)
         _topic_names[key] = clean
-        return clean, True
-    if cached != clean:
-        _topic_names[key] = clean
+        _persist_topic_names()
         return clean, True
     return cached, False
 
@@ -352,11 +403,14 @@ def strip_emoji_prefix(name: str) -> str:
 def update_stored_topic_name(chat_id: int, thread_id: int, new_clean_name: str) -> None:
     """Overwrite the stored clean name for a topic.
 
-    Called from FORUM_TOPIC_EDITED handler. Does not invalidate _topic_states
-    since the Telegram topic already has the correct name — the next emoji
-    cycle will naturally use the updated base name.
+    Called from FORUM_TOPIC_EDITED handler. This is the ONLY path allowed to
+    mutate the stored text (a genuine Telegram rename by the user). Persists the
+    new name and drops the cached state token so the next emoji cycle re-applies
+    the status prefix onto the user's freshly-typed (emoji-less) name.
     """
     _topic_names[(chat_id, thread_id)] = new_clean_name
+    _persist_topic_names()
+    _topic_states.pop((chat_id, thread_id), None)
 
 
 @topic_state.register("chat")
@@ -365,7 +419,8 @@ def clear_topic_emoji_state(chat_id: int, thread_id: int) -> None:
     key = (chat_id, thread_id)
     _topic_states.pop(key, None)
     _pending_transitions.pop(key, None)
-    _topic_names.pop(key, None)
+    if _topic_names.pop(key, None) is not None:
+        _persist_topic_names()  # CCGRAM-HOTFIX:sticky-topic-name
 
 
 _MAX_DISABLED_CHATS = 1000
