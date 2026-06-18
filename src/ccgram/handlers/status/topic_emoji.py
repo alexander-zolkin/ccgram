@@ -211,8 +211,10 @@ def _compose_topic_name(
         parts.append(emoji)
     if rc_active:
         parts.append(EMOJI_RC)
-    if approval_mode == "yolo":
-        parts.append(EMOJI_YOLO)
+    # CCGRAM-HOTFIX:no-yolo-dice — Alexander asked to drop the 🎲 auto-approve
+    # badge from topic titles (keep 🟢/🟡 status). See ~/.ccgram/hotfixes/reapply.sh.
+    # if approval_mode == "yolo":
+    #     parts.append(EMOJI_YOLO)
     parts.append(clean_name)
     return " ".join(parts)
 
