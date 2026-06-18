@@ -12,7 +12,11 @@ import asyncio
 
 import structlog
 
-from ..claude_task_state import classify_wait_message, claude_task_state
+from ..claude_task_state import (
+    _WAITING_INPUT,  # CCGRAM-HOTFIX:no-interactive-on-idle-nudge
+    classify_wait_message,
+    claude_task_state,
+)
 from ..providers.base import HookEvent
 from ..session_lifecycle import session_lifecycle
 from ..telegram_client import TelegramClient
@@ -81,6 +85,16 @@ async def _handle_notification(event: HookEvent, client: TelegramClient) -> None
                 client, user_id, window_id, None, thread_id=thread_id
             )
 
+        # CCGRAM-HOTFIX:no-interactive-on-idle-nudge — "Claude is waiting for
+        # your input" is the 60s idle nudge, NOT a real interactive prompt.
+        # Rendering the interactive UI (screenshot + keyboard) on it spams the
+        # topic instead of relaying reply text (esp. right after resume).
+        # Genuine prompts (approval/plan) classify to a different header and
+        # keep their UI below; the window poller (_check_interactive_only)
+        # independently catches any real terminal-side interactive state.
+        if wait_header == _WAITING_INPUT:
+            continue
+
         if provider_name != "claude":
             message = str(event.data.get("message", "") or "Agent notification")
             await enqueue_status_update(
@@ -121,7 +135,7 @@ async def _get_llm_summary(transcript_path: str) -> str | None:
         from ..llm.summarizer import summarize_completion
 
         return await summarize_completion(transcript_path)
-    except RuntimeError, OSError, ValueError:
+    except (RuntimeError, OSError, ValueError):
         logger.debug("LLM summary failed", exc_info=True)
         return None
 
