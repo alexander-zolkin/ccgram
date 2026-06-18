@@ -12,6 +12,17 @@
 
 ---
 
+> ### 🍴 This is a fork
+> Fork of [`alexei-led/ccgram`](https://github.com/alexei-led/ccgram) with behavioural
+> hotfixes for Alexander's bridge (zero-tap auto-resume, sticky topic names, no
+> duplicate topics, Telegram-safe Markdown tables, and more). Each patch is a real
+> commit tagged in-source with `CCGRAM-HOTFIX:<name>`.
+> **See [`HOTFIXES.md`](HOTFIXES.md)** for the full list, the rationale per patch,
+> and the upstream-sync procedure. Install from this fork via
+> `~/.ccgram/ccgram-upgrade.sh` (no runtime patching).
+
+---
+
 ## Why CCGram?
 
 AI coding agents run in your terminal. When you step away — commuting, on the couch, or just away from your desk — the session keeps working, but you lose visibility and control.
