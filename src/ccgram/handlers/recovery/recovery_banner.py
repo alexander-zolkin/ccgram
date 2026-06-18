@@ -336,6 +336,100 @@ async def _create_and_bind_window(
     return True
 
 
+async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
+    message,
+    bot,
+    user_id: int,
+    thread_id: int,
+    old_window_id: str,
+    cwd: str,
+    pending_text: str,
+) -> bool:
+    """Message-driven variant of ``_handle_continue``.
+
+    Resume the most recent session for ``cwd`` via ``--continue``, bind it to the
+    topic, rename, and forward ``pending_text`` — so a message to a hibernated
+    (dead-but-bound) topic wakes the same session with zero taps. Returns True on
+    success; False (never raises) to let the caller fall back to the banner.
+    """
+    try:
+        if not cwd or not Path(cwd).is_dir():
+            return False
+        if not await asyncio.to_thread(scan_sessions_for_cwd, cwd):
+            return False
+
+        old_view = window_query.view_window(old_window_id)
+        provider = get_provider_for_window(
+            old_window_id,
+            provider_name=old_view.provider_name if old_view else None,
+        )
+        approval_mode = old_view.approval_mode if old_view else "normal"
+        # Preserve the user's topic name across hibernate/wake (don't rename to cwd)
+        keep_name = thread_router.get_display_name(old_window_id)
+        if not keep_name or keep_name == old_window_id:
+            keep_name = ""
+        launch_args = provider.make_launch_args(use_continue=True)
+        launch_command = resolve_launch_command(
+            provider.capabilities.name, approval_mode=approval_mode
+        )
+
+        success, msg, created_wname, created_wid = await tmux_manager.create_window(
+            cwd, agent_args=launch_args, launch_command=launch_command
+        )
+        if not success:
+            logger.warning("autoresume: create_window failed: %s", msg)
+            return False
+
+        if keep_name:
+            await tmux_manager.rename_window(created_wid, keep_name)
+        else:
+            keep_name = created_wname
+
+        if provider.capabilities.supports_hook:
+            await session_map_sync.wait_for_session_map_entry(created_wid)
+
+        session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
+        session_manager.set_window_provider(created_wid, provider.capabilities.name)
+        session_manager.set_window_approval_mode(created_wid, approval_mode)
+
+        thread_router.unbind_thread(user_id, thread_id)
+        thread_router.bind_thread(
+            user_id, thread_id, created_wid, window_name=keep_name
+        )
+        chat = getattr(message, "chat", None)
+        if chat is not None and chat.type in ("group", "supergroup"):
+            thread_router.set_group_chat_id(user_id, thread_id, chat.id)
+
+        client = PTBTelegramClient(bot)
+        # CCGRAM-HOTFIX:sticky-bind-name — autoresume must not clobber the topic
+        # title; prefer the sticky stored name over the recreated window name.
+        _chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+        _label = get_stored_topic_name(_chat_id, thread_id) or keep_name
+        try:
+            await client.edit_forum_topic(
+                chat_id=_chat_id,
+                message_thread_id=thread_id,
+                name=format_topic_name_for_mode(_label, approval_mode),
+            )
+        except TelegramError as e:
+            logger.debug("autoresume: failed to rename topic: %s", e)
+
+        if pending_text:
+            send_ok, send_msg = await send_to_window(created_wid, pending_text)
+            if not send_ok:
+                logger.warning("autoresume: forward pending text failed: %s", send_msg)
+        logger.info(
+            "autoresume: woke thread %d in %s -> window %s",
+            thread_id,
+            cwd,
+            created_wid,
+        )
+        return True
+    except Exception as e:  # never break the inbound message path
+        logger.warning("autoresume: failed, falling back to banner: %s", e)
+        return False
+
+
 def _cwd_for_window(window_id: str) -> str:
     """Return the bound cwd for ``window_id`` or empty string."""
     view = window_query.view_window(window_id)

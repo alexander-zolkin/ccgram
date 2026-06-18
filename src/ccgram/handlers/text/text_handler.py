@@ -319,6 +319,37 @@ async def _handle_unbound_topic(
     return True
 
 
+def _recover_cwd_for_window(window_id: str) -> str:  # CCGRAM-HOTFIX:autoresume
+    """Recover the last-known cwd for a dead window from events.jsonl.
+
+    When a window dies, ccgram prunes its session_map entry, so
+    ``view_window().cwd`` goes empty and recovery falls back to the directory
+    browser. The hook event log retains the cwd, so we read it back to keep
+    hibernated topics resumable.
+    """
+    import json as _json
+    import os as _os
+
+    key = f"ccgram:{window_id}"
+    base = _os.getenv("CCGRAM_DIR") or _os.path.expanduser("~/.ccgram")
+    path = Path(base) / "events.jsonl"
+    found = ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    ev = _json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("window_key") == key:
+                    c = (ev.get("data") or {}).get("cwd")
+                    if c:
+                        found = c  # keep the most recent
+    except OSError:
+        return ""
+    return found
+
+
 async def _handle_dead_window(
     window_id: str,
     user_id: int,
@@ -339,6 +370,8 @@ async def _handle_dead_window(
     display = thread_router.get_display_name(window_id)
     view = window_query.view_window(window_id)
     cwd = view.cwd if view else ""
+    if not cwd:  # CCGRAM-HOTFIX:autoresume — session_map pruned on death loses cwd
+        cwd = _recover_cwd_for_window(window_id)
 
     if not cwd or not Path(cwd).is_dir():
         # No valid cwd — unbind and fall back to directory browser
@@ -364,6 +397,17 @@ async def _handle_dead_window(
             user_data[PENDING_THREAD_TEXT] = text
         await safe_reply(message, msg_text, reply_markup=keyboard)
         return True
+
+    # CCGRAM-HOTFIX:autoresume — wake the hibernated session in place (zero taps)
+    import os as _os
+
+    if _os.getenv("CCGRAM_AUTORESUME_DEAD", "").lower() in ("1", "true", "yes"):
+        from ..recovery.recovery_banner import auto_continue_from_message
+
+        if await auto_continue_from_message(
+            message, message.get_bot(), user_id, thread_id, window_id, cwd, text
+        ):
+            return True
 
     # Show recovery UI
     logger.info(
