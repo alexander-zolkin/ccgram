@@ -24,6 +24,7 @@ from telegram.error import BadRequest, RetryAfter, TelegramError
 
 from ...config import config
 from ...entity_formatting import convert_to_entities
+from ...rich_tables import maybe_rich_upgrade  # CCGRAM-HOTFIX:rich-tables
 from ...telegram_client import TelegramClient
 from ...telegram_sender import TELEGRAM_MAX_MESSAGE_LENGTH
 from ..reactions import (
@@ -156,11 +157,15 @@ async def _with_entity_fallback(
         if phase_entities is not None:
             send_kwargs["entities"] = phase_entities
         try:
-            return await send_fn(plain_text, **send_kwargs)
+            _sent = await send_fn(plain_text, **send_kwargs)
+            await maybe_rich_upgrade(_sent, text)  # CCGRAM-HOTFIX:rich-tables
+            return _sent
         except RetryAfter as e:
             await asyncio.sleep(_retry_after_seconds(e) + 1)
             try:
-                return await send_fn(plain_text, **send_kwargs)
+                _sent = await send_fn(plain_text, **send_kwargs)
+                await maybe_rich_upgrade(_sent, text)  # CCGRAM-HOTFIX:rich-tables
+                return _sent
             except TelegramError as e2:
                 if is_thread_gone(e2):
                     return None
