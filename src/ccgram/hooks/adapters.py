@@ -353,6 +353,14 @@ def detect_provider_from_payload(payload: dict[str, object]) -> ProviderName | N
         provider = "gemini"
     elif "/.pi/" in transcript_path:
         provider = "pi"
+    elif "/.claude/" in transcript_path:
+        # CCGRAM-HOTFIX:claude-stop-permmode — Claude Code >=2.1 puts
+        # permission_mode/model into the Stop payload; the codex heuristic below
+        # then misdetects claude Stop events as 'codex' and the reply is never
+        # posted (Notification lacks those fields, so it stays claude → "typing"
+        # shows but no text). A /.claude/ transcript is authoritative claude;
+        # return None so the caller's pane-tty/claude default applies.
+        provider = None
     elif event_name in _GEMINI_ONLY_EVENT_TYPES:
         provider = "gemini"
     elif _str_field(payload, "permission_mode") or _str_field(payload, "model"):
