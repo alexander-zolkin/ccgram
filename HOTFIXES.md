@@ -53,7 +53,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 
 ### `autoresume` — zero-tap resume of hibernated sessions
 - **Files:** `handlers/text/text_handler.py`, `handlers/recovery/recovery_banner.py`
-- **Commit:** `e71c6af` `feat(resume): zero-tap auto-resume of hibernated sessions`
+- **Commit:** `b7a3133` `feat(resume): zero-tap auto-resume of hibernated sessions`
 - **What:** when a message lands on an unbound topic or a dead tmux window,
   ccgram recreates/rebinds the window and resumes the Claude session
   automatically, instead of waiting for the user to tap a recovery button.
@@ -65,7 +65,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   `(chat_id, thread_id)`, persisted to survive daemon restarts),
   `handlers/topics/{directory_callbacks,window_callbacks,topic_lifecycle}.py`,
   `handlers/registry.py`, `handlers/recovery/recovery_banner.py`
-- **Commit:** `c70bce3` `feat(topics): stable topic titles and no duplicate topics`
+- **Commit:** `7e3d20e` `feat(topics): stable topic titles and no duplicate topics`
 - **What:** ccgram manages **only** the leading status emoji (🟢/🟡); the topic
   *text* is whatever Alexander named it. A new tmux window or a daemon restart
   never re-imposes the window/cwd name onto the title. Only a genuine Telegram
@@ -75,21 +75,21 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 
 ### `freeze-topic-name` — tmux renames don't touch the topic
 - **Files:** `thread_router.py`
-- **Commit:** `c70bce3`
+- **Commit:** `7e3d20e`
 - **What:** a tmux window rename no longer auto-renames the Telegram topic.
 - **Why:** complements the sticky-name set — the window name and the topic title
   are decoupled.
 
 ### `ended-banner-sticky-name` — end/restore banners read the stored title
 - **Files:** `handlers/recovery/recovery_banner.py`
-- **Commit:** `c70bce3`
+- **Commit:** `7e3d20e`
 - **What:** "Session … ended" / restore / resume banners render the stored topic
   title, not the drifted window name.
 - **Why:** otherwise an ended session banner said `workspace` instead of `Test`.
 
 ### `fresh-no-dup-topic` — race-guard against duplicate topics
 - **Files:** `handlers/recovery/recovery_banner.py` (`_create_and_bind_window`)
-- **Commit:** `c70bce3`
+- **Commit:** `7e3d20e`
 - **What:** tags the new window as pending-creation before the `await`s that
   yield the loop, so a late `SessionMonitor` poll takes the already-bound branch
   instead of creating a SECOND topic named after the tmux window.
@@ -97,7 +97,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 
 ### `no-dup-on-probe-timeout` — rebind, don't recreate, on probe timeout
 - **Files:** `handlers/topics/topic_orchestration.py` (`_rebind_existing_topic_by_name`)
-- **Commit:** `c70bce3`
+- **Commit:** `7e3d20e`
 - **What:** when a Telegram topic probe times out, rebind the existing topic
   rather than creating a fresh one.
 - **Why:** probe timeouts were misread as "topic gone" → duplicate topic.
@@ -105,7 +105,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 ### `rich-tables` — Telegram-safe Markdown tables & headers
 - **Files:** `rich_tables.py` (**new module**),
   `handlers/messaging_pipeline/message_sender.py`
-- **Commit:** `65a344f` `feat(messaging): render Markdown tables/headers as Telegram-safe rich text`
+- **Commit:** `ab1f3e1` `feat(messaging): render Markdown tables/headers as Telegram-safe rich text`
 - **What:** converts Markdown tables and ATX (`#`) headers into aligned monospace
   blocks before the message goes through python-telegram-bot's parser.
 - **Why:** upstream's parser silently mangles tables (rows collapse) and leaks
@@ -113,20 +113,20 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 
 ### `no-yolo-dice` — drop the 🎲 auto-approve badge
 - **Files:** `handlers/status/topic_emoji.py` (`_compose_topic_name`)
-- **Commit:** `1c1132e` `fix(topics): drop the 🎲 yolo badge from topic titles`
+- **Commit:** `f920999` `fix(topics): drop the 🎲 yolo badge from topic titles`
 - **What:** keep the 🟢/🟡 status emoji but stop appending the yolo dice to the
   title.
 - **Why:** Alexander wanted cleaner topic names.
 
 ### `claude-stop-permmode` — keep approval mode across Stop
 - **Files:** `hooks/adapters.py` (`detect_provider_from_payload`)
-- **Commit:** `3fcc600` `fix(hooks): preserve approval mode across Claude Stop events`
+- **Commit:** `f9710e8` `fix(hooks): preserve approval mode across Claude Stop events`
 - **What:** a bare Stop hook no longer resets the permission mode.
 - **Why:** auto-approve was dropping back to interactive at every turn boundary.
 
 ### `no-interactive-on-idle-nudge` — idle nudge is informational
 - **Files:** `handlers/hook_events.py`
-- **Commit:** `f88dade` `fix(hooks): don't emit an interactive prompt on idle-nudge notifications`
+- **Commit:** `bdc21c6` `fix(hooks): don't emit an interactive prompt on idle-nudge notifications`
 - **What:** the idle nudge no longer reuses the Notification path that asks the
   user to reply; it's treated as informational only.
 - **Why:** the nudge produced a spurious interactive prompt in the topic.
@@ -137,18 +137,18 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 
 | marker | files | commit |
 |---|---|---|
-| `autoresume` | text_handler.py, recovery_banner.py | e71c6af |
-| `sticky-topic-name` | topic_emoji.py | c70bce3 |
-| `sticky-bind-name` | topic_emoji.py, directory_callbacks.py, window_callbacks.py, recovery_banner.py | c70bce3 |
-| `sticky-create-name` | registry.py, topic_lifecycle.py | c70bce3 |
-| `freeze-topic-name` | thread_router.py | c70bce3 |
-| `ended-banner-sticky-name` | recovery_banner.py | c70bce3 |
-| `fresh-no-dup-topic` | recovery_banner.py | c70bce3 |
-| `no-dup-on-probe-timeout` | topic_orchestration.py | c70bce3 |
-| `rich-tables` | rich_tables.py (new), message_sender.py | 65a344f |
-| `no-yolo-dice` | topic_emoji.py | 1c1132e |
-| `claude-stop-permmode` | adapters.py | 3fcc600 |
-| `no-interactive-on-idle-nudge` | hook_events.py | f88dade |
+| `autoresume` | text_handler.py, recovery_banner.py | b7a3133 |
+| `sticky-topic-name` | topic_emoji.py | 7e3d20e |
+| `sticky-bind-name` | topic_emoji.py, directory_callbacks.py, window_callbacks.py, recovery_banner.py | 7e3d20e |
+| `sticky-create-name` | registry.py, topic_lifecycle.py | 7e3d20e |
+| `freeze-topic-name` | thread_router.py | 7e3d20e |
+| `ended-banner-sticky-name` | recovery_banner.py | 7e3d20e |
+| `fresh-no-dup-topic` | recovery_banner.py | 7e3d20e |
+| `no-dup-on-probe-timeout` | topic_orchestration.py | 7e3d20e |
+| `rich-tables` | rich_tables.py (new), message_sender.py | ab1f3e1 |
+| `no-yolo-dice` | topic_emoji.py | f920999 |
+| `claude-stop-permmode` | adapters.py | f9710e8 |
+| `no-interactive-on-idle-nudge` | hook_events.py | bdc21c6 |
 
 Verify all present in an install:
 ```bash
