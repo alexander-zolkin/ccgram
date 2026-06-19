@@ -10,7 +10,7 @@ tagged in-source with a grep-able marker:
 CCGRAM-HOTFIX:<name>
 ```
 
-> **Maintainer = Kara (Claude).** This file is the single source of truth for
+> **Maintainer: Kara.** This file is the single source of truth for
 > *what diverges from upstream and why*. Read it before every upstream merge so
 > a refactor upstream doesn't silently drop one of these behaviours.
 
