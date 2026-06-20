@@ -25,10 +25,12 @@ from ..topics.directory_browser import (
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
     STATE_BROWSING_DIRECTORY,
+    STATE_CONFIRMING_DEFAULTS,
     STATE_KEY,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
+    build_quickstart_prompt,
     build_window_picker,
     build_worktree_confirm,
     clear_browse_state,
@@ -208,6 +210,21 @@ async def _check_ui_guards(
         user_data.pop(PENDING_THREAD_ID, None)
         user_data.pop(PENDING_THREAD_TEXT, None)
 
+    # Quick-start defaults prompt guard  # CCGRAM-HOTFIX:quickstart-defaults
+    if user_data.get(STATE_KEY) == STATE_CONFIRMING_DEFAULTS:
+        pending_tid = user_data.get(PENDING_THREAD_ID)
+        if pending_tid == thread_id:
+            await safe_reply(
+                message,
+                "Please tap Yes or No above, or tap Cancel.",
+            )
+            return True
+        # Stale prompt state from a different thread — clear it so a later
+        # stale Yes/No tap can't act on the wrong topic.
+        user_data.pop(STATE_KEY, None)
+        user_data.pop(PENDING_THREAD_ID, None)
+        user_data.pop(PENDING_THREAD_TEXT, None)
+
     return False
 
 
@@ -299,19 +316,17 @@ async def _handle_unbound_topic(
         await safe_reply(message, PENDING_DELIVERY_NOTICE)
         return True
 
-    # No unbound windows — show directory browser to create a new session
+    # No unbound windows — offer the quick-start defaults prompt as the first
+    # step. "Yes" launches with Alexander's defaults; "No" falls through to the
+    # directory browser and the full wizard.  # CCGRAM-HOTFIX:quickstart-defaults
     logger.info(
-        "Unbound topic: showing directory browser (user=%d, thread=%d)",
+        "Unbound topic: showing quick-start defaults prompt (user=%d, thread=%d)",
         user_id,
         thread_id,
     )
-    start_path = str(Path.cwd())
-    msg_text, keyboard, subdirs = build_directory_browser(start_path, user_id=user_id)
+    msg_text, keyboard = build_quickstart_prompt()
     if user_data is not None:
-        user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-        user_data[BROWSE_PATH_KEY] = start_path
-        user_data[BROWSE_PAGE_KEY] = 0
-        user_data[BROWSE_DIRS_KEY] = subdirs
+        user_data[STATE_KEY] = STATE_CONFIRMING_DEFAULTS
         user_data[PENDING_THREAD_ID] = thread_id
         user_data[PENDING_THREAD_TEXT] = text
     await safe_reply(message, msg_text, reply_markup=keyboard)

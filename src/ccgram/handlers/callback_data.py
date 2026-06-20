@@ -86,6 +86,13 @@ CB_WT_NEW = "wt:new"  # show confirm/edit screen with suggested branch
 CB_WT_CONFIRM = "wt:ok"  # create the worktree, fall through to provider pick
 CB_WT_EDIT_NAME = "wt:ed"  # prompt for branch name via text reply
 
+# Quick-start defaults prompt — CCGRAM-HOTFIX:quickstart-defaults
+# Shown as the FIRST step when creating a new session on an unbound topic
+# (no unbound windows to adopt). "Yes" skips the 4-step wizard and launches
+# with Alexander's defaults; "No" falls through to the directory browser.
+CB_DEFAULTS_YES = "qs:yes"  # launch immediately with quick-start defaults
+CB_DEFAULTS_NO = "qs:no"  # fall through to the full directory-browser wizard
+
 # Pane screenshot (from /panes command)
 CB_PANE_SCREENSHOT = "pn:ss:"  # pn:ss:<window_id>:<pane_id>
 

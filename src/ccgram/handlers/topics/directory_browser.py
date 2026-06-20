@@ -22,6 +22,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from ...config import config
 from ...user_preferences import user_preferences
 from ..callback_data import (
+    CB_DEFAULTS_NO,
+    CB_DEFAULTS_YES,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_FAV,
@@ -66,10 +68,17 @@ _MAX_BUTTON_LABEL_LEN = 13
 STATE_KEY = "state"
 STATE_BROWSING_DIRECTORY = "browsing_directory"
 STATE_SELECTING_WINDOW = "selecting_window"
+STATE_CONFIRMING_DEFAULTS = "confirming_defaults"  # CCGRAM-HOTFIX:quickstart-defaults
 BROWSE_PATH_KEY = "browse_path"
 BROWSE_PAGE_KEY = "browse_page"
 BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
+
+# CCGRAM-HOTFIX:quickstart-defaults — Alexander's one-tap "Use default settings?"
+# values. The Yes button skips the whole wizard and launches with these.
+QUICKSTART_DEFAULT_CWD = "/home/openclaw/.openclaw/workspace"
+QUICKSTART_DEFAULT_PROVIDER = "claude"
+QUICKSTART_DEFAULT_MODE = "yolo"  # approval_mode → --dangerously-skip-permissions
 
 # Project markers: filename → badge icon (checked via os.scandir)
 _PROJECT_MARKERS: dict[str, str] = {
@@ -123,6 +132,35 @@ def clear_window_picker_state(user_data: dict | None) -> None:
     if user_data is not None:
         user_data.pop(STATE_KEY, None)
         user_data.pop(UNBOUND_WINDOWS_KEY, None)
+
+
+def build_quickstart_prompt() -> tuple[str, InlineKeyboardMarkup]:
+    """Build the "Use default settings?" yes/no prompt.  # CCGRAM-HOTFIX:quickstart-defaults
+
+    Shown as the FIRST step when creating a new session on an unbound topic
+    (no unbound windows to adopt). "Yes" skips the 4-step wizard and launches
+    immediately with the quick-start defaults; "No" falls through to the
+    directory browser and the full wizard.
+
+    Returns: (text, keyboard).
+    """
+    display_cwd = QUICKSTART_DEFAULT_CWD.replace(str(Path.home()), "~")
+    text = (
+        "*Use default settings?*\n\n"
+        f"Launch right away in `{display_cwd}`:\n"
+        "• Provider: 🟠 Claude\n"
+        "• Branch: current (no worktree)\n"
+        "• Mode: 🎲 YOLO\n\n"
+        "Or tap *No* to choose directory, branch, provider and mode."
+    )
+    buttons = [
+        [
+            InlineKeyboardButton("✅ Yes", callback_data=CB_DEFAULTS_YES),
+            InlineKeyboardButton("⚙️ No", callback_data=CB_DEFAULTS_NO),
+        ],
+        [InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL)],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
 
 
 def build_window_picker(

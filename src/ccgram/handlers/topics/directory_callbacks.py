@@ -37,6 +37,8 @@ from ...window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
 from ...thread_router import thread_router
 from ...tmux_manager import send_to_window, tmux_manager
 from ..callback_data import (
+    CB_DEFAULTS_NO,
+    CB_DEFAULTS_YES,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_FAV,
@@ -57,6 +59,11 @@ from .directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
+    QUICKSTART_DEFAULT_CWD,
+    QUICKSTART_DEFAULT_MODE,
+    QUICKSTART_DEFAULT_PROVIDER,
+    STATE_BROWSING_DIRECTORY,
+    STATE_KEY,
     build_directory_browser,
     build_mode_picker,
     build_provider_picker,
@@ -107,7 +114,11 @@ async def handle_directory_callback(
 
     Dispatches to the appropriate sub-handler based on callback data prefix.
     """
-    if data.startswith(CB_DIR_FAV):
+    if data == CB_DEFAULTS_YES:  # CCGRAM-HOTFIX:quickstart-defaults
+        await _handle_defaults_yes(query, user_id, update, context)
+    elif data == CB_DEFAULTS_NO:  # CCGRAM-HOTFIX:quickstart-defaults
+        await _handle_defaults_no(query, user_id, update, context)
+    elif data.startswith(CB_DIR_FAV):
         await _handle_fav(query, user_id, data, update, context)
     elif data.startswith(CB_DIR_STAR):
         await _handle_star(query, user_id, data, update, context)
@@ -992,6 +1003,111 @@ async def _create_window_and_bind(  # noqa: PLR0915
         context.user_data.pop(PENDING_THREAD_ID, None)
 
 
+async def _finalize_session_creation(
+    query: CallbackQuery,
+    user_id: int,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    selected_path: str,
+    provider_name: str,
+    approval_mode: str,
+) -> None:
+    """Shared finalize tail: validate the pending topic, then create+bind+launch.
+
+    Used by both the mode picker (``_handle_mode_select``, after the full
+    4-step wizard) and the quick-start defaults Yes button
+    (``CCGRAM-HOTFIX:quickstart-defaults``, which skips the wizard). Clears
+    browse state first — so a leftover worktree flow can't survive past
+    ``_check_ui_guards`` — reads the pending thread, runs the shared
+    topic-mismatch + double-click guard, then delegates to
+    ``_create_window_and_bind`` (which forwards the pending text on success).
+    """
+    pending_thread_id: int | None = (
+        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
+    )
+
+    clear_browse_state(context.user_data)
+
+    if not await _validate_provider_select(
+        query, user_id, update, context, pending_thread_id
+    ):
+        return
+
+    await _create_window_and_bind(
+        query, user_id, selected_path, provider_name, approval_mode, context
+    )
+
+
+async def _handle_defaults_yes(
+    query: CallbackQuery,
+    user_id: int,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_DEFAULTS_YES: skip the wizard, launch with quick-start defaults.
+
+    CCGRAM-HOTFIX:quickstart-defaults — workspace cwd, current branch (no
+    worktree), Claude, YOLO. Reuses the same finalize tail as the mode picker,
+    so bind + launch + pending-text delivery are byte-for-byte identical to
+    completing the full wizard.
+    """
+    pending_tid = (
+        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
+    )
+    if pending_tid is None:
+        # Flow was reset (e.g. /start cleared PENDING_THREAD_ID) — a stale tap.
+        # Fail closed rather than spawn an unbound window in the default cwd.
+        await query.answer("Stale prompt (flow reset)", show_alert=True)
+        return
+    if not Path(QUICKSTART_DEFAULT_CWD).is_dir():
+        await query.answer()
+        await safe_edit(query, f"❌ Default directory missing: {QUICKSTART_DEFAULT_CWD}")
+        return
+    await _finalize_session_creation(
+        query,
+        user_id,
+        update,
+        context,
+        QUICKSTART_DEFAULT_CWD,
+        QUICKSTART_DEFAULT_PROVIDER,
+        QUICKSTART_DEFAULT_MODE,
+    )
+
+
+async def _handle_defaults_no(
+    query: CallbackQuery,
+    user_id: int,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_DEFAULTS_NO: fall through to the full directory-browser wizard.
+
+    CCGRAM-HOTFIX:quickstart-defaults — morphs the prompt message into the
+    directory browser (the original first step) and arms
+    STATE_BROWSING_DIRECTORY so the rest of the 4-step wizard proceeds
+    unchanged. PENDING_THREAD_ID/PENDING_THREAD_TEXT stay set (the browser flow
+    relies on them).
+    """
+    pending_tid = (
+        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
+    )
+    if pending_tid is None:
+        await query.answer("Stale prompt (flow reset)", show_alert=True)
+        return
+    if get_thread_id(update) != pending_tid:
+        await query.answer("Stale prompt (topic mismatch)", show_alert=True)
+        return
+    await query.answer()
+    start_path = str(Path.cwd())
+    msg_text, keyboard, subdirs = build_directory_browser(start_path, user_id=user_id)
+    if context.user_data is not None:
+        context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+        context.user_data[BROWSE_PATH_KEY] = start_path
+        context.user_data[BROWSE_PAGE_KEY] = 0
+        context.user_data[BROWSE_DIRS_KEY] = subdirs
+    await safe_edit(query, msg_text, reply_markup=keyboard)
+
+
 async def _handle_mode_select(
     query: CallbackQuery,
     user_id: int,
@@ -1018,19 +1134,9 @@ async def _handle_mode_select(
         await query.answer()
         await safe_edit(query, "❌ Selection expired. Tap Cancel and retry.")
         return
-    pending_thread_id: int | None = (
-        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
-    )
 
-    clear_browse_state(context.user_data)
-
-    if not await _validate_provider_select(
-        query, user_id, update, context, pending_thread_id
-    ):
-        return
-
-    await _create_window_and_bind(
-        query, user_id, selected_path, provider_name, approval_mode, context
+    await _finalize_session_creation(
+        query, user_id, update, context, selected_path, provider_name, approval_mode
     )
 
 
@@ -1059,6 +1165,8 @@ async def _handle_cancel(
 
 
 @register(
+    CB_DEFAULTS_YES,  # CCGRAM-HOTFIX:quickstart-defaults
+    CB_DEFAULTS_NO,  # CCGRAM-HOTFIX:quickstart-defaults
     CB_DIR_FAV,
     CB_DIR_STAR,
     CB_DIR_SELECT,

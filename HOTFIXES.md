@@ -180,6 +180,30 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   refused. A deeper fix (resume by the topic's own session id via `--session`)
   is possible later; this guard stops the data-bleed now.
 
+### `quickstart-defaults` — "Use default settings?" one-tap session start
+- **Files:** `handlers/callback_data.py`, `handlers/topics/directory_browser.py`,
+  `handlers/topics/directory_callbacks.py`, `handlers/text/text_handler.py`
+- **Commit:** `<this commit>` `feat(topics): quick-start "Use default settings?" prompt`
+- **What:** when a message lands on an **unbound** topic with **no unbound
+  windows to adopt** (the create-new-session path), ccgram now shows a yes/no
+  *"Use default settings?"* prompt **before** the directory browser.
+  - **No** → falls through to the unchanged 4-step wizard (directory → worktree
+    → provider → mode).
+  - **Yes** → skips all 4 steps and launches immediately with Alexander's
+    defaults: cwd `~/.openclaw/workspace`, current branch (no worktree),
+    provider `claude`, approval mode `yolo`. Then binds the thread, launches the
+    window, and delivers the pending message — via the **same** finalize tail as
+    the wizard's mode-select step (`_finalize_session_creation` →
+    `_create_window_and_bind`), so bind/launch/delivery and the duplicate-topic
+    race-guard are identical.
+- **Why:** every new session needed four taps from the phone even though
+  Alexander's answer is almost always the same. One tap now covers the common
+  case; the full wizard is one tap away for the rest.
+- **Scope:** only the create-new-session path. The window-picker (adopt an
+  existing unbound window) and already-bound / dead-window paths are untouched.
+  A new `STATE_CONFIRMING_DEFAULTS` user-state + a `_check_ui_guards` branch keep
+  a typed message (instead of a tap) from racing the prompt.
+
 ---
 
 ## Marker → files quick map
@@ -200,6 +224,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `no-interactive-on-idle-nudge` | hook_events.py | bdc21c6 |
 | `skip-synthetic-continue` | synthetic_continue.py (new), message_routing.py, recovery_banner.py | c7907da |
 | `resume-session-collision` | recovery_banner.py | (see git log) |
+| `quickstart-defaults` | callback_data.py, directory_browser.py, directory_callbacks.py, text_handler.py | (see git log) |
 
 Verify all present in an install:
 ```bash
