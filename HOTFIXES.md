@@ -131,6 +131,32 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   user to reply; it's treated as informational only.
 - **Why:** the nudge produced a spurious interactive prompt in the topic.
 
+### `skip-synthetic-continue` — drop the `--continue` placeholder round
+- **Files:** `synthetic_continue.py` (**new module**),
+  `handlers/messaging_pipeline/message_routing.py`,
+  `handlers/recovery/recovery_banner.py`
+- **Commit:** `c7907da` `fix(relay): drop --continue placeholder round from autoresume topics`
+- **What:** the Claude Code harness, when a session is launched with `--continue`
+  and no prompt (zero-tap `autoresume`), runs a stock **"Continue from where you
+  left off."** turn — a placeholder *user prompt* plus the model's no-op *reply*.
+  Both used to surface in the topic as spurious 👤 bubbles. Now:
+  1. `message_routing.handle_new_message` drops the placeholder user prompt
+     globally (`_is_synthetic_continue`) — display-only, the model already
+     processed it.
+  2. `synthetic_continue.py` is a one-shot arm/disarm registry keyed by
+     **window id** (known at launch, before the transcript read — beats the
+     session-id relay race).
+  3. `recovery_banner.auto_continue_from_message` arms the freshly-resumed window
+     so the model's no-op reply is swallowed too; a real forwarded user turn or
+     any tool call disarms it.
+- **Why:** the placeholder is pure harness behaviour (not a ccgram string), and
+  relaying it + its no-op reply spammed the topic on every wake.
+- **Note:** `/continue` is untouched — it never arms a window, so its reply still
+  shows. The reply is suppressed via the armed-window registry (not by passing
+  `pending_text` as a CLI arg) because `_start_agent_in_pane` *types* the launch
+  command via `send_keys literal`; a multiline/quoted Telegram message as an arg
+  would break the command (newline = premature Enter).
+
 ---
 
 ## Marker → files quick map
@@ -149,6 +175,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `no-yolo-dice` | topic_emoji.py | f920999 |
 | `claude-stop-permmode` | adapters.py | f9710e8 |
 | `no-interactive-on-idle-nudge` | hook_events.py | bdc21c6 |
+| `skip-synthetic-continue` | synthetic_continue.py (new), message_routing.py, recovery_banner.py | c7907da |
 
 Verify all present in an install:
 ```bash
