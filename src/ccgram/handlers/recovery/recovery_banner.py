@@ -336,6 +336,100 @@ async def _create_and_bind_window(
     return True
 
 
+def _recover_session_id_for_window(  # CCGRAM-HOTFIX:resume-own-session
+    window_id: str,
+) -> tuple[str, str]:
+    """Recover (session_id, transcript_path) for a window from events.jsonl.
+
+    Mirrors ``_recover_cwd_for_window``: a dead window's ``window_states`` row is
+    usually pruned by the monitor before autoresume runs, but the append-only
+    event log retains what the hook wrote at SessionStart. Returns the most
+    recent event carrying BOTH a session id and a transcript path (so the two
+    stay paired), or ("", "") if none / unreadable.
+    """
+    import json as _json
+    import os as _os
+
+    key = f"ccgram:{window_id}"
+    base = _os.getenv("CCGRAM_DIR") or _os.path.expanduser("~/.ccgram")
+    path = Path(base) / "events.jsonl"
+    found_sid, found_tx = "", ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    ev = _json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("window_key") != key:
+                    continue
+                sid = ev.get("session_id") or ""
+                tx = (ev.get("data") or {}).get("transcript_path") or ""
+                if sid and tx:  # paired SessionStart-style event; keep the latest
+                    found_sid, found_tx = sid, tx
+    except OSError:
+        return "", ""
+    return found_sid, found_tx
+
+
+async def _session_held_by_other_live_window(  # CCGRAM-HOTFIX:resume-session-collision
+    sid: str, exclude_window_id: str
+) -> bool:
+    """True if a LIVE window other than ``exclude_window_id`` holds session ``sid``.
+
+    Resuming a session another live topic already owns would cross-wire the two
+    (one Claude session, two topics). Used to bail autoresume to the recovery
+    banner instead of bleeding. Shared by the own-session and cwd-newest paths.
+    """
+    if not sid:
+        return False
+    live_ids = {w.window_id for w in await tmux_manager.list_windows()}
+    for _uid, _tid, bound_wid in thread_router.iter_thread_bindings():
+        if bound_wid == exclude_window_id or bound_wid not in live_ids:
+            continue
+        if window_query.get_session_id_for_window(bound_wid) == sid:
+            logger.warning(
+                "resume: session %s already held by live window %s - refusing to "
+                "avoid cross-topic hijack",
+                sid,
+                bound_wid,
+            )
+            return True
+    return False
+
+
+def decide_launch_args(  # CCGRAM-HOTFIX:resume-own-session
+    provider,
+    own_sid: str,
+    own_transcript_ok: bool,
+    own_contended: bool,
+    candidate_sid: str,
+    cwd_contended: bool,
+) -> tuple[str | None, bool]:
+    """Pure launch-args decision for autoresume (no I/O).
+
+    Returns ``(agent_args, arm_synthetic)``. ``agent_args`` is None to signal
+    "bail to the recovery banner" on a genuine collision. Prefers resuming this
+    topic's OWN session by id (immune to same-cwd cross-wire); falls back to
+    today's cwd-newest ``--continue`` when no usable own session exists.
+
+    arm_synthetic is True only on the ``--continue`` branch: that launch makes
+    the harness run the "Continue from where you left off." placeholder round.
+    ``--resume <id>`` does not (the existing /resume + recovery-PICK paths never
+    arm), so arming it would swallow the real first reply.
+    """
+    if own_sid and own_transcript_ok:
+        if own_contended:
+            return None, False  # CCGRAM-HOTFIX:resume-session-collision
+        try:
+            return provider.make_launch_args(resume_id=own_sid), False
+        except ValueError:
+            pass  # malformed id -> fall back to --continue
+    if candidate_sid and cwd_contended:
+        return None, False  # CCGRAM-HOTFIX:resume-session-collision
+    return provider.make_launch_args(use_continue=True), True
+
+
 async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
     message,
     bot,
@@ -359,28 +453,6 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
         if not candidates:
             return False
 
-        # CCGRAM-HOTFIX:resume-session-collision — `claude --continue` resumes the
-        # most-recent session for the cwd, not this topic's own session. When
-        # several topics are rooted at the same cwd, that most-recent session may
-        # already belong to another LIVE window (another topic). Resuming here
-        # would hijack it: two topics → one Claude session → messages from one
-        # topic surface in the other. Detect that and bail to the recovery banner
-        # so the user picks/starts a session instead of a silent cross-topic bleed.
-        candidate_sid = candidates[0].session_id
-        if candidate_sid:
-            live_ids = {w.window_id for w in await tmux_manager.list_windows()}
-            for _uid, _tid, bound_wid in thread_router.iter_thread_bindings():
-                if bound_wid == old_window_id or bound_wid not in live_ids:
-                    continue
-                if window_query.get_session_id_for_window(bound_wid) == candidate_sid:
-                    logger.warning(
-                        "autoresume: candidate session %s already held by live "
-                        "window %s — refusing to avoid cross-topic hijack",
-                        candidate_sid,
-                        bound_wid,
-                    )
-                    return False
-
         old_view = window_query.view_window(old_window_id)
         provider = get_provider_for_window(
             old_window_id,
@@ -391,7 +463,51 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
         keep_name = thread_router.get_display_name(old_window_id)
         if not keep_name or keep_name == old_window_id:
             keep_name = ""
-        launch_args = provider.make_launch_args(use_continue=True)
+
+        # CCGRAM-HOTFIX:resume-own-session — resume THIS topic's OWN session by id
+        # instead of the cwd-newest session via --continue. When several topics
+        # share one cwd, --continue can grab a different (still-live) topic's
+        # session -> cross-topic bleed. Recover the dead window's own session id +
+        # transcript from events.jsonl (its window_states row is usually pruned on
+        # death). Claude only for v1; other providers keep --continue below.
+        own_sid, own_tx = "", ""
+        if provider.capabilities.name == "claude":
+            own_sid, own_tx = await asyncio.to_thread(
+                _recover_session_id_for_window, old_window_id
+            )
+            if not own_sid and old_view and old_view.session_id:
+                own_sid = old_view.session_id
+                own_tx = (
+                    str(old_view.transcript_path) if old_view.transcript_path else ""
+                )
+        own_transcript_ok = bool(own_tx) and await asyncio.to_thread(
+            Path(own_tx).is_file
+        )
+        own_contended = bool(own_sid) and await _session_held_by_other_live_window(
+            own_sid, old_window_id
+        )
+        candidate_sid = candidates[0].session_id
+        cwd_contended = bool(candidate_sid) and await _session_held_by_other_live_window(
+            candidate_sid, old_window_id
+        )
+
+        launch_args, arm_synthetic = decide_launch_args(
+            provider,
+            own_sid,
+            own_transcript_ok,
+            own_contended,
+            candidate_sid,
+            cwd_contended,
+        )
+        if launch_args is None:
+            logger.warning(
+                "autoresume: session collision (own=%s candidate=%s) -> bailing "
+                "to recovery banner",
+                own_sid or "-",
+                candidate_sid or "-",
+            )
+            return False
+
         launch_command = resolve_launch_command(
             provider.capabilities.name, approval_mode=approval_mode
         )
@@ -403,12 +519,14 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
             logger.warning("autoresume: create_window failed: %s", msg)
             return False
 
-        # CCGRAM-HOTFIX:skip-synthetic-continue — `--continue` makes the harness
-        # run a "Continue from where you left off." placeholder round. Arm the
-        # window so its no-op reply is swallowed before the real pending_text is
-        # forwarded. Done by window id (known now) to beat the relay; disarmed by
-        # the first real user turn / tool call in message_routing.
-        synthetic_continue.arm(created_wid)
+        # CCGRAM-HOTFIX:skip-synthetic-continue — only --continue makes the harness
+        # run a "Continue from where you left off." placeholder round; arm
+        # suppression on that branch only (decide_launch_args sets arm_synthetic).
+        # --resume <id> does not emit it, so arming there would swallow the real
+        # first reply. Armed by window id (known now); disarmed by the first real
+        # user turn / tool call in message_routing.
+        if arm_synthetic:
+            synthetic_continue.arm(created_wid)
 
         if keep_name:
             await tmux_manager.rename_window(created_wid, keep_name)

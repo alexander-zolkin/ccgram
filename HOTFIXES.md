@@ -225,6 +225,37 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   session-keying issue (resume by session-id, see `resume-session-collision`)
   remains a separate, larger fix.
 
+### `resume-own-session` — zero-tap autoresume resumes the topic's OWN session
+- **Files:** `handlers/recovery/recovery_banner.py`
+  (+ `tests/ccgram/handlers/recovery/test_resume_own_session.py`)
+- **Commit:** `<this commit>` `fix(resume): autoresume the topic's own session by id, not cwd-newest`
+- **What:** the zero-tap autoresume path (`auto_continue_from_message`) launched
+  `claude --continue`, which resumes the **newest session for the cwd** — not the
+  topic's own. When several topics share one cwd (every `quickstart-defaults`
+  one-tap default roots at `~/.openclaw/workspace`), "newest for cwd" can be a
+  *different, still-live* topic's session → two topics on one Claude session →
+  cross-topic message bleed. `resume-session-collision` only *detected* this and
+  bailed to a banner; this is the deeper fix it deferred. Now: recover the dead
+  window's **own** `(session_id, transcript_path)` from `events.jsonl` (its
+  `window_states` row is usually pruned on death — same trick `autoresume` uses
+  for cwd), confirm the transcript still exists and no live window holds that id,
+  then launch `claude --resume <own_sid>`. Pure decision lives in
+  `decide_launch_args(...)` (unit-tested); the collision scan is shared via
+  `_session_held_by_other_live_window(...)`.
+- **Fallbacks (additive, never worse than today):** no recoverable own session /
+  missing transcript / malformed id → `--continue` (exactly today's behavior);
+  own session genuinely held by another live window → bail to the recovery
+  banner. Outer `except → return False` still backstops everything.
+- **Scope:** claude only (`provider.capabilities.name == "claude"`) and only the
+  zero-tap autoresume path for v1; the manual "Continue" button and other
+  providers keep `--continue`. Widen later.
+- **Synthetic-continue interaction:** `decide_launch_args` returns `arm_synthetic`
+  — True only on the `--continue` branch (the placeholder round is a `--continue`
+  behavior). `--resume <id>` is NOT armed (the existing `/resume` + recovery-PICK
+  paths never arm it); arming there would swallow the real first reply.
+- **Why:** observed 2026-06-20 cross-topic bleed with 8 topics sharing the
+  workspace cwd; `quickstart-defaults` makes that the common shape.
+
 ---
 
 ## Marker → files quick map
@@ -247,6 +278,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `resume-session-collision` | recovery_banner.py | (see git log) |
 | `quickstart-defaults` | callback_data.py, directory_browser.py, directory_callbacks.py, text_handler.py | (see git log) |
 | `no-false-dead` | polling/window_tick/__init__.py | (see git log) |
+| `resume-own-session` | recovery/recovery_banner.py | (see git log) |
 
 Verify all present in an install:
 ```bash
