@@ -204,6 +204,27 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   A new `STATE_CONFIRMING_DEFAULTS` user-state + a `_check_ui_guards` branch keep
   a typed message (instead of a tap) from racing the prompt.
 
+### `no-false-dead` — don't declare a live window dead on one missed snapshot
+- **Files:** `handlers/polling/window_tick/__init__.py`
+- **Commit:** `<this commit>` `fix(polling): confirm window death before the "ended" banner`
+- **What:** the polling coordinator builds `window_lookup` from a single bulk
+  `tmux_manager.list_windows()` snapshot, then `tick_window` treats a binding
+  whose `wid` is missing from that snapshot as a dead window and fires the
+  proactive **"⚠ Session `…` ended."** recovery banner. That snapshot can
+  transiently drop a *live* window (tmux churn right at session start; load when
+  many topics are bound). The fix: when the snapshot has no window for the
+  binding, re-confirm with a direct per-id `find_window_by_id(window_id)` query
+  before notifying. Found → snapshot blip, tick normally (no banner). Still gone
+  → genuine death, banner as before.
+- **Why:** observed 2026-06-20 — a freshly created session (Test5 / window @110,
+  alive, bound, own session intact) got a false "Session ended" banner seconds
+  after launch. Amplified by `quickstart-defaults`: every one-tap default roots
+  at the *same* `~/.openclaw/workspace`, so many same-cwd windows churn the
+  monitor and a dropped snapshot became routine. This guard fixes the false
+  positive for **all** paths (wizard + quickstart); the deeper same-cwd
+  session-keying issue (resume by session-id, see `resume-session-collision`)
+  remains a separate, larger fix.
+
 ---
 
 ## Marker → files quick map
@@ -225,6 +246,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `skip-synthetic-continue` | synthetic_continue.py (new), message_routing.py, recovery_banner.py | c7907da |
 | `resume-session-collision` | recovery_banner.py | (see git log) |
 | `quickstart-defaults` | callback_data.py, directory_browser.py, directory_callbacks.py, text_handler.py | (see git log) |
+| `no-false-dead` | polling/window_tick/__init__.py | (see git log) |
 
 Verify all present in an install:
 ```bash

@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ....telegram_client import PTBTelegramClient
+from ....tmux_manager import tmux_manager
 from ...messaging_pipeline.message_queue import get_message_queue
 from ...recovery.transcript_discovery import discover_and_register_transcript
 from ..polling_state import (
@@ -72,8 +73,16 @@ async def tick_window(
         return
 
     if window is None:
-        await _handle_dead_window_notification(bot, user_id, thread_id, window_id)
-        return
+        # CCGRAM-HOTFIX:no-false-dead — the coordinator's bulk list_windows()
+        # snapshot can transiently drop a *live* window (tmux churn at session
+        # start, or many topics sharing one cwd). A single missed snapshot must
+        # not declare the session dead: confirm with a direct per-id tmux query
+        # first. If tmux still has it, it was a snapshot blip — fall through and
+        # tick normally. Only a genuine miss here fires the "ended" banner.
+        window = await tmux_manager.find_window_by_id(window_id)
+        if window is None:
+            await _handle_dead_window_notification(bot, user_id, thread_id, window_id)
+            return
 
     await discover_and_register_transcript(
         window_id,
