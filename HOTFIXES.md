@@ -157,6 +157,29 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   command via `send_keys literal`; a multiline/quoted Telegram message as an arg
   would break the command (newline = premature Enter).
 
+### `resume-session-collision` — autoresume must not hijack another topic's session
+- **Files:** `handlers/recovery/recovery_banner.py` (`auto_continue_from_message`)
+- **Commit:** `<this commit>` `fix(resume): don't hijack a live topic's session on autoresume`
+- **What:** `claude --continue` resumes the **most-recent session for the cwd**,
+  not the specific session the topic previously owned. When several Telegram
+  topics are rooted at the same cwd (e.g. multiple topics under
+  `…/.openclaw/workspace`), autoresuming a stale topic would grab whatever
+  session is newest — often a *different, still-live* topic's session. Result:
+  two topics bound to one Claude session, one transcript, and messages typed in
+  topic A surfacing in topic B (and two `claude --continue` processes appending
+  to the same `.jsonl`). The guard compares the candidate session
+  (`scan_sessions_for_cwd(cwd)[0]`) against every **live** window's session id
+  (`tmux list_windows` ∩ `thread_router` bindings, excluding the dead window
+  being recovered); on a match it logs and returns `False` so the caller falls
+  back to the recovery banner instead of silently cross-wiring.
+- **Why:** observed 2026-06-20 — a daemon restart left a same-cwd topic's window
+  stale; its next message autoresumed onto the *active* session, so a message in
+  one topic was delivered to another. Refusing → banner is the safe fallback.
+- **Trade-off:** the genuine "resume my own session" case still works (the dead
+  old window is excluded). Only a true collision with a *live* other window is
+  refused. A deeper fix (resume by the topic's own session id via `--session`)
+  is possible later; this guard stops the data-bleed now.
+
 ---
 
 ## Marker → files quick map
@@ -176,6 +199,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `claude-stop-permmode` | adapters.py | f9710e8 |
 | `no-interactive-on-idle-nudge` | hook_events.py | bdc21c6 |
 | `skip-synthetic-continue` | synthetic_continue.py (new), message_routing.py, recovery_banner.py | c7907da |
+| `resume-session-collision` | recovery_banner.py | (see git log) |
 
 Verify all present in an install:
 ```bash

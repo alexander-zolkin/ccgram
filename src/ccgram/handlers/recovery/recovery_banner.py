@@ -355,8 +355,31 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
     try:
         if not cwd or not Path(cwd).is_dir():
             return False
-        if not await asyncio.to_thread(scan_sessions_for_cwd, cwd):
+        candidates = await asyncio.to_thread(scan_sessions_for_cwd, cwd)
+        if not candidates:
             return False
+
+        # CCGRAM-HOTFIX:resume-session-collision — `claude --continue` resumes the
+        # most-recent session for the cwd, not this topic's own session. When
+        # several topics are rooted at the same cwd, that most-recent session may
+        # already belong to another LIVE window (another topic). Resuming here
+        # would hijack it: two topics → one Claude session → messages from one
+        # topic surface in the other. Detect that and bail to the recovery banner
+        # so the user picks/starts a session instead of a silent cross-topic bleed.
+        candidate_sid = candidates[0].session_id
+        if candidate_sid:
+            live_ids = {w.window_id for w in await tmux_manager.list_windows()}
+            for _uid, _tid, bound_wid in thread_router.iter_thread_bindings():
+                if bound_wid == old_window_id or bound_wid not in live_ids:
+                    continue
+                if window_query.get_session_id_for_window(bound_wid) == candidate_sid:
+                    logger.warning(
+                        "autoresume: candidate session %s already held by live "
+                        "window %s — refusing to avoid cross-topic hijack",
+                        candidate_sid,
+                        bound_wid,
+                    )
+                    return False
 
         old_view = window_query.view_window(old_window_id)
         provider = get_provider_for_window(
