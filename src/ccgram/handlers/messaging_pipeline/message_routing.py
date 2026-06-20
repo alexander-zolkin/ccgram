@@ -10,7 +10,7 @@ from pathlib import Path
 
 import structlog
 
-from ... import session_query
+from ... import session_query, synthetic_continue
 from ...session_monitor import NewMessage
 from ...telegram_client import TelegramClient
 from ...user_preferences import user_preferences
@@ -29,6 +29,18 @@ logger = structlog.get_logger()
 
 _MIN_THINKING_LENGTH = 20
 
+# CCGRAM-HOTFIX:skip-synthetic-continue — placeholder user turns the Claude Code
+# harness injects when a session is launched with `--continue` and no real prompt
+# (zero-tap autoresume, scheduled wake, bare /continue). They are never typed by the
+# user; relaying them just spams the topic with a 👤 "Continue from where you left
+# off." bubble. Match case-insensitively, ignoring trailing punctuation.
+_SYNTHETIC_CONTINUE_PROMPTS = frozenset({"continue from where you left off"})
+
+
+def _is_synthetic_continue(text: str) -> bool:
+    """True for the harness's stock `--continue` placeholder prompt."""
+    return (text or "").strip().lower().rstrip(".") in _SYNTHETIC_CONTINUE_PROMPTS
+
 
 async def handle_new_message(msg: NewMessage, client: TelegramClient) -> None:  # noqa: C901, PLR0912
     """Handle a new assistant message — enqueue for sequential processing.
@@ -44,6 +56,13 @@ async def handle_new_message(msg: NewMessage, client: TelegramClient) -> None:  
         len(msg.text),
     )
 
+    # CCGRAM-HOTFIX:skip-synthetic-continue — drop the harness's `--continue`
+    # placeholder before it reaches any topic. Display-only: the model has already
+    # processed the turn, so this changes nothing functionally.
+    if msg.role == "user" and _is_synthetic_continue(msg.text):
+        logger.debug("skip synthetic continue prompt: session=%s", msg.session_id)
+        return
+
     active_users = session_query.find_users_for_session(msg.session_id)
 
     if not active_users:
@@ -55,6 +74,23 @@ async def handle_new_message(msg: NewMessage, client: TelegramClient) -> None:  
         structlog.contextvars.bind_contextvars(
             window_id=window_id, session_id=msg.session_id
         )
+
+        # CCGRAM-HOTFIX:skip-synthetic-continue — for an autoresumed window
+        # (armed in auto_continue_from_message), swallow the model's no-op reply
+        # to the harness placeholder. A real user turn or a tool call means the
+        # session is doing genuine work, so disarm and relay normally.
+        if synthetic_continue.is_armed(window_id):
+            if msg.role == "user" or msg.content_type == "tool_use":
+                synthetic_continue.disarm(window_id)
+            elif msg.role == "assistant" and msg.is_complete:
+                if msg.content_type == "text":
+                    synthetic_continue.disarm(window_id)
+                logger.debug(
+                    "skip placeholder-round output: window=%s ct=%s",
+                    window_id,
+                    msg.content_type,
+                )
+                continue
 
         if msg.content_type == "thinking":
             stripped = (msg.text or "").strip()

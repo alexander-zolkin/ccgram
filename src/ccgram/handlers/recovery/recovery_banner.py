@@ -30,7 +30,7 @@ import structlog
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 
-from ... import window_query
+from ... import synthetic_continue, window_query
 from ...providers import get_provider, get_provider_for_window, resolve_launch_command
 from ...session import session_manager
 from ...session_map import session_map_sync
@@ -379,6 +379,13 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
         if not success:
             logger.warning("autoresume: create_window failed: %s", msg)
             return False
+
+        # CCGRAM-HOTFIX:skip-synthetic-continue — `--continue` makes the harness
+        # run a "Continue from where you left off." placeholder round. Arm the
+        # window so its no-op reply is swallowed before the real pending_text is
+        # forwarded. Done by window id (known now) to beat the relay; disarmed by
+        # the first real user turn / tool call in message_routing.
+        synthetic_continue.arm(created_wid)
 
         if keep_name:
             await tmux_manager.rename_window(created_wid, keep_name)
