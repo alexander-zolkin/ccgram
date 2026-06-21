@@ -256,6 +256,34 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 - **Why:** observed 2026-06-20 cross-topic bleed with 8 topics sharing the
   workspace cwd; `quickstart-defaults` makes that the common shape.
 
+### `file-first-unbound` — a photo/file as the first message opens the topic
+- **Files:** `handlers/file_handler.py`
+  (+ `tests/ccgram/handlers/test_file_handler.py`)
+- **Commit:** `<this commit>` `fix(files): open the topic when a file is the first message`
+- **What:** sending a **photo or document as the very first message** to a fresh
+  unbound topic used to dead-end: `_resolve_upload_dir` returns no `window_id`
+  and the handler replied **"❌ No session bound to this topic."** — the wizard
+  never showed and the file was dropped. (Text-first already opens the wizard via
+  `_handle_unbound_topic`; files just didn't.) Now, when the topic is unbound, the
+  file handler downloads the upload to a **session-independent staging dir**
+  (`$CCGRAM_DIR/pending-uploads/<thread_id>/`, default `~/.ccgram/...`), builds the
+  same "I've uploaded …" notify message but with the file's **absolute** staged
+  path, and routes into the **same** `_handle_unbound_topic` flow as text —
+  stashing that message as the topic's `PENDING_THREAD_TEXT`. The existing
+  pending-text delivery (window-picker / quickstart / directory wizard) then
+  forwards it once the user binds a session, and Claude reads the file straight
+  from staging via the absolute path.
+- **Why this shape:** the upload's normal home is `<cwd>/.ccgram-uploads/`, but the
+  cwd isn't known until a session is bound. Using an absolute staged path lets the
+  **unchanged** pending-text machinery deliver it — **zero** edits in any of the
+  three delivery sites (`window_callbacks._handle_bind`,
+  `directory_callbacks._create_window_and_bind`, `recovery_banner`).
+- **Scope:** only the **unbound + has-thread** path. A file in the **General**
+  topic (`thread_id is None`) keeps the old explicit error (no per-topic session
+  to open). Bound topics are completely unchanged. If the topic races into a
+  binding between resolve and wizard, the file is delivered directly to the
+  now-bound window.
+
 ---
 
 ## Marker → files quick map
@@ -279,6 +307,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `quickstart-defaults` | callback_data.py, directory_browser.py, directory_callbacks.py, text_handler.py | (see git log) |
 | `no-false-dead` | polling/window_tick/__init__.py | (see git log) |
 | `resume-own-session` | recovery/recovery_banner.py | (see git log) |
+| `file-first-unbound` | handlers/file_handler.py | (see git log) |
 
 Verify all present in an install:
 ```bash

@@ -12,6 +12,7 @@ from ccgram.handlers.text.text_handler import (
 from ccgram.handlers.polling.polling_state import lifecycle_strategy
 from ccgram.handlers.topics.directory_browser import (
     STATE_BROWSING_DIRECTORY,
+    STATE_CONFIRMING_DEFAULTS,
     STATE_KEY,
     STATE_SELECTING_WINDOW,
 )
@@ -121,20 +122,22 @@ class TestHandleUnboundTopic:
         assert user_data[PENDING_THREAD_TEXT] == "hello"
 
     @patch(f"{_TH}.safe_reply", new_callable=AsyncMock)
-    @patch(f"{_TH}.build_directory_browser")
+    @patch(f"{_TH}.build_quickstart_prompt")
     @patch(f"{_TH}.tmux_manager")
     @patch(f"{_TH}.thread_router")
-    async def test_shows_directory_browser(
+    async def test_shows_quickstart_prompt_when_no_unbound_windows(
         self,
         mock_tr: MagicMock,
         mock_tm: MagicMock,
-        mock_browser: MagicMock,
+        mock_quickstart: MagicMock,
         mock_reply: AsyncMock,
     ) -> None:
+        # CCGRAM-HOTFIX:quickstart-defaults — with no unbound windows the first
+        # step is the one-tap "Use default settings?" prompt, not the browser.
         mock_tr.get_window_for_thread.return_value = None
         mock_tr.iter_thread_bindings.return_value = []
         mock_tm.list_windows = AsyncMock(return_value=[])
-        mock_browser.return_value = ("Browse:", MagicMock(), [])
+        mock_quickstart.return_value = ("Use defaults?", MagicMock())
 
         user_data: dict = {}
         message = AsyncMock()
@@ -142,8 +145,9 @@ class TestHandleUnboundTopic:
         result = await _handle_unbound_topic(100, 42, "hello", user_data, message)
 
         assert result is True
-        mock_browser.assert_called_once()
-        assert user_data[STATE_KEY] == STATE_BROWSING_DIRECTORY
+        mock_quickstart.assert_called_once()
+        assert user_data[STATE_KEY] == STATE_CONFIRMING_DEFAULTS
+        assert user_data[PENDING_THREAD_TEXT] == "hello"
         assert mock_reply.call_count == 2
 
     @patch(f"{_TH}.safe_reply", new_callable=AsyncMock)

@@ -12,6 +12,7 @@ Key handlers:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+import os
 import structlog
 import re
 from datetime import datetime, timezone
@@ -187,8 +188,64 @@ async def _download_and_save(
     return filename
 
 
+def _pending_uploads_dir(thread_id: int) -> Path:
+    """Session-independent staging dir for files sent before a session exists."""
+    base = os.getenv("CCGRAM_DIR") or os.path.expanduser("~/.ccgram")
+    return Path(base) / "pending-uploads" / str(thread_id)
+
+
+async def _stage_and_defer(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    thread_id: int,
+    filename: str,
+    file_id: str,
+    file_size: int | None,
+    size_label: str,
+    claude_msg_tpl: str,
+) -> None:
+    """Stage a file dropped into an unbound topic, then run the SAME unbound-topic
+    wizard as a first text message.  # CCGRAM-HOTFIX:file-first-unbound
+
+    A file-first message used to dead-end with "No session bound to this topic"
+    and the topic never opened.  Instead we download the file to a
+    session-independent staging dir and stash the notify message \u2014 carrying an
+    ABSOLUTE staged path \u2014 as the topic's pending text.  The existing pending-text
+    delivery (window picker / quick-start / directory wizard) then forwards it
+    once the user binds a session, and Claude reads the file straight from
+    staging.  Zero changes needed in any delivery site.
+    """
+    # Lazy: text_handler \u2194 file_handler would cycle at module load.
+    from .text.text_handler import _handle_unbound_topic
+
+    staging = _pending_uploads_dir(thread_id)
+    saved_name = await _download_and_save(
+        message, staging, filename, file_id, file_size, size_label
+    )
+    if not saved_name:
+        return
+
+    abs_path = str((staging / saved_name).resolve())
+    claude_msg = claude_msg_tpl.format(name=saved_name, path=abs_path)
+    caption = message.caption or ""
+    if caption:
+        claude_msg += f"\n\nUser note: {_sanitize_caption(caption)}"
+
+    user_data = context.user_data if context else None
+    handled = await _handle_unbound_topic(
+        user_id, thread_id, claude_msg, user_data, message
+    )
+    if not handled:
+        # Raced into a binding between resolve and now \u2014 deliver directly.
+        window_id = thread_router.resolve_window_for_thread(user_id, thread_id)
+        if window_id:
+            await send_to_window(window_id, claude_msg)
+
+
 async def _upload_and_notify(
     message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
     thread_id: int | None,
     filename: str,
@@ -200,7 +257,25 @@ async def _upload_and_notify(
 ) -> None:
     """Shared upload flow: resolve dir, download, notify Claude, reply to user."""
     window_id, upload_path, error = _resolve_upload_dir(user_id, thread_id)
-    if error or not window_id or not upload_path:
+    if window_id is None:
+        # Unbound topic.  File-first into a fresh topic: stage the file and run
+        # the wizard instead of dead-ending.  # CCGRAM-HOTFIX:file-first-unbound
+        if thread_id is not None:
+            await _stage_and_defer(
+                message,
+                context,
+                user_id,
+                thread_id,
+                filename,
+                file_id,
+                file_size,
+                size_label,
+                claude_msg_tpl,
+            )
+        else:
+            await safe_reply(message, f"\u274c {error}")
+        return
+    if error or not upload_path:
         await safe_reply(message, f"\u274c {error}")
         return
 
@@ -231,7 +306,7 @@ async def _upload_and_notify(
 
 
 async def handle_photo_message(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle photo uploads: save to .ccgram-uploads/ and notify Claude."""
     user = update.effective_user
@@ -245,6 +320,7 @@ async def handle_photo_message(
     photo = message.photo[-1]
     await _upload_and_notify(
         message,
+        context,
         user.id,
         get_thread_id(update),
         _generate_photo_filename(photo.file_unique_id),
@@ -257,7 +333,7 @@ async def handle_photo_message(
 
 
 async def handle_document_message(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle document uploads: save to .ccgram-uploads/ and notify Claude."""
     user = update.effective_user
@@ -271,6 +347,7 @@ async def handle_document_message(
     doc = message.document
     await _upload_and_notify(
         message,
+        context,
         user.id,
         get_thread_id(update),
         _sanitize_filename(doc.file_name or "document"),

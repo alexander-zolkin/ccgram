@@ -2,6 +2,7 @@
 
 import re
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -10,8 +11,11 @@ from ccgram.handlers.file_handler import (
     _sanitize_caption,
     _sanitize_filename,
     _unique_dest,
+    _upload_and_notify,
     _validate_dest_path,
 )
+
+_FH = "ccgram.handlers.file_handler"
 
 
 class TestSanitizeFilename:
@@ -120,3 +124,89 @@ class TestGeneratePhotoFilename:
     def test_format(self) -> None:
         result = _generate_photo_filename("ABCDEFGHIJKLMNOP")
         assert re.match(r"^photo_\d{8}_\d{6}_ABCDEFGH\.jpg$", result)
+
+
+class TestUnboundFileFirst:
+    """CCGRAM-HOTFIX:file-first-unbound — a file dropped into a fresh topic must
+    open the topic via the same wizard as text, not dead-end with an error."""
+
+    @patch(f"{_FH}.send_to_window", new_callable=AsyncMock)
+    @patch(f"{_FH}.thread_router")
+    @patch("ccgram.handlers.text.text_handler._handle_unbound_topic")
+    @patch(f"{_FH}._download_and_save", new_callable=AsyncMock)
+    @patch(f"{_FH}._resolve_upload_dir")
+    @patch(f"{_FH}.safe_reply", new_callable=AsyncMock)
+    async def test_unbound_routes_into_wizard(
+        self,
+        mock_reply: AsyncMock,
+        mock_resolve: MagicMock,
+        mock_download: AsyncMock,
+        mock_wizard: AsyncMock,
+        _mock_tr: MagicMock,
+        _mock_send: AsyncMock,
+    ) -> None:
+        # Unbound topic: window_id is None.
+        mock_resolve.return_value = (None, None, "No session bound to this topic.")
+        mock_download.return_value = "photo_x.jpg"
+        mock_wizard.return_value = True  # wizard handled it
+
+        message = MagicMock()
+        message.caption = None
+        context = MagicMock()
+        context.user_data = {}
+
+        await _upload_and_notify(
+            message,
+            context,
+            user_id=100,
+            thread_id=42,
+            filename="photo_x.jpg",
+            file_id="fid",
+            file_size=123,
+            size_label="Photo",
+            claude_msg_tpl="I've uploaded an image to {path} — please take a look.",
+            success_emoji="📷",
+        )
+
+        # No "No session bound" error reply.
+        mock_reply.assert_not_called()
+        # Wizard invoked with the notify text carrying the ABSOLUTE staged path.
+        mock_wizard.assert_awaited_once()
+        args = mock_wizard.await_args.args
+        assert args[0] == 100  # user_id
+        assert args[1] == 42  # thread_id
+        notify_text = args[2]
+        assert "please take a look" in notify_text
+        assert "pending-uploads/42/photo_x.jpg" in notify_text
+        assert Path(notify_text.split(" to ")[1].split(" —")[0]).is_absolute()
+
+    @patch(f"{_FH}._download_and_save", new_callable=AsyncMock)
+    @patch(f"{_FH}._resolve_upload_dir")
+    @patch(f"{_FH}.safe_reply", new_callable=AsyncMock)
+    async def test_general_topic_none_thread_still_errors(
+        self,
+        mock_reply: AsyncMock,
+        mock_resolve: MagicMock,
+        mock_download: AsyncMock,
+    ) -> None:
+        # No thread (General topic) — keep the old explicit error, no staging.
+        mock_resolve.return_value = (None, None, "No session bound to this topic.")
+        message = MagicMock()
+        context = MagicMock()
+
+        await _upload_and_notify(
+            message,
+            context,
+            user_id=100,
+            thread_id=None,
+            filename="photo_x.jpg",
+            file_id="fid",
+            file_size=123,
+            size_label="Photo",
+            claude_msg_tpl="I've uploaded an image to {path}.",
+            success_emoji="📷",
+        )
+
+        mock_download.assert_not_called()
+        mock_reply.assert_awaited_once()
+        assert "No session bound" in mock_reply.await_args.args[1]
