@@ -106,6 +106,28 @@ def _resolve_thread_bindings(
                     val,
                 )
                 changed = True
+        # CCGRAM-HOTFIX:resolve-1to1-binding — enforce 1 window = 1 thread.
+        # Name-based re-resolution above can collapse two same-named topics
+        # onto a single live window (the 3rd binding-mutation path, which was
+        # missing the 1:1 guard that _dedup_thread_bindings and bind_thread
+        # already enforce). Keep the highest thread_id (same policy as
+        # _dedup_thread_bindings); drop the rest so they re-bind to their own
+        # window on the next message via bind_thread.
+        _by_window: dict[str, list[int]] = {}
+        for _tid, _wid in new_bindings.items():
+            _by_window.setdefault(_wid, []).append(_tid)
+        for _wid, _tids in _by_window.items():
+            if len(_tids) > 1:
+                _keep = max(_tids)
+                for _tid in _tids:
+                    if _tid != _keep:
+                        del new_bindings[_tid]
+                        changed = True
+                        logger.warning(
+                            "Resolve: collapsed duplicate display-name onto "
+                            "window %s; kept thread %d, dropped %d",
+                            _wid, _keep, _tid,
+                        )
         bindings.clear()
         bindings.update(new_bindings)
 
