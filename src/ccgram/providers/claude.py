@@ -137,7 +137,11 @@ class ClaudeProvider:
             return f"--resume {resume_id}"
         if use_continue:
             return "--continue"
-        return ""
+        # Fresh ccgram-launched sessions default to a higher reasoning effort:
+        # they are async / fire-and-forget from Telegram where iterating is
+        # expensive. Per-topic /effort still overrides this. Resume/continue
+        # paths intentionally keep each session's own persisted effort.
+        return "--effort xhigh"
 
     def read_transcript_file(
         self, file_path: str, last_offset: int

@@ -81,7 +81,12 @@ class TestAgentProviderCapabilities:
 class TestMakeLaunchArgs:
     def test_fresh_session_returns_empty(self, provider: AgentProvider) -> None:
         result = provider.make_launch_args()
-        assert result == ""
+        if provider.capabilities.name == "claude":
+            # Claude fresh launches carry a default reasoning effort (ccgram
+            # raises it for async Telegram-driven sessions).
+            assert result == "--effort xhigh"
+        else:
+            assert result == ""
 
     def test_resume_id_included_when_supported(self, provider: AgentProvider) -> None:
         caps = provider.capabilities
