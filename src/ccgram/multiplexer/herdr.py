@@ -220,7 +220,7 @@ class HerdrManager:
             return None
         try:
             payload = json.loads(out)
-        except json.JSONDecodeError, ValueError:
+        except (json.JSONDecodeError, ValueError):
             logger.debug("herdr returned non-JSON", args=list(args))
             return None
         if not isinstance(payload, dict):
@@ -248,7 +248,7 @@ class HerdrManager:
             return True
         try:
             payload = json.loads(text)
-        except json.JSONDecodeError, ValueError:
+        except (json.JSONDecodeError, ValueError):
             return True  # non-JSON chatter on a zero exit → success
         return not (isinstance(payload, dict) and "error" in payload)
 

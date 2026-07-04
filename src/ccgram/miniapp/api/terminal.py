@@ -160,7 +160,7 @@ async def _send_json(ws: web.WebSocketResponse, payload: dict[str, Any]) -> bool
         return False
     try:
         await ws.send_json(payload)
-    except ConnectionResetError, RuntimeError:
+    except (ConnectionResetError, RuntimeError):
         return False
     return True
 

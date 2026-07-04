@@ -980,7 +980,7 @@ class TmuxManager:
             dims = stdout.decode("utf-8", errors="replace").strip()
             cols_str, rows_str = dims.split(":")
             return PaneDims(width=int(cols_str), height=int(rows_str))
-        except TimeoutError, ValueError:
+        except (TimeoutError, ValueError):
             if proc:
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()

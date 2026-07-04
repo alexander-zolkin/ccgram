@@ -128,7 +128,7 @@ def _source_workspace_id(repo: str) -> str:
     ).stdout
     try:
         return json.loads(out)["result"]["source"]["source_workspace_id"] or ""
-    except ValueError, KeyError, TypeError:
+    except (ValueError, KeyError, TypeError):
         return ""
 
 

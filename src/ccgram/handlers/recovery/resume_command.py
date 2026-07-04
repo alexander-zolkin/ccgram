@@ -259,7 +259,7 @@ def _build_resume_keyboard(
             )
         try:
             entry_mtime = float(entry.get("mtime", 0.0) or 0.0)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             entry_mtime = 0.0
         raw_count = entry.get("msg_count")
         msg_count = raw_count if isinstance(raw_count, int) and raw_count > 0 else None

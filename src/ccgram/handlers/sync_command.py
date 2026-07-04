@@ -239,7 +239,7 @@ async def _close_ghost_topics(client: TelegramClient, issues: list[AuditIssue]) 
                 thread_router.unbind_thread(user_id, thread_id)
                 if topic_removed:
                     closed_count += 1
-            except OSError, TelegramError:
+            except (OSError, TelegramError):
                 logger.exception(
                     "Failed to clean up ghost binding thread=%d window=%s",
                     thread_id,
@@ -398,7 +398,7 @@ async def _recreate_dead_topics(
         try:
             await _handle_new_window(event, client)
             recreated += 1
-        except TelegramError, OSError:
+        except (TelegramError, OSError):
             logger.exception("Failed to recreate topic for window %s", window_id)
             # Restore binding so the window isn't orphaned
             thread_router.bind_thread(user_id, thread_id, window_id, window_name=name)

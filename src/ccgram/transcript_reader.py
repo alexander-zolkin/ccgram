@@ -49,7 +49,7 @@ def _resolve_provider_for_file(window_id: str, file_path: Path) -> Any:
         from .window_state_ports import identity_state
 
         provider_name = identity_state.get_provider_name(window_id)
-    except ImportError, RuntimeError:
+    except (ImportError, RuntimeError):
         pass
     provider = get_provider_for_window(window_id, provider_name=provider_name)
     inferred = detect_provider_from_transcript_path(str(file_path))

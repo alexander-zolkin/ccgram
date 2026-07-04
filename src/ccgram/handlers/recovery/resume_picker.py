@@ -171,7 +171,7 @@ def _scan_index_for_cwd(
     """Scan a sessions-index.json for sessions matching a cwd."""
     try:
         index_data = json.loads(index_file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError, OSError:
+    except (json.JSONDecodeError, OSError):
         return
 
     original_path = index_data.get("originalPath", "")

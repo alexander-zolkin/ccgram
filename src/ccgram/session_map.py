@@ -72,7 +72,7 @@ async def read_session_map_raw() -> dict[str, Any] | None:
         async with aiofiles.open(config.session_map_file, "r") as f:
             content = await f.read()
         return cast(dict[str, Any], json.loads(content))
-    except json.JSONDecodeError, OSError:
+    except (json.JSONDecodeError, OSError):
         return None
 
 

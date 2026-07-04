@@ -98,7 +98,7 @@ async def _handle_workspace_callback(
     # CB_WS_SELECT<index>
     try:
         idx = int(data[len(CB_WS_SELECT) :])
-    except ValueError, IndexError:
+    except (ValueError, IndexError):
         await safe_edit(query, "❌ Invalid workspace selection. Tap Cancel and retry.")
         return
 
