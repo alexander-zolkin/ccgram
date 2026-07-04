@@ -19,6 +19,7 @@ from ..claude_task_state import (
 )
 from ..providers.base import HookEvent
 from ..session_lifecycle import session_lifecycle
+from ..session_state_ports.live_session_state import has_task_snapshot
 from ..telegram_client import TelegramClient
 from ..thread_router import thread_router
 from ..window_query import view_window
@@ -43,11 +44,13 @@ def _resolve_users_for_window_key(
 ) -> list[tuple[int, int, str]]:
     """Resolve window_key to list of (user_id, thread_id, window_id).
 
-    The window_key format is "tmux_session:window_id" (e.g. "ccgram:@0").
-    We extract the window_id part and look up thread bindings.
+    The window_key format is "<prefix>:<window_id>" (e.g. "ccgram:@0" for tmux,
+    "herdr:w2:p1" for herdr, whose window_id itself contains a colon). The prefix
+    is a single colon-free token, so we split on the FIRST colon to recover the
+    full window_id and look up thread bindings.
     """
-    # Extract window_id from key (e.g. "ccgram:@0" -> "@0")
-    parts = window_key.rsplit(":", 1)
+    # Extract window_id from key ("ccgram:@0" -> "@0", "herdr:w2:p1" -> "w2:p1")
+    parts = window_key.split(":", 1)
     if len(parts) < _WINDOW_KEY_PARTS:
         return []
     window_id = parts[1]
@@ -348,7 +351,7 @@ async def _handle_task_completed(event: HookEvent, client: TelegramClient) -> No
                 task_id,
                 subject=task_subject,
             )
-        if tracked or claude_task_state.has_snapshot(window_id):
+        if tracked or has_task_snapshot(window_id):
             await enqueue_status_update(
                 client, user_id, window_id, None, thread_id=thread_id
             )

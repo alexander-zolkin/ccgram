@@ -75,7 +75,7 @@ class TestScrapeCurrentModeEdit:
     async def test_edit_mode(self):
         provider = ClaudeProvider()
         mock_capture = AsyncMock(return_value="some output\n⏵⏵ auto-accept edits on  >")
-        with patch("ccgram.tmux_manager.tmux_manager", capture_pane=mock_capture):
+        with patch("ccgram.multiplexer.multiplexer", capture_pane=mock_capture):
             result = await provider.scrape_current_mode("@0")
         assert result == "Edit"
 
@@ -84,7 +84,7 @@ class TestScrapeCurrentModePlan:
     async def test_plan_mode(self):
         provider = ClaudeProvider()
         mock_capture = AsyncMock(return_value="some output\n⏸ plan mode  >")
-        with patch("ccgram.tmux_manager.tmux_manager", capture_pane=mock_capture):
+        with patch("ccgram.multiplexer.multiplexer", capture_pane=mock_capture):
             result = await provider.scrape_current_mode("@0")
         assert result == "Plan"
 
@@ -93,7 +93,7 @@ class TestScrapeCurrentModeFull:
     async def test_yolo_mode(self):
         provider = ClaudeProvider()
         mock_capture = AsyncMock(return_value="some output\n⏵⏵ bypass permissions  >")
-        with patch("ccgram.tmux_manager.tmux_manager", capture_pane=mock_capture):
+        with patch("ccgram.multiplexer.multiplexer", capture_pane=mock_capture):
             result = await provider.scrape_current_mode("@0")
         assert result == "YOLO"
 
@@ -102,21 +102,21 @@ class TestScrapeCurrentModeNone:
     async def test_no_mode_line(self):
         provider = ClaudeProvider()
         mock_capture = AsyncMock(return_value="just regular output\nno mode here")
-        with patch("ccgram.tmux_manager.tmux_manager", capture_pane=mock_capture):
+        with patch("ccgram.multiplexer.multiplexer", capture_pane=mock_capture):
             result = await provider.scrape_current_mode("@0")
         assert result is None
 
     async def test_empty_capture(self):
         provider = ClaudeProvider()
         mock_capture = AsyncMock(return_value="")
-        with patch("ccgram.tmux_manager.tmux_manager", capture_pane=mock_capture):
+        with patch("ccgram.multiplexer.multiplexer", capture_pane=mock_capture):
             result = await provider.scrape_current_mode("@0")
         assert result is None
 
     async def test_capture_failure(self):
         provider = ClaudeProvider()
         mock_capture = AsyncMock(side_effect=OSError("tmux gone"))
-        with patch("ccgram.tmux_manager.tmux_manager", capture_pane=mock_capture):
+        with patch("ccgram.multiplexer.multiplexer", capture_pane=mock_capture):
             result = await provider.scrape_current_mode("@0")
         assert result is None
 
@@ -160,3 +160,89 @@ class TestModeShortLabel:
 
     def test_unknown_returns_none(self):
         assert _mode_short_label("something weird") is None
+
+
+class TestParseTranscriptEntries:
+    """Characterization: parse_transcript_entries wraps ParsedEntry fields into AgentMessage."""
+
+    def _entry(self, msg_type: str, content: list) -> dict:
+        return {
+            "type": msg_type,
+            "message": {"content": content},
+            "timestamp": "2024-01-01T00:00:00.000Z",
+        }
+
+    def test_assistant_text_wrapped(self):
+        provider = ClaudeProvider()
+        entries = [self._entry("assistant", [{"type": "text", "text": "hello world"}])]
+        messages, remaining = provider.parse_transcript_entries(entries, {})
+        assert len(messages) == 1
+        m = messages[0]
+        assert m.role == "assistant"
+        assert m.content_type == "text"
+        assert m.text == "hello world"
+        assert m.timestamp == "2024-01-01T00:00:00.000Z"
+        assert not remaining
+
+    def test_tool_use_and_result_wrapped(self):
+        provider = ClaudeProvider()
+        entries = [
+            self._entry(
+                "assistant",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "Read",
+                        "input": {"file_path": "x.py"},
+                    }
+                ],
+            ),
+            self._entry(
+                "user",
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": "3 lines\nof\ntext",
+                    }
+                ],
+            ),
+        ]
+        messages, remaining = provider.parse_transcript_entries(entries, {})
+        tool_use_msgs = [m for m in messages if m.content_type == "tool_use"]
+        tool_result_msgs = [m for m in messages if m.content_type == "tool_result"]
+        assert len(tool_use_msgs) == 1
+        assert tool_use_msgs[0].tool_use_id == "t1"
+        assert tool_use_msgs[0].tool_name == "Read"
+        assert len(tool_result_msgs) == 1
+        assert tool_result_msgs[0].tool_use_id == "t1"
+        assert not remaining
+
+    def test_carry_over_pending_tools(self):
+        provider = ClaudeProvider()
+        entries = [
+            self._entry(
+                "assistant",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "t2",
+                        "name": "Bash",
+                        "input": {"command": "ls"},
+                    }
+                ],
+            ),
+        ]
+        messages, remaining = provider.parse_transcript_entries(entries, {})
+        assert "t2" in remaining
+
+    def test_unknown_entry_type_skipped(self):
+        provider = ClaudeProvider()
+        entries = [
+            {"type": "summary", "message": {"content": "ignored"}},
+            self._entry("assistant", [{"type": "text", "text": "kept"}]),
+        ]
+        messages, remaining = provider.parse_transcript_entries(entries, {})
+        assert len(messages) == 1
+        assert messages[0].text == "kept"

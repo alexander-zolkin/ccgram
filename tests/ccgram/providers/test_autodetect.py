@@ -2,13 +2,95 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ccgram.multiplexer.base import ForegroundInfo
 from ccgram.providers import (
     _reset_provider,
     detect_provider_from_command,
+    detect_provider_from_pane,
     detect_provider_from_runtime,
     should_probe_pane_title_for_provider_detection,
 )
+from ccgram.providers.process_detection import _pgid_cache
 from ccgram.session_monitor import SessionMonitor
+
+
+class TestDetectProviderFromPane:
+    """``detect_provider_from_pane`` resolves the foreground process through
+    the multiplexer seam (``Multiplexer.foreground``) — never a tty/ps path."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        _pgid_cache.clear()
+        yield
+        _pgid_cache.clear()
+
+    async def test_fast_path_skips_foreground(self) -> None:
+        mock_mux = MagicMock()
+        mock_mux.foreground = AsyncMock()
+        with patch("ccgram.multiplexer.multiplexer", mock_mux):
+            result = await detect_provider_from_pane("claude", window_id="@0")
+        assert result == "claude"
+        mock_mux.foreground.assert_not_called()
+
+    async def test_js_runtime_routes_through_foreground(self) -> None:
+        mock_mux = MagicMock()
+        mock_mux.foreground = AsyncMock(
+            return_value=ForegroundInfo(
+                pid=8668,
+                pgid=8668,
+                argv=["bun", "/Users/x/.bun/bin/codex", "--full-auto"],
+                cwd="/tmp",
+            )
+        )
+        with patch("ccgram.multiplexer.multiplexer", mock_mux):
+            result = await detect_provider_from_pane("bun", window_id="@0")
+        assert result == "codex"
+        mock_mux.foreground.assert_awaited_once_with("@0")
+
+    async def test_non_runtime_command_skips_foreground(self) -> None:
+        mock_mux = MagicMock()
+        mock_mux.foreground = AsyncMock()
+        with patch("ccgram.multiplexer.multiplexer", mock_mux):
+            result = await detect_provider_from_pane("vim", window_id="@0")
+        assert result == ""
+        mock_mux.foreground.assert_not_called()
+
+    async def test_missing_window_id_returns_empty(self) -> None:
+        mock_mux = MagicMock()
+        mock_mux.foreground = AsyncMock()
+        with patch("ccgram.multiplexer.multiplexer", mock_mux):
+            result = await detect_provider_from_pane("bun", window_id="")
+        assert result == ""
+        mock_mux.foreground.assert_not_called()
+
+    async def test_no_foreground_returns_empty(self) -> None:
+        mock_mux = MagicMock()
+        mock_mux.foreground = AsyncMock(return_value=None)
+        with patch("ccgram.multiplexer.multiplexer", mock_mux):
+            result = await detect_provider_from_pane("node", window_id="@0")
+        assert result == ""
+        mock_mux.foreground.assert_awaited_once_with("@0")
+
+    async def test_empty_command_classifies_shell_via_foreground(self) -> None:
+        # herdr reports no pane_current_command for a bare shell pane; the
+        # foreground argv must still classify it as a shell so binding/adopting
+        # the pane sets the shell provider.
+        mock_mux = MagicMock()
+        mock_mux.foreground = AsyncMock(
+            return_value=ForegroundInfo(pid=4242, pgid=4242, argv=["-fish"], cwd="/tmp")
+        )
+        with patch("ccgram.multiplexer.multiplexer", mock_mux):
+            result = await detect_provider_from_pane("", window_id="@7")
+        assert result == "shell"
+        mock_mux.foreground.assert_awaited_once_with("@7")
+
+    async def test_empty_command_without_window_skips_foreground(self) -> None:
+        mock_mux = MagicMock()
+        mock_mux.foreground = AsyncMock()
+        with patch("ccgram.multiplexer.multiplexer", mock_mux):
+            result = await detect_provider_from_pane("", window_id="")
+        assert result == ""
+        mock_mux.foreground.assert_not_called()
 
 
 class TestDetectProviderFromCommand:
@@ -66,7 +148,7 @@ class TestDetectProviderFromRuntime:
 
     def test_detects_gemini_from_wrapper_and_title_marker(self) -> None:
         assert (
-            detect_provider_from_runtime("bun", pane_title="◇ Ready (ccbot)")
+            detect_provider_from_runtime("bun", pane_title="◇ Ready (ccgram)")
             == "gemini"
         )
 
@@ -228,7 +310,7 @@ class TestHandleNewWindowAutoDetection:
         mock_window = MagicMock()
         mock_window.pane_current_command = "bun"
         mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-        mock_tmux.get_pane_title = AsyncMock(return_value="◇  Ready (ccbot)")
+        mock_tmux.get_pane_title = AsyncMock(return_value="◇  Ready (ccgram)")
 
         event = NewWindowEvent(
             window_id="@8", session_id="uuid-4", window_name="proj", cwd="/tmp"

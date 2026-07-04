@@ -42,6 +42,34 @@ class TestBootstrapApplicationOrdering:
         assert bootstrap.session_monitor is instance
 
 
+class TestEnsureMultiplexerSession:
+    async def test_forwards_to_active_backend(self):
+        from ccgram.multiplexer import install_multiplexer
+
+        backend = MagicMock()
+        backend.ensure_session = AsyncMock()
+        install_multiplexer(backend)
+
+        await bootstrap.ensure_multiplexer_session()
+
+        backend.ensure_session.assert_awaited_once_with()
+
+    async def test_exits_cleanly_when_backend_unavailable(self):
+        from ccgram.multiplexer import install_multiplexer
+
+        backend = MagicMock()
+        backend.ensure_session = AsyncMock(side_effect=RuntimeError("socket down"))
+        install_multiplexer(backend)
+
+        # An unreachable backend exits via SystemExit (caught by PTB's
+        # run_polling → graceful shutdown, no traceback), not a raw exception.
+        with pytest.raises(SystemExit) as exc_info:
+            await bootstrap.ensure_multiplexer_session()
+
+        assert exc_info.value.code == 1
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
 class TestWireRuntimeCallbacks:
     def test_wires_approval_callback(self):
         from ccgram.handlers.shell import shell_capture
@@ -68,6 +96,10 @@ class TestBootstrapApplication:
             patch(
                 "ccgram.bootstrap.install_global_exception_handler",
                 side_effect=lambda: order.append("exc_handler"),
+            ),
+            patch(
+                "ccgram.bootstrap.ensure_multiplexer_session",
+                new=AsyncMock(side_effect=lambda: order.append("ensure_session")),
             ),
             patch(
                 "ccgram.bootstrap.register_provider_commands",
@@ -106,6 +138,7 @@ class TestBootstrapApplication:
 
         assert order == [
             "exc_handler",
+            "ensure_session",
             "commands",
             "stale_ids",
             "adopt",

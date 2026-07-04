@@ -1,18 +1,23 @@
 """Integration tests for TmuxManager with a real tmux server."""
 
 import asyncio
+import os
 import shutil
 
 import pytest
 
-from ccgram.tmux_manager import TmuxManager
+from ccgram.multiplexer.tmux import TmuxManager
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed"),
 ]
 
-TEST_SESSION = "ccgram-test-integration"
+# Unique per xdist worker so parallel workers (``--dist=worksteal``) never share
+# the one real tmux session — concurrent create/kill on a shared name races.
+TEST_SESSION = (
+    f"ccgram-test-integration-{os.environ.get('PYTEST_XDIST_WORKER', 'main')}"
+)
 
 
 @pytest.fixture()
@@ -134,6 +139,25 @@ async def test_list_panes_missing_window(tmux) -> None:
     assert panes == []
 
 
+async def test_split_window_adds_pane(tmux, tmp_path) -> None:
+    ok, _msg, _name, window_id = await tmux.create_window(
+        str(tmp_path), window_name="split-me", start_agent=False
+    )
+    assert ok
+
+    new_pane = await tmux.split_window(window_id)
+    assert new_pane is not None
+    assert new_pane.startswith("%")
+
+    panes = await tmux.list_panes(window_id)
+    assert len(panes) == 2
+    assert any(p.pane_id == new_pane for p in panes)
+
+
+async def test_split_window_missing_returns_none(tmux) -> None:
+    assert await tmux.split_window("@99999") is None
+
+
 async def test_capture_pane_by_id_missing(tmux) -> None:
     output = await tmux.capture_pane_by_id("%99999")
     assert output is None
@@ -200,7 +224,7 @@ async def test_accept_yolo_confirmation_detects_prompt(tmux, tmp_path) -> None:
     )
     await asyncio.sleep(0.5)
 
-    with patch("ccgram.handlers.topics.directory_callbacks.tmux_manager", tmux):
+    with patch("ccgram.handlers.topics.window_launch_service.tmux_manager", tmux):
         from ccgram.handlers.topics.directory_callbacks import _accept_yolo_confirmation
 
         result = await _accept_yolo_confirmation(window_id, timeout=3.0)
@@ -246,7 +270,7 @@ async def test_accept_yolo_confirmation_timeout_on_no_prompt(tmux, tmp_path) -> 
     await tmux.send_keys(window_id, "echo hello world")
     await asyncio.sleep(0.3)
 
-    with patch("ccgram.handlers.topics.directory_callbacks.tmux_manager", tmux):
+    with patch("ccgram.handlers.topics.window_launch_service.tmux_manager", tmux):
         from ccgram.handlers.topics.directory_callbacks import _accept_yolo_confirmation
 
         result = await _accept_yolo_confirmation(window_id, timeout=1.0)

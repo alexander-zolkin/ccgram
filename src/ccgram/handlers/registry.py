@@ -41,6 +41,7 @@ from .recovery import restore_command, resume_command
 from .recovery.history import history_command
 from .send import send_command
 from .sessions_dashboard import sessions_command
+from .split_command import split_command
 from .sync_command import sync_command
 from .text.text_handler import text_handler
 from .topics import new_command
@@ -85,6 +86,7 @@ def register_all(
         CommandSpec("screenshot", screenshot_command),
         CommandSpec("live", live_command),
         CommandSpec("panes", panes_command),
+        CommandSpec("split", split_command),
         CommandSpec("sync", sync_command),
         CommandSpec("toolbar", toolbar_command),
         CommandSpec("send", send_command),
@@ -167,6 +169,7 @@ COMMAND_NAMES: tuple[str, ...] = (
     "screenshot",
     "live",
     "panes",
+    "split",
     "sync",
     "toolbar",
     "send",

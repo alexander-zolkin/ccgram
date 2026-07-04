@@ -26,6 +26,7 @@ import structlog
 from telegram.error import TelegramError
 
 from .cc_commands import register_commands
+from .config import config
 from .handlers.commands import setup_menu_refresh_job
 from .handlers.hook_events import dispatch_hook_event
 from .handlers.messaging_pipeline.message_queue import shutdown_workers
@@ -38,6 +39,7 @@ from .handlers.topics.topic_orchestration import (
 from .handlers.topics.topic_orchestration import (
     handle_new_window as _handle_new_window,
 )
+from .multiplexer import get_multiplexer, install_multiplexer, multiplexer
 from .providers import get_provider
 from .session import session_manager
 from .telegram_client import PTBTelegramClient
@@ -141,6 +143,44 @@ def verify_hooks_installed() -> None:
         )
 
 
+def wire_multiplexer() -> None:
+    """Install the configured multiplexer backend as the module-level proxy.
+
+    Selects the backend from ``config.multiplexer_name`` (``CCGRAM_MULTIPLEXER``,
+    default tmux). Must run before the session monitor / status polling start so
+    callers that use the ``multiplexer`` proxy forward to a wired backend.
+    Idempotent — re-installs the same cached backend on repeat calls.
+    """
+    backend = get_multiplexer(config.multiplexer_name)
+    install_multiplexer(backend)
+    logger.info("Multiplexer backend wired: %s", backend.capabilities.name)
+
+
+async def ensure_multiplexer_session() -> None:
+    """Ensure the active backend's session/server is reachable before polling.
+
+    tmux creates/finds the session; herdr verifies the socket is alive and the
+    pinned protocol version matches (raising on mismatch). Runs once at startup
+    via the seam so a misconfigured backend fails loudly here rather than later
+    as silent ``None`` returns in the polling loop.
+
+    An unreachable backend is fatal but not a bug: log one actionable line and
+    exit cleanly. ``SystemExit`` (unlike a plain exception) is caught by PTB's
+    ``run_polling`` and triggers a graceful shutdown, so the user sees the error
+    instead of a traceback.
+    """
+    try:
+        await multiplexer.ensure_session()
+    except Exception as exc:
+        logger.error(
+            "Multiplexer '%s' is not available: %s. "
+            "Make sure it is installed and running, then start ccgram again.",
+            config.multiplexer_name,
+            exc,
+        )
+        raise SystemExit(1) from exc
+
+
 def wire_runtime_callbacks() -> None:
     """Wire module-level callbacks that break cross-subsystem direct imports.
 
@@ -209,9 +249,36 @@ def start_status_polling(application: Application) -> asyncio.Task[None]:
     return _status_poll_task
 
 
+def start_event_stream(application: Application) -> object | None:
+    """Start the push event-stream consumer on event-stream backends (herdr).
+
+    No-op on backends without ``capabilities.supports_event_stream`` (tmux).
+    Returns the monitor (or None) so callers/tests can inspect it.
+    """
+    if not multiplexer.capabilities.supports_event_stream:
+        return None
+    # Lazy: keep the event-stream consumer (and its handler graph) out of the
+    # cold-import path; only event-stream backends ever load it.
+    from .event_stream_monitor import EventStreamMonitor, set_active_event_stream
+
+    # Lazy: thread_router proxy, used only to seed the bound-window set.
+    from .thread_router import thread_router
+
+    def _bound_window_ids() -> set[str]:
+        return {wid for _u, _t, wid in thread_router.iter_thread_bindings()}
+
+    monitor = EventStreamMonitor(PTBTelegramClient(application.bot), _bound_window_ids)
+    monitor.start()
+    set_active_event_stream(monitor)
+    logger.info("Event-stream consumer started")
+    return monitor
+
+
 async def bootstrap_application(application: Application) -> None:
     """Run the full post_init sequence in the prescribed order."""
     install_global_exception_handler()
+    wire_multiplexer()
+    await ensure_multiplexer_session()
     await register_provider_commands(application)
     await session_manager.resolve_stale_ids()
     await _adopt_unbound_windows(PTBTelegramClient(application.bot))
@@ -219,6 +286,7 @@ async def bootstrap_application(application: Application) -> None:
     wire_runtime_callbacks()
     await start_session_monitor(application)
     start_status_polling(application)
+    start_event_stream(application)
 
     # Lazy: main imports bot at top, bot imports bootstrap; hoisting forms
     # main → bot → bootstrap → main on cold import.
@@ -244,6 +312,15 @@ async def shutdown_runtime() -> None:
         logger.info("Session monitor stopped")
         session_monitor = None
     clear_active_monitor()
+
+    # Lazy: event-stream consumer is only loaded on event-stream backends.
+    from .event_stream_monitor import get_active_event_stream, set_active_event_stream
+
+    event_stream = get_active_event_stream()
+    if event_stream is not None:
+        event_stream.stop()
+        set_active_event_stream(None)
+        logger.info("Event-stream consumer stopped")
 
     await shutdown_workers()
 
@@ -275,3 +352,15 @@ def reset_for_testing() -> None:
     session_monitor = None
     _status_poll_task = None
     clear_active_monitor()
+
+    # Stop any event-stream consumer this run started and clear its caches so the
+    # supervisor task + module-global state don't leak into the next test.
+    # Lazy: event-stream consumer is only loaded on event-stream backends.
+    from .event_stream_monitor import get_active_event_stream, set_active_event_stream
+    from .multiplexer import agent_status_cache
+
+    event_stream = get_active_event_stream()
+    if event_stream is not None:
+        event_stream.stop()
+        set_active_event_stream(None)
+    agent_status_cache.reset()

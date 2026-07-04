@@ -214,6 +214,25 @@ class TestStoreCRUD:
         store.from_dict(legacy)
         assert store.window_states["@1"].panes == {}
 
+    def test_clear_window_session_clears_transcript_path_for_rediscovery(
+        self, store: WindowStateStore
+    ) -> None:
+        store.window_states["@1"] = WindowState(
+            session_id="old-session",
+            cwd="/proj",
+            window_name="proj",
+            transcript_path="/home/user/.codex/sessions/old.jsonl",
+            provider_name="codex",
+        )
+
+        store.clear_window_session("@1")
+
+        state = store.window_states["@1"]
+        assert state.session_id == ""
+        assert state.transcript_path == ""
+        assert state.cwd == "/proj"
+        assert state.provider_name == "codex"
+
 
 class TestPaneLifecycleNotify:
     def test_window_state_default_is_none(self) -> None:
@@ -516,6 +535,42 @@ class TestSetWindowProvider:
         state.session_id = "keep-me"
         store.set_window_provider("@1", "codex", new_provider_supports_hook=True)
         assert store.window_states["@1"].session_id == "keep-me"
+
+    def test_hook_to_hook_switch_invokes_callback(
+        self, store: WindowStateStore
+    ) -> None:
+        """Regression: hook-to-hook switch (e.g. claude -> pi) must clear the stale
+        session_map.json entry, or the poll loop and the live hook fight each other
+        and spam 'Corrected provider' warnings every poll cycle."""
+        called: list[str] = []
+        store._on_hookless_provider_switch = called.append
+        state = store.get_window_state("@1")
+        state.provider_name = "claude"
+        store.set_window_provider("@1", "pi", new_provider_supports_hook=True)
+        assert called == ["@1"]
+
+    def test_hook_to_hook_switch_does_not_clear_session_fields(
+        self, store: WindowStateStore
+    ) -> None:
+        """Hook providers update session/transcript via their own hooks;
+        the session fields must survive a hook-to-hook provider change."""
+        state = store.get_window_state("@1")
+        state.provider_name = "claude"
+        state.session_id = "keep-me"
+        state.transcript_path = "/keep/me.jsonl"
+        store.set_window_provider("@1", "pi", new_provider_supports_hook=True)
+        assert store.window_states["@1"].session_id == "keep-me"
+        assert store.window_states["@1"].transcript_path == "/keep/me.jsonl"
+
+    def test_same_hook_provider_does_not_invoke_callback(
+        self, store: WindowStateStore
+    ) -> None:
+        called: list[str] = []
+        store._on_hookless_provider_switch = called.append
+        state = store.get_window_state("@1")
+        state.provider_name = "pi"
+        store.set_window_provider("@1", "pi", new_provider_supports_hook=True)
+        assert called == []
 
     def test_empty_provider_name_reset_does_not_trigger_hookless_callback(
         self, store: WindowStateStore

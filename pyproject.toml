@@ -136,13 +136,14 @@ asyncio_mode = "auto"
 # (multiple conftest.py) are passed explicitly as collection targets (the
 # test-runner hook does this). pythonpath keeps the bare `_helpers` imports in
 # tests/ccgram/** resolvable, since importlib does not prepend the test's dir.
-addopts = "--import-mode=importlib"
+addopts = "--import-mode=importlib --durations=10 --durations-min=0.5"
 pythonpath = ["tests/ccgram"]
 timeout = 30
 markers = [
     "integration: tests using real filesystem or external processes",
     "e2e: end-to-end tests with real agent CLIs (local only, slow)",
     "llm: tests requiring real LLM API keys (slow, requires env vars)",
+    "herdr: contract tests against a running herdr server (local only, needs socket)",
 ]
 
 [tool.coverage.run]

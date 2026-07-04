@@ -12,30 +12,28 @@ Handles all inline keyboard callbacks for the directory browser UI:
   - CB_DIR_STAR: Star/unstar a directory
 
 Key function: handle_directory_callback (uniform callback handler signature).
+
+Navigation, worktree-picker, and cancel logic live here.
+Provider/mode selection: provider_mode_callbacks.py
+Workspace picker: workspace_callbacks.py
+Window launch: window_launch_service.py
+Flow state: topic_creation_draft.py
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 import asyncio
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
-from pathlib import Path
-
 from telegram import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.error import TelegramError
-from ...providers import registry as provider_registry
-from ...session import session_manager
-from ...session_map import session_map_sync
-from ...user_preferences import user_preferences
-from ...window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
-from ...thread_router import thread_router
-from ...tmux_manager import send_to_window, tmux_manager
+
 from ..callback_data import (
     CB_DEFAULTS_NO,
     CB_DEFAULTS_YES,
@@ -53,37 +51,12 @@ from ..callback_data import (
     CB_WT_EDIT_NAME,
     CB_WT_NEW,
     CB_WT_USE_CURRENT,
+    CB_WS_SELECT,
+    CB_WS_SKIP,
 )
 from ..callback_helpers import get_thread_id
-from .directory_browser import (
-    BROWSE_DIRS_KEY,
-    BROWSE_PAGE_KEY,
-    BROWSE_PATH_KEY,
-    QUICKSTART_DEFAULT_CWD,
-    QUICKSTART_DEFAULT_MODE,
-    QUICKSTART_DEFAULT_PROVIDER,
-    STATE_BROWSING_DIRECTORY,
-    STATE_KEY,
-    build_directory_browser,
-    build_mode_picker,
-    build_provider_picker,
-    build_worktree_confirm,
-    build_worktree_picker,
-    clear_browse_state,
-    clear_worktree_state,
-    get_favorites,
-)
-from .worktree import (
-    WorktreeError,
-    check_worktree_eligibility,
-    create_worktree,
-    slug_for_path,
-    suggest_branch_name,
-    worktree_path_for,
-)
 from ..callback_registry import register
-from ..messaging_pipeline.message_sender import safe_edit, safe_send
-from ..status.topic_emoji import format_topic_name_for_mode, get_stored_topic_name
+from ..messaging_pipeline.message_sender import safe_edit
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
     PENDING_THREAD_ID,
@@ -95,12 +68,128 @@ from ..user_state import (
     PENDING_WORKTREE_REPO,
     PENDING_WORKTREE_SUBDIR,
 )
-from . import topic_orchestration
+from .directory_browser import (
+    BROWSE_DIRS_KEY,
+    BROWSE_PAGE_KEY,
+    BROWSE_PATH_KEY,
+    QUICKSTART_DEFAULT_CWD,
+    QUICKSTART_DEFAULT_MODE,
+    QUICKSTART_DEFAULT_PROVIDER,
+    STATE_BROWSING_DIRECTORY,
+    STATE_KEY,
+    build_directory_browser,
+    build_worktree_confirm,
+    build_worktree_picker,
+    clear_browse_state,
+    clear_workspace_state,
+    clear_worktree_state,
+    get_favorites,
+)
+from .provider_mode_callbacks import (
+    _handle_mode_select,
+    _handle_provider_select,
+    _parse_mode_select,
+    _validate_provider_select,
+)
+from .topic_creation_draft import (
+    _browser_flow_stale,
+    _required_selected_path,
+)
+
+# Intentional test-compat re-exports: tests import these names from this module.
+from .window_launch_service import (
+    WindowLaunchRequest,
+    _accept_yolo_confirmation,
+    _cwd_within,
+    _persist_worktree_state,
+    launch_window,
+    launch_window as _create_window_and_bind,
+)
+from .worktree import (
+    WorktreeError,
+    check_worktree_eligibility,
+    create_worktree,
+    slug_for_path,
+    suggest_branch_name,
+    worktree_path_for,
+)
+from .workspace_callbacks import (
+    _handle_workspace_callback,
+    _show_provider_picker,
+    _show_workspace_picker_or_provider,
+)
+from ...multiplexer import multiplexer as tmux_manager
+from ...thread_router import thread_router
+from ...user_preferences import user_preferences
 
 if TYPE_CHECKING:
     from telegram.ext import ContextTypes
 
 logger = structlog.get_logger()
+
+# Re-export for backward compatibility (tests import these from directory_callbacks)
+__all__ = [
+    "handle_directory_callback",
+    "_browser_flow_stale",
+    "_required_selected_path",
+    "_handle_confirm",
+    "_handle_fav",
+    "_handle_star",
+    "_handle_up",
+    "_handle_home",
+    "_handle_page",
+    "_handle_select",
+    "_handle_worktree_callback",
+    "_handle_wt_confirm",
+    "_handle_wt_edit_name",
+    "_handle_wt_new",
+    "_handle_wt_use_current",
+    "_handle_workspace_callback",
+    "_show_workspace_picker_or_provider",
+    "_handle_defaults_yes",  # CCGRAM-HOTFIX:quickstart-defaults
+    "_handle_defaults_no",  # CCGRAM-HOTFIX:quickstart-defaults
+    "_create_window_and_bind",
+    "_validate_provider_select",
+    "_handle_provider_select",
+    "_parse_mode_select",
+    "_handle_mode_select",
+    # test-compat re-exports from window_launch_service / thread_router
+    "_accept_yolo_confirmation",
+    "_cwd_within",
+    "_persist_worktree_state",
+    "thread_router",
+]
+
+
+def _current_browse_path(context: ContextTypes.DEFAULT_TYPE) -> str:
+    default_path = str(Path.cwd())
+    if context.user_data is None:
+        return default_path
+    return context.user_data.get(BROWSE_PATH_KEY, default_path)
+
+
+def _current_browse_page(context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data is None:
+        return 0
+    return context.user_data.get(BROWSE_PAGE_KEY, 0)
+
+
+async def _render_directory_browser(
+    query: CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    path: str,
+    *,
+    user_id: int,
+    page: int = 0,
+) -> None:
+    if context.user_data is not None:
+        context.user_data[BROWSE_PATH_KEY] = path
+        context.user_data[BROWSE_PAGE_KEY] = page
+
+    msg_text, keyboard, subdirs = build_directory_browser(path, page, user_id=user_id)
+    if context.user_data is not None:
+        context.user_data[BROWSE_DIRS_KEY] = subdirs
+    await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
 async def handle_directory_callback(
@@ -138,28 +227,10 @@ async def handle_directory_callback(
         await _handle_mode_select(query, user_id, data, update, context)
     elif data in (CB_WT_USE_CURRENT, CB_WT_NEW, CB_WT_CONFIRM, CB_WT_EDIT_NAME):
         await _handle_worktree_callback(query, data, update, context)
+    elif data.startswith(CB_WS_SELECT) or data == CB_WS_SKIP:
+        await _handle_workspace_callback(query, data, update, context)
     elif data == CB_DIR_CANCEL:
         await _handle_cancel(query, update, context)
-
-
-def _browser_flow_stale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """True if the directory-browser flow was reset or the tap is cross-topic.
-
-    A live browser always has ``PENDING_THREAD_ID`` set in the same topic
-    (``_handle_unbound_topic`` / ``_handle_dead_window`` set it together
-    with the browse state; navigation never clears it). If it is gone
-    (``/start`` or Cancel cleared it) or the tap arrived in a different
-    topic, every navigation/favorites handler must fail closed: otherwise
-    they repopulate ``BROWSE_PATH_KEY`` (falling back to the bot's own
-    cwd) *without* setting ``STATE_KEY``, so ``_check_ui_guards`` can't
-    catch the residue and a later stale ``db:confirm`` spawns a window in
-    that path. ``_handle_star`` would also toggle a persistent favorite
-    off a dead browser.
-    """
-    pending_tid = (
-        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
-    )
-    return pending_tid is None or get_thread_id(update) != pending_tid
 
 
 async def _resolve_fav_index(
@@ -204,14 +275,7 @@ async def _handle_fav(
         await query.answer("Directory no longer exists", show_alert=True)
         return
 
-    if context.user_data is not None:
-        context.user_data[BROWSE_PATH_KEY] = fav_path
-        context.user_data[BROWSE_PAGE_KEY] = 0
-
-    msg_text, keyboard, subdirs = build_directory_browser(fav_path, user_id=user_id)
-    if context.user_data is not None:
-        context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
+    await _render_directory_browser(query, context, fav_path, user_id=user_id)
     await query.answer()
 
 
@@ -230,20 +294,15 @@ async def _handle_star(
         return
     now_starred = user_preferences.toggle_user_star(user_id, fav_path)
 
-    # Rebuild browser at current path to update star icons
-    default_path = str(Path.cwd())
-    current_path = (
-        context.user_data.get(BROWSE_PATH_KEY, default_path)
-        if context.user_data
-        else default_path
+    current_path = _current_browse_path(context)
+    current_page = _current_browse_page(context)
+    await _render_directory_browser(
+        query,
+        context,
+        current_path,
+        user_id=user_id,
+        page=current_page,
     )
-    current_page = context.user_data.get(BROWSE_PAGE_KEY, 0) if context.user_data else 0
-    msg_text, keyboard, subdirs = build_directory_browser(
-        current_path, current_page, user_id=user_id
-    )
-    if context.user_data is not None:
-        context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
     await query.answer("⭐ Starred" if now_starred else "☆ Unstarred")
 
 
@@ -272,12 +331,7 @@ async def _handle_select(
         return
     subdir_name = cached_dirs[idx]
 
-    default_path = str(Path.cwd())
-    current_path = (
-        context.user_data.get(BROWSE_PATH_KEY, default_path)
-        if context.user_data
-        else default_path
-    )
+    current_path = _current_browse_path(context)
     new_path = (Path(current_path) / subdir_name).resolve()
 
     if not new_path.exists() or not new_path.is_dir():
@@ -285,14 +339,7 @@ async def _handle_select(
         return
 
     new_path_str = str(new_path)
-    if context.user_data is not None:
-        context.user_data[BROWSE_PATH_KEY] = new_path_str
-        context.user_data[BROWSE_PAGE_KEY] = 0
-
-    msg_text, keyboard, subdirs = build_directory_browser(new_path_str, user_id=user_id)
-    if context.user_data is not None:
-        context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
+    await _render_directory_browser(query, context, new_path_str, user_id=user_id)
     await query.answer()
 
 
@@ -306,24 +353,11 @@ async def _handle_up(
     if _browser_flow_stale(update, context):
         await query.answer("Stale browser (flow reset)", show_alert=True)
         return
-    default_path = str(Path.cwd())
-    current_path = (
-        context.user_data.get(BROWSE_PATH_KEY, default_path)
-        if context.user_data
-        else default_path
-    )
-    current = Path(current_path).resolve()
+    current = Path(_current_browse_path(context)).resolve()
     parent = current.parent
 
     parent_path = str(parent)
-    if context.user_data is not None:
-        context.user_data[BROWSE_PATH_KEY] = parent_path
-        context.user_data[BROWSE_PAGE_KEY] = 0
-
-    msg_text, keyboard, subdirs = build_directory_browser(parent_path, user_id=user_id)
-    if context.user_data is not None:
-        context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
+    await _render_directory_browser(query, context, parent_path, user_id=user_id)
     await query.answer()
 
 
@@ -339,14 +373,7 @@ async def _handle_home(
         return
 
     home_path = str(Path.home())
-    if context.user_data is not None:
-        context.user_data[BROWSE_PATH_KEY] = home_path
-        context.user_data[BROWSE_PAGE_KEY] = 0
-
-    msg_text, keyboard, subdirs = build_directory_browser(home_path, user_id=user_id)
-    if context.user_data is not None:
-        context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
+    await _render_directory_browser(query, context, home_path, user_id=user_id)
     await query.answer()
 
 
@@ -366,21 +393,14 @@ async def _handle_page(
     except ValueError:
         await query.answer("Invalid data")
         return
-    default_path = str(Path.cwd())
-    current_path = (
-        context.user_data.get(BROWSE_PATH_KEY, default_path)
-        if context.user_data
-        else default_path
+    current_path = _current_browse_path(context)
+    await _render_directory_browser(
+        query,
+        context,
+        current_path,
+        user_id=user_id,
+        page=pg,
     )
-    if context.user_data is not None:
-        context.user_data[BROWSE_PAGE_KEY] = pg
-
-    msg_text, keyboard, subdirs = build_directory_browser(
-        current_path, pg, user_id=user_id
-    )
-    if context.user_data is not None:
-        context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
     await query.answer()
 
 
@@ -393,7 +413,7 @@ def _subdir_within_repo(selected_path: str, repo_path: Path) -> str:
     """
     try:
         rel = Path(selected_path).resolve().relative_to(repo_path.resolve())
-    except (ValueError, OSError):
+    except ValueError, OSError:
         return ""
     return str(rel) if rel.parts else ""
 
@@ -436,6 +456,7 @@ async def _handle_confirm(
     await query.answer()
 
     # Guard against double-click: if thread already has a window, skip
+
     if pending_thread_id is not None:
         existing_wid = thread_router.get_window_for_thread(user_id, pending_thread_id)
         if existing_wid is not None:
@@ -473,34 +494,13 @@ async def _handle_confirm(
         return
 
     # Show provider selection keyboard (keep browse state for _handle_provider_select)
-    await _show_provider_picker(query, selected_path)
-
-
-async def _show_provider_picker(query: CallbackQuery, selected_path: str) -> None:
-    """Edit the message to the provider picker for *selected_path*."""
-    text, keyboard = build_provider_picker(selected_path)
-    await safe_edit(query, text, reply_markup=keyboard)
+    await _show_workspace_picker_or_provider(query, selected_path, context)
 
 
 def _cancel_only_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL)]]
     )
-
-
-def _required_selected_path(context: ContextTypes.DEFAULT_TYPE) -> str | None:
-    """Selected directory for a window-creating step, or None if the flow
-    was reset (e.g. by ``/start``, which clears ``BROWSE_PATH_KEY``).
-
-    Unlike the navigation handlers, the create path must never fall back
-    to the bot's cwd: a stale provider/worktree button tapped after a
-    reset would otherwise spawn an unbound tmux window running an agent
-    CLI in the bot's own working directory.
-    """
-    if context.user_data is None:
-        return None
-    path = context.user_data.get(BROWSE_PATH_KEY)
-    return path if isinstance(path, str) and path else None
 
 
 async def _handle_worktree_callback(
@@ -546,7 +546,7 @@ async def _handle_wt_use_current(
         await safe_edit(query, "❌ Worktree state lost. Tap Cancel and retry.")
         return
     clear_worktree_state(context.user_data)
-    await _show_provider_picker(query, selected_path)
+    await _show_workspace_picker_or_provider(query, selected_path, context)
 
 
 async def _handle_wt_new(
@@ -579,15 +579,21 @@ async def _handle_wt_confirm(
 ) -> None:
     """Create the worktree, then continue to provider pick rooted in it."""
     user_data = context.user_data
-    # Re-entrancy guard set synchronously *before* the first await: a
-    # fast double-tap on "Use this" would otherwise run create_worktree
-    # twice and the second call would overwrite the provider picker with
-    # a "branch already exists" error even though the first succeeded.
-    if user_data is not None and user_data.get(PENDING_WORKTREE_CREATING):
-        await query.answer("Creating worktree…")
-        return
-    if user_data is not None:
-        user_data[PENDING_WORKTREE_CREATING] = True
+    # On herdr the worktree is created later (delegated to `worktree create`
+    # in _create_window_and_bind), so no slow git op runs here and no
+    # re-entrancy guard is needed. On tmux the guard is set synchronously
+    # *before* the first await: a fast double-tap on "Use this" would otherwise
+    # run `git worktree add` twice and the second call would overwrite the
+    # provider picker with a "branch already exists" error even though the
+    # first succeeded.
+
+    delegate = tmux_manager.capabilities.native_worktrees
+    if not delegate:
+        if user_data is not None and user_data.get(PENDING_WORKTREE_CREATING):
+            await query.answer("Creating worktree…")
+            return
+        if user_data is not None:
+            user_data[PENDING_WORKTREE_CREATING] = True
     await query.answer()
     repo = user_data.get(PENDING_WORKTREE_REPO) if user_data else None
     branch = user_data.get(PENDING_WORKTREE_BRANCH) if user_data else None
@@ -596,6 +602,16 @@ async def _handle_wt_confirm(
         if user_data is not None:
             user_data.pop(PENDING_WORKTREE_CREATING, None)
         await safe_edit(query, "❌ Worktree state lost. Tap Cancel and retry.")
+        return
+    if delegate:
+        # herdr makes the checkout + grouped workspace itself at creation time.
+        # Skip ccgram's `git worktree add` and the workspace picker (herdr
+        # assigns the worktree its own workspace); keep the PENDING_WORKTREE_*
+        # keys so _create_window_and_bind issues `worktree create` at this path.
+        if user_data is not None:
+            user_data[BROWSE_PATH_KEY] = worktree_path
+        logger.info("Deferring worktree %s (branch %s) to herdr", worktree_path, branch)
+        await _show_provider_picker(query, worktree_path)
         return
     try:
         # Offloaded: create_worktree runs a blocking `git worktree add`
@@ -636,7 +652,7 @@ async def _handle_wt_confirm(
         branch,
         target_str,
     )
-    await _show_provider_picker(query, target_str)
+    await _show_workspace_picker_or_provider(query, target_str, context)
 
 
 async def _handle_wt_edit_name(
@@ -661,383 +677,6 @@ async def _handle_wt_edit_name(
     )
 
 
-async def _validate_provider_select(
-    query: CallbackQuery,
-    user_id: int,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    pending_thread_id: int | None,
-) -> bool:
-    """Validate provider select callback; returns True if request should proceed."""
-    confirm_thread_id = get_thread_id(update)
-    if pending_thread_id is not None and confirm_thread_id != pending_thread_id:
-        # _handle_mode_select clears browse state before calling this, so
-        # _check_ui_guards can no longer catch a leftover worktree flow on
-        # a later message — clear it here or the CREATING re-entrancy flag
-        # sticks and blocks every future worktree confirm.
-        clear_worktree_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop(PENDING_THREAD_ID, None)
-            context.user_data.pop(PENDING_THREAD_TEXT, None)
-        await query.answer("Stale browser (topic mismatch)", show_alert=True)
-        return False
-
-    await query.answer()
-
-    # Guard against double-click: if thread already has a window, skip
-    if pending_thread_id is not None:
-        existing_wid = thread_router.get_window_for_thread(user_id, pending_thread_id)
-        if existing_wid is not None:
-            display = thread_router.get_display_name(existing_wid)
-            logger.warning(
-                "Thread %d already bound to window %s (%s), ignoring duplicate provider select",
-                pending_thread_id,
-                existing_wid,
-                display,
-            )
-            await safe_edit(query, f"✅ Already bound to window {display}.")
-            return False
-
-    return True
-
-
-async def _handle_provider_select(
-    query: CallbackQuery,
-    user_id: int,
-    data: str,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Handle CB_PROV_SELECT: select provider and show mode picker.
-
-    Providers without a YOLO flag (e.g. shell) skip the mode picker
-    and go directly to window creation with approval_mode="normal".
-    """
-    # Lazy: providers package heavy bootstrap
-    from ccgram.providers import has_yolo_mode
-
-    provider_name = data[len(CB_PROV_SELECT) :]
-    if not provider_registry.is_valid(provider_name):
-        await query.answer("Unknown provider", show_alert=True)
-        return
-
-    selected_path = _required_selected_path(context)
-    if selected_path is None:
-        await query.answer()
-        await safe_edit(query, "❌ Selection expired. Tap Cancel and retry.")
-        return
-    pending_thread_id: int | None = (
-        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
-    )
-
-    if not await _validate_provider_select(
-        query, user_id, update, context, pending_thread_id
-    ):
-        return
-
-    if not has_yolo_mode(provider_name):
-        # No mode picker needed — go directly to window creation
-        clear_browse_state(context.user_data)
-        await _create_window_and_bind(
-            query, user_id, selected_path, provider_name, "normal", context
-        )
-        return
-
-    text, keyboard = build_mode_picker(selected_path, provider_name)
-    await safe_edit(query, text, reply_markup=keyboard)
-
-
-def _parse_mode_select(data: str) -> tuple[str, str] | None:
-    """Parse mode callback data as (provider_name, approval_mode)."""
-    raw = data[len(CB_MODE_SELECT) :]
-    provider_name, sep, approval_mode = raw.partition(":")
-    if not sep:
-        return None
-    return provider_name, approval_mode.lower()
-
-
-async def _wait_for_shell_ready(window_id: str, *, attempts: int = 5) -> None:
-    """Wait for a freshly created tmux window to show a shell prompt."""
-    # Lazy: only needed inside the shell-detection branch
-    import os
-
-    # Lazy: providers package heavy bootstrap
-    from ccgram.providers.shell import KNOWN_SHELLS
-
-    for _ in range(attempts):
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w and w.pane_current_command:
-            cmd = os.path.basename(w.pane_current_command.split()[0]).lstrip("-")
-            if cmd in KNOWN_SHELLS:
-                return
-        await asyncio.sleep(0.2)
-
-
-async def _accept_yolo_confirmation(window_id: str, *, timeout: float = 8.0) -> bool:
-    """Detect and accept Claude Code's bypass permissions confirmation prompt.
-
-    When launched with --dangerously-skip-permissions, Claude Code shows a
-    TUI confirmation where "No, exit" is the default selection. Sends
-    Down+Enter to select the "Yes" option so the session can start.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        text = await tmux_manager.capture_pane(window_id)
-        if text and "bypass permissions" in text.lower():
-            await asyncio.sleep(0.3)
-            await tmux_manager.send_keys(window_id, "Down", enter=False, literal=False)
-            await asyncio.sleep(0.15)
-            await tmux_manager.send_keys(window_id, "Enter", enter=False, literal=False)
-            logger.info("Accepted bypass permissions prompt for window %s", window_id)
-            return True
-        await asyncio.sleep(0.5)
-    logger.warning(
-        "Bypass permissions prompt not detected within %.0fs for window %s",
-        timeout,
-        window_id,
-    )
-    return False
-
-
-def _cwd_within(cwd: str, worktree_path: str) -> bool:
-    """True if *cwd* is the worktree root or nested inside it."""
-    try:
-        c = Path(cwd).resolve()
-        w = Path(worktree_path).resolve()
-    except OSError:
-        return False
-    return c == w or c.is_relative_to(w)
-
-
-def _persist_worktree_state(
-    window_id: str, cwd: str, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Persist a pending worktree path/branch onto the new window state.
-
-    Only persists when the window's *cwd* is the pending worktree path
-    (or a subdirectory of it — the new topic may be rooted at a subdir
-    of the fresh checkout) so a stale path from an earlier aborted
-    attempt can't attach to an unrelated window. Always clears the
-    worktree flow keys afterwards.
-    """
-    user_data = context.user_data
-    worktree_path = user_data.get(PENDING_WORKTREE_PATH) if user_data else None
-    worktree_branch = user_data.get(PENDING_WORKTREE_BRANCH) if user_data else None
-    if worktree_path and worktree_branch and _cwd_within(cwd, worktree_path):
-        session_manager.set_window_worktree(window_id, worktree_path, worktree_branch)
-    clear_worktree_state(user_data)
-
-
-async def _abort_topic_creation(
-    query: CallbackQuery, message: str, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Surface a window-creation failure and drop all pending-topic state.
-
-    The error message carries no keyboard, so the user must restart the
-    flow. Clearing the pending worktree state (including the re-entrancy
-    flag) keeps a sticky "creating" guard from rejecting every future
-    worktree confirm — the worktree, if any, was already created on disk.
-    """
-    await safe_edit(query, f"❌ {message}")
-    if context.user_data is not None:
-        context.user_data.pop(PENDING_THREAD_ID, None)
-        context.user_data.pop(PENDING_THREAD_TEXT, None)
-    clear_worktree_state(context.user_data)
-
-
-async def _create_window_and_bind(  # noqa: PLR0915
-    query: CallbackQuery,
-    user_id: int,
-    selected_path: str,
-    provider_name: str,
-    approval_mode: str,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Create a tmux window, bind to the pending topic, and forward pending text.
-
-    Shared by _handle_mode_select (after mode picker) and _handle_provider_select
-    (when mode picker is skipped for providers without YOLO flags).
-    """
-    # Lazy: providers package heavy bootstrap
-    from ccgram.providers import resolve_launch_command
-
-    pending_thread_id: int | None = (
-        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
-    )
-
-    launch_command = resolve_launch_command(provider_name, approval_mode=approval_mode)
-
-    success, message, created_wname, created_wid = await tmux_manager.create_window(
-        selected_path, launch_command=launch_command
-    )
-    if not success:
-        await _abort_topic_creation(query, message, context)
-        return
-
-    # Race-guard: tag this window as "directory flow in progress" BEFORE any
-    # subsequent await. The provider's SessionStart hook fires inside the new
-    # tmux pane within seconds; the SessionMonitor's 1s poll cycle would
-    # otherwise see an unbound window and auto-create a duplicate Telegram
-    # topic before bind_thread() runs below. See MC-2967 for full repro.
-    topic_orchestration.register_pending_creation(created_wid)
-
-    user_preferences.update_user_mru(user_id, selected_path)
-    session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
-    session_manager.set_window_cwd(created_wid, selected_path)
-    session_manager.set_window_provider(created_wid, provider_name)
-    session_manager.set_window_approval_mode(created_wid, approval_mode)
-    _persist_worktree_state(created_wid, selected_path, context)
-    logger.info(
-        "Window created: %s (id=%s) at %s provider=%s mode=%s (user=%d, thread=%s)",
-        created_wname,
-        created_wid,
-        selected_path,
-        provider_name,
-        approval_mode,
-        user_id,
-        pending_thread_id,
-    )
-    await tmux_manager.stamp_pane_title(created_wid, provider_name)
-
-    provider_caps = provider_registry.get(provider_name).capabilities
-    if provider_caps.chat_first_command_path:
-        # Lazy: shell ↔ topics cycle via window_callbacks adoption flow.
-        from ..shell.shell_prompt_orchestrator import ensure_setup
-
-        await _wait_for_shell_ready(created_wid)
-        await ensure_setup(created_wid, "auto")
-
-    if pending_thread_id is not None:
-        thread_router.bind_thread(
-            user_id, pending_thread_id, created_wid, window_name=created_wname
-        )
-        query_message = query.message
-        chat = query_message.chat if query_message else None
-        if chat and chat.type in ("group", "supergroup"):
-            thread_router.set_group_chat_id(user_id, pending_thread_id, chat.id)
-        # Bind is durable now — handle_new_window's `_is_window_already_bound`
-        # check will find the binding, so the pending-creation race-guard can
-        # be released. (Late SessionMonitor polls are still safe: they will
-        # take the already-bound branch instead.)
-        topic_orchestration.clear_pending_creation(created_wid)
-
-    provider = provider_registry.get(provider_name)
-    if approval_mode == "yolo" and provider.capabilities.has_yolo_confirmation:
-        await _accept_yolo_confirmation(created_wid)
-
-    if provider.capabilities.supports_hook:
-        await session_map_sync.wait_for_session_map_entry(created_wid)
-
-    if pending_thread_id is None:
-        await safe_edit(query, f"✅ {message}")
-        return
-
-    # CCGRAM-HOTFIX:sticky-bind-name — never clobber an existing topic title with
-    # the cwd/tmux window name on (re)bind. Prefer the sticky stored name; fall
-    # back to created_wname only for a genuinely new topic (no stored name yet).
-    _chat_id = thread_router.resolve_chat_id(user_id, pending_thread_id)
-    _label = get_stored_topic_name(_chat_id, pending_thread_id) or created_wname
-    try:
-        await context.bot.edit_forum_topic(
-            chat_id=_chat_id,
-            message_thread_id=pending_thread_id,
-            name=format_topic_name_for_mode(_label, approval_mode),
-        )
-    except TelegramError as e:
-        logger.debug("Failed to rename topic: %s", e)
-
-    await safe_edit(
-        query,
-        f"✅ {message}\n\nBound to this topic. Send messages here.",
-    )
-
-    pending_text = (
-        context.user_data.get(PENDING_THREAD_TEXT) if context.user_data else None
-    )
-    if pending_text:
-        logger.debug(
-            "Forwarding pending text to window %s (len=%d)",
-            created_wname,
-            len(pending_text),
-        )
-        if context.user_data is not None:
-            context.user_data.pop(PENDING_THREAD_TEXT, None)
-            context.user_data.pop(PENDING_THREAD_ID, None)
-
-        # Chat-first providers (shell): route through NL→command approval flow
-        if provider_caps.chat_first_command_path:
-            # Lazy: telegram_client wraps PTB Bot; shell.shell_commands
-            # ↔ topics cycle through approval callback wiring.
-            from ...telegram_client import PTBTelegramClient
-
-            # Lazy: shell.shell_commands ↔ topics cycle through approval wiring.
-            from ..shell.shell_commands import handle_shell_message
-
-            await handle_shell_message(
-                PTBTelegramClient(context.bot),
-                user_id,
-                pending_thread_id,
-                created_wid,
-                pending_text,
-            )
-        else:
-            send_ok, send_msg = await send_to_window(created_wid, pending_text)
-            if not send_ok:
-                logger.warning(
-                    "Failed to forward pending text to window %s (user %s): %s",
-                    created_wid,
-                    user_id,
-                    send_msg,
-                )
-                # Lazy: telegram_client wraps PTB Bot.
-                from ...telegram_client import PTBTelegramClient
-
-                await safe_send(
-                    PTBTelegramClient(context.bot),
-                    thread_router.resolve_chat_id(user_id, pending_thread_id),
-                    f"❌ Failed to send pending message: {send_msg}",
-                    message_thread_id=pending_thread_id,
-                )
-    elif context.user_data is not None:
-        context.user_data.pop(PENDING_THREAD_ID, None)
-
-
-async def _finalize_session_creation(
-    query: CallbackQuery,
-    user_id: int,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    selected_path: str,
-    provider_name: str,
-    approval_mode: str,
-) -> None:
-    """Shared finalize tail: validate the pending topic, then create+bind+launch.
-
-    Used by both the mode picker (``_handle_mode_select``, after the full
-    4-step wizard) and the quick-start defaults Yes button
-    (``CCGRAM-HOTFIX:quickstart-defaults``, which skips the wizard). Clears
-    browse state first — so a leftover worktree flow can't survive past
-    ``_check_ui_guards`` — reads the pending thread, runs the shared
-    topic-mismatch + double-click guard, then delegates to
-    ``_create_window_and_bind`` (which forwards the pending text on success).
-    """
-    pending_thread_id: int | None = (
-        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
-    )
-
-    clear_browse_state(context.user_data)
-
-    if not await _validate_provider_select(
-        query, user_id, update, context, pending_thread_id
-    ):
-        return
-
-    await _create_window_and_bind(
-        query, user_id, selected_path, provider_name, approval_mode, context
-    )
-
-
 async def _handle_defaults_yes(
     query: CallbackQuery,
     user_id: int,
@@ -1047,9 +686,9 @@ async def _handle_defaults_yes(
     """Handle CB_DEFAULTS_YES: skip the wizard, launch with quick-start defaults.
 
     CCGRAM-HOTFIX:quickstart-defaults — workspace cwd, current branch (no
-    worktree), Claude, YOLO. Reuses the same finalize tail as the mode picker,
-    so bind + launch + pending-text delivery are byte-for-byte identical to
-    completing the full wizard.
+    worktree), Claude, YOLO. Reuses the same finalize tail as the mode picker
+    (clear browse state → validate → ``launch_window``), so bind + launch +
+    pending-text delivery are identical to completing the full wizard.
     """
     pending_tid = (
         context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
@@ -1063,14 +702,29 @@ async def _handle_defaults_yes(
         await query.answer()
         await safe_edit(query, f"❌ Default directory missing: {QUICKSTART_DEFAULT_CWD}")
         return
-    await _finalize_session_creation(
+
+    clear_browse_state(context.user_data)
+
+    if not await _validate_provider_select(
+        query, user_id, update, context, pending_tid
+    ):
+        return
+
+    await launch_window(
         query,
-        user_id,
-        update,
         context,
-        QUICKSTART_DEFAULT_CWD,
-        QUICKSTART_DEFAULT_PROVIDER,
-        QUICKSTART_DEFAULT_MODE,
+        WindowLaunchRequest(
+            user_id=user_id,
+            thread_id=pending_tid,
+            provider_name=QUICKSTART_DEFAULT_PROVIDER,
+            cwd=QUICKSTART_DEFAULT_CWD,
+            mode=QUICKSTART_DEFAULT_MODE,
+            pending_text=(
+                context.user_data.get(PENDING_THREAD_TEXT)
+                if context.user_data
+                else None
+            ),
+        ),
     )
 
 
@@ -1108,38 +762,6 @@ async def _handle_defaults_no(
     await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
-async def _handle_mode_select(
-    query: CallbackQuery,
-    user_id: int,
-    data: str,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Handle CB_MODE_SELECT: select launch mode and create tmux window."""
-    parsed = _parse_mode_select(data)
-    if parsed is None:
-        await query.answer("Invalid mode", show_alert=True)
-        return
-
-    provider_name, approval_mode = parsed
-    if not provider_registry.is_valid(provider_name):
-        await query.answer("Unknown provider", show_alert=True)
-        return
-    if approval_mode not in ("normal", "yolo"):
-        await query.answer("Unknown mode", show_alert=True)
-        return
-
-    selected_path = _required_selected_path(context)
-    if selected_path is None:
-        await query.answer()
-        await safe_edit(query, "❌ Selection expired. Tap Cancel and retry.")
-        return
-
-    await _finalize_session_creation(
-        query, user_id, update, context, selected_path, provider_name, approval_mode
-    )
-
-
 async def _handle_cancel(
     query: CallbackQuery,
     update: Update,
@@ -1154,6 +776,7 @@ async def _handle_cancel(
         return
     clear_browse_state(context.user_data)
     clear_worktree_state(context.user_data)
+    clear_workspace_state(context.user_data)
     if context.user_data is not None:
         context.user_data.pop(PENDING_THREAD_ID, None)
         context.user_data.pop(PENDING_THREAD_TEXT, None)
@@ -1180,6 +803,8 @@ async def _handle_cancel(
     CB_WT_NEW,
     CB_WT_CONFIRM,
     CB_WT_EDIT_NAME,
+    CB_WS_SELECT,
+    CB_WS_SKIP,
     CB_DIR_CANCEL,
 )
 async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

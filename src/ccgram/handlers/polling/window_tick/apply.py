@@ -29,7 +29,8 @@ from ....config import config
 from ....providers import get_provider_for_window
 from ....telegram_client import PTBTelegramClient
 from ....thread_router import thread_router
-from ....tmux_manager import tmux_manager
+from ....multiplexer import agent_status_cache
+from ....multiplexer import multiplexer as tmux_manager
 from ....window_state_ports.pane_state import (
     get_pane_lifecycle_notify,
     get_pane_projection,
@@ -63,7 +64,8 @@ if TYPE_CHECKING:
     from telegram import Bot
 
     from ....providers.base import AgentProvider
-    from ....tmux_manager import TmuxWindow
+    from ....multiplexer.base import WindowRef as TmuxWindow
+    from ..polling_runtime import PollingRuntime
 
 logger = structlog.get_logger()
 
@@ -78,13 +80,17 @@ def _get_provider(window_id: str) -> "AgentProvider":
 
 
 async def _send_typing_throttled(
-    bot: "Bot", user_id: int, thread_id: int | None
+    bot: "Bot",
+    user_id: int,
+    thread_id: int | None,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
     if thread_id is None:
         return
-    if lifecycle_strategy.is_typing_throttled(user_id, thread_id):
+    lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
+    if lc.is_typing_throttled(user_id, thread_id):
         return
-    lifecycle_strategy.record_typing_sent(user_id, thread_id)
+    lc.record_typing_sent(user_id, thread_id)
     chat_id = thread_router.resolve_chat_id(user_id, thread_id)
     client = PTBTelegramClient(bot)
     with contextlib.suppress(TelegramError):
@@ -105,12 +111,15 @@ async def _transition_to_idle(
     thread_id: int,
     chat_id: int,
     display: str,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
-    terminal_poll_state.cancel_startup_timer(window_id)
+    ps = runtime.poll_state if runtime is not None else terminal_poll_state
+    lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
+    ps.cancel_startup_timer(window_id)
     client = PTBTelegramClient(bot)
     await update_topic_emoji(client, chat_id, thread_id, "idle", display)
-    lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
-    lifecycle_strategy.clear_typing_state(user_id, thread_id)
+    lc.clear_autoclose_timer(user_id, thread_id)
+    lc.clear_typing_state(user_id, thread_id)
     await enqueue_status_update(
         client, user_id, window_id, IDLE_STATUS_TEXT, thread_id=thread_id
     )
@@ -176,9 +185,11 @@ async def _scan_window_panes(
     user_id: int,
     window_id: str,
     thread_id: int,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
     """Delegate multi-pane scanning to ``PaneStatusStrategy``."""
-    transitions = await pane_status_strategy.scan_window(
+    pss = runtime.pane_status if runtime is not None else pane_status_strategy
+    transitions = await pss.scan_window(
         bot,
         user_id,
         window_id,
@@ -236,6 +247,7 @@ async def _check_interactive_only(
     thread_id: int,
     *,
     _window: "TmuxWindow | None" = None,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
     w = _window or await tmux_manager.find_window_by_id(window_id)
     if not w:
@@ -248,7 +260,7 @@ async def _check_interactive_only(
     if not pane_text:
         return
 
-    status = await _resolve_status(window_id, pane_text, w)
+    status = await _resolve_status(window_id, pane_text, w, runtime=runtime)
 
     if status is not None and status.is_interactive:
         set_interactive_mode(user_id, window_id, thread_id)
@@ -263,11 +275,16 @@ async def _check_interactive_only(
 
 
 async def _maybe_check_passive_shell(
-    bot: "Bot", user_id: int, window_id: str, thread_id: int
+    bot: "Bot",
+    user_id: int,
+    window_id: str,
+    thread_id: int,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
     if not _get_provider(window_id).capabilities.chat_first_command_path:
         return
-    ws = terminal_poll_state.get_state(window_id)
+    ps = runtime.poll_state if runtime is not None else terminal_poll_state
+    ws = ps.get_state(window_id)
     rendered = ws.last_rendered_text
     if rendered is None:
         raw = await tmux_manager.capture_pane(window_id)
@@ -289,11 +306,24 @@ async def _maybe_check_passive_shell(
 
 
 async def _handle_dead_window_notification(
-    bot: "Bot", user_id: int, thread_id: int, wid: str
+    bot: "Bot",
+    user_id: int,
+    thread_id: int,
+    wid: str,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
-    if lifecycle_strategy.is_dead_notified(user_id, thread_id, wid):
+    lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
+    ps = runtime.poll_state if runtime is not None else terminal_poll_state
+    if lc.is_dead_notified(user_id, thread_id, wid):
         return
-    terminal_poll_state.clear_seen_status(wid)
+    # Mark notified before the first await: the push (event-stream) and poll
+    # paths both call this for the same window and could otherwise both pass the
+    # guard above before either marks, sending two banners + two autoclose timers.
+    lc.mark_dead_notified(user_id, thread_id, wid)
+    # Evict any push-cached status so a dead/replaced window (herdr reuses tab
+    # ids across restart) can't serve a stale "working" to the status poll.
+    agent_status_cache.clear(wid)
+    ps.clear_seen_status(wid)
 
     clear_tool_msg_ids_for_topic(user_id, thread_id)
     chat_id = thread_router.resolve_chat_id(user_id, thread_id)
@@ -301,9 +331,7 @@ async def _handle_dead_window_notification(
     await update_topic_emoji(
         PTBTelegramClient(bot), chat_id, thread_id, "dead", display
     )
-    lifecycle_strategy.start_autoclose_timer(
-        user_id, thread_id, "dead", time.monotonic()
-    )
+    lc.start_autoclose_timer(user_id, thread_id, "dead", time.monotonic())
 
     view = window_query.view_window(wid)
     cwd = view.cwd if view else ""
@@ -343,7 +371,7 @@ async def _handle_dead_window_notification(
                 "thread not found" in probe_err.message.lower()
                 or "topic_id_invalid" in probe_err.message.lower()
             ):
-                terminal_poll_state.reset_probe_failures(wid)
+                ps.reset_probe_failures(wid)
                 await clear_topic_state(
                     user_id,
                     thread_id,
@@ -360,7 +388,6 @@ async def _handle_dead_window_notification(
                 )
         except TelegramError:
             pass
-    lifecycle_strategy.mark_dead_notified(user_id, thread_id, wid)
 
 
 # ── Decision-application transitions ───────────────────────────────────
@@ -372,12 +399,15 @@ async def _apply_active_transition(
     window_id: str,
     thread_id: int | None,
     decision: TickDecision,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
+    ps = runtime.poll_state if runtime is not None else terminal_poll_state
+    lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
     if decision.send_status:
         claude_task_state.clear_wait_header(window_id)
         claude_task_state.set_last_status(window_id, decision.status_text or "")
-        terminal_poll_state.mark_seen_status(window_id)
-        await _send_typing_throttled(bot, user_id, thread_id)
+        ps.mark_seen_status(window_id)
+        await _send_typing_throttled(bot, user_id, thread_id, runtime=runtime)
         subagent_names = get_subagent_names(window_id)
         display_status = decision.status_text or ""
         if subagent_names:
@@ -392,14 +422,14 @@ async def _apply_active_transition(
         )
     else:
         claude_task_state.clear_wait_header(window_id)
-        await _send_typing_throttled(bot, user_id, thread_id)
+        await _send_typing_throttled(bot, user_id, thread_id, runtime=runtime)
     if thread_id is not None:
         chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         display = thread_router.get_display_name(window_id)
         await update_topic_emoji(
             PTBTelegramClient(bot), chat_id, thread_id, "active", display
         )
-        lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
+        lc.clear_autoclose_timer(user_id, thread_id)
 
 
 async def _apply_done_transition(
@@ -407,21 +437,22 @@ async def _apply_done_transition(
     user_id: int,
     window_id: str,
     thread_id: int | None,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
     if thread_id is None:
         return
+    ps = runtime.poll_state if runtime is not None else terminal_poll_state
+    lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
     chat_id = thread_router.resolve_chat_id(user_id, thread_id)
     display = thread_router.get_display_name(window_id)
-    terminal_poll_state.cancel_startup_timer(window_id)
+    ps.cancel_startup_timer(window_id)
     client = PTBTelegramClient(bot)
     await update_topic_emoji(client, chat_id, thread_id, "done", display)
-    lifecycle_strategy.start_autoclose_timer(
-        user_id, thread_id, "done", time.monotonic()
-    )
-    lifecycle_strategy.clear_typing_state(user_id, thread_id)
+    lc.start_autoclose_timer(user_id, thread_id, "done", time.monotonic())
+    lc.clear_typing_state(user_id, thread_id)
     await enqueue_status_update(client, user_id, window_id, None, thread_id=thread_id)
     if not _get_provider(window_id).capabilities.supports_hook:
-        terminal_poll_state.mark_seen_status(window_id)
+        ps.mark_seen_status(window_id)
 
 
 async def _apply_starting_transition(
@@ -429,18 +460,21 @@ async def _apply_starting_transition(
     user_id: int,
     window_id: str,
     thread_id: int | None,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
-    ws = terminal_poll_state.peek_state(window_id)
+    ps = runtime.poll_state if runtime is not None else terminal_poll_state
+    lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
+    ws = ps.peek_state(window_id)
     if ws is None or ws.startup_time is None:
-        terminal_poll_state.begin_startup_timer(window_id, time.monotonic())
-    await _send_typing_throttled(bot, user_id, thread_id)
+        ps.begin_startup_timer(window_id, time.monotonic())
+    await _send_typing_throttled(bot, user_id, thread_id, runtime=runtime)
     if thread_id is not None:
         chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         display = thread_router.get_display_name(window_id)
         await update_topic_emoji(
             PTBTelegramClient(bot), chat_id, thread_id, "active", display
         )
-        lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
+        lc.clear_autoclose_timer(user_id, thread_id)
 
 
 async def _apply_tick_decision(
@@ -449,13 +483,16 @@ async def _apply_tick_decision(
     window_id: str,
     thread_id: int | None,
     decision: TickDecision,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
     """Apply the effects dictated by a ``TickDecision``. All I/O lives here."""
     if decision.show_recovery or decision.transition is None:
         return
 
     if decision.transition == "active":
-        await _apply_active_transition(bot, user_id, window_id, thread_id, decision)
+        await _apply_active_transition(
+            bot, user_id, window_id, thread_id, decision, runtime=runtime
+        )
     elif decision.transition == "idle" and thread_id is not None:
         await _transition_to_idle(
             bot,
@@ -464,11 +501,16 @@ async def _apply_tick_decision(
             thread_id,
             thread_router.resolve_chat_id(user_id, thread_id),
             thread_router.get_display_name(window_id),
+            runtime=runtime,
         )
     elif decision.transition == "done":
-        await _apply_done_transition(bot, user_id, window_id, thread_id)
+        await _apply_done_transition(
+            bot, user_id, window_id, thread_id, runtime=runtime
+        )
     elif decision.transition == "starting":
-        await _apply_starting_transition(bot, user_id, window_id, thread_id)
+        await _apply_starting_transition(
+            bot, user_id, window_id, thread_id, runtime=runtime
+        )
 
 
 # ── Status-update orchestration ─────────────────────────────────────────
@@ -481,6 +523,7 @@ async def _update_status(
     thread_id: int | None = None,
     *,
     _window: "TmuxWindow | None" = None,
+    runtime: "PollingRuntime | None" = None,
 ) -> None:
     w = _window or await tmux_manager.find_window_by_id(window_id)
     if not w:
@@ -493,8 +536,8 @@ async def _update_status(
     if not pane_text:
         return
 
-    _check_vim_insert(window_id, pane_text, w)
-    status = await _resolve_status(window_id, pane_text, w)
+    _check_vim_insert(window_id, pane_text, w, runtime=runtime)
+    status = await _resolve_status(window_id, pane_text, w, runtime=runtime)
 
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True
@@ -512,7 +555,7 @@ async def _update_status(
         await handle_interactive_ui(client, user_id, window_id, thread_id)
         return
 
-    ctx = build_context(window_id, w, status)
+    ctx = build_context(window_id, w, status, runtime=runtime)
     decision = decide_tick(ctx)
     await _apply_tick_decision(
         bot,
@@ -520,6 +563,7 @@ async def _update_status(
         window_id,
         thread_id,
         decision,
+        runtime=runtime,
     )
 
 

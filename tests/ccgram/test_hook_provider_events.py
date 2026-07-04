@@ -258,6 +258,30 @@ def test_codex_stop_redacts_raw_prompt_and_tool_payload(
     assert "last_assistant_message" not in event["data"]
 
 
+def test_codex_stop_outputs_valid_stop_hook_json(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
+    _run_hook(
+        monkeypatch,
+        {
+            "session_id": _CODEX_SESSION_ID,
+            "cwd": "/tmp/project",
+            "transcript_path": "/tmp/.codex/session.jsonl",
+            "hook_event_name": "Stop",
+            "model": "gpt-5",
+            "permission_mode": "default",
+            "turn_id": "turn",
+            "stop_hook_active": False,
+            "last_assistant_message": "secret output",
+        },
+        "codex",
+    )
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {}
+
+
 def test_codex_adapter_rejects_non_uuid_session_id() -> None:
     from ccgram.hooks.adapters import get_hook_adapter
 
@@ -356,6 +380,28 @@ def test_detect_provider_from_payload_uses_gemini_only_event_name() -> None:
 
     # AfterAgent is unique to Gemini
     assert detect_provider_from_payload({"hook_event_name": "AfterAgent"}) == "gemini"
+
+
+def test_detect_provider_from_payload_claude_model_field_not_codex() -> None:
+    from ccgram.hooks.adapters import detect_provider_from_payload
+
+    # Claude Stop/Notification payloads now carry a ``model`` field; a Claude
+    # transcript path must not be misdetected as codex.
+    payload: dict[str, object] = {
+        "session_id": "550e8400-e29b-41d4-a716-446655440000",
+        "hook_event_name": "Stop",
+        "transcript_path": "/home/u/.claude/projects/proj/sess.jsonl",
+        "model": "claude-opus-4-8",
+        "permission_mode": "default",
+    }
+    assert detect_provider_from_payload(payload) is None
+
+
+def test_detect_provider_from_payload_codex_model_field_still_codex() -> None:
+    from ccgram.hooks.adapters import detect_provider_from_payload
+
+    # A model-bearing payload that is not a Claude transcript still infers codex.
+    assert detect_provider_from_payload({"model": "gpt-5-codex"}) == "codex"
 
 
 def test_gemini_install_adds_provider_specific_hooks(

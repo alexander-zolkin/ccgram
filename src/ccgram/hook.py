@@ -22,7 +22,6 @@ import shlex
 import subprocess
 import structlog
 import sys
-import time
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -31,7 +30,8 @@ from ccgram.hooks.adapters import (
     detect_provider_from_payload,
     get_hook_adapter,
 )
-from ccgram.hooks.model import ProviderName
+from ccgram.hooks.model import NormalizedHookEvent, ProviderName
+from ccgram.multiplexer.self_identify import resolve_self_identity
 
 logger = structlog.get_logger()
 
@@ -645,6 +645,57 @@ def _hook_status(provider_name: str = "claude") -> int:  # noqa: PLR0911
     return 1
 
 
+def _resolve_herdr_tab_id(pane_id: str) -> str | None:
+    """Resolve a herdr pane id to its containing tab id.
+
+    Runs ``herdr pane get <pane_id>`` and extracts ``result["pane"]["tab_id"]``.
+    The socket path is picked up from ``$HERDR_SOCKET_PATH`` by the herdr CLI
+    automatically (same as the multiplexer backend's subprocess runner).
+
+    Returns None on any failure (herdr not installed, socket down, pane gone)
+    so the caller degrades gracefully to the pane id.
+    """
+    try:
+        result = subprocess.run(
+            ["herdr", "pane", "get", pane_id],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("herdr pane get failed for pane %s: %s", pane_id, exc)
+        return None
+    if result.returncode != 0:
+        logger.warning(
+            "herdr pane get returned non-zero for pane %s (rc=%d): %s",
+            pane_id,
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning(
+            "herdr pane get returned unparseable JSON for pane %s: %s", pane_id, exc
+        )
+        return None
+    if not isinstance(payload, dict):
+        logger.warning(
+            "herdr pane get returned unexpected type %s for pane %s",
+            type(payload).__name__,
+            pane_id,
+        )
+        return None
+    tab_id = payload.get("result", {}).get("pane", {}).get("tab_id")
+    if not isinstance(tab_id, str) or not tab_id:
+        logger.warning(
+            "herdr pane get missing tab_id for pane %s (payload=%r)", pane_id, payload
+        )
+        return None
+    return tab_id
+
+
 def _resolve_window_id(pane_id: str) -> tuple[str, str, str, str] | None:
     """Resolve tmux pane ID to (session_window_key, window_id, window_name, pane_tty).
 
@@ -809,14 +860,12 @@ def _write_event(
     events_file = ccgram_dir() / "events.jsonl"
     events_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Lazy: hooks.state_files only imported when an event fires (same rationale
+    # as the utils import above: keep the hook fast path lean).
+    from .hooks.state_files import serialize_event_record
+
     event_line = json.dumps(
-        {
-            "ts": time.time(),
-            "event": event_type,
-            "window_key": window_key,
-            "session_id": session_id,
-            "data": data,
-        },
+        serialize_event_record(event_type, session_id, window_key, data),
         separators=(",", ":"),
     )
 
@@ -883,13 +932,12 @@ def _update_session_map(
                     except OSError:
                         logger.warning("Failed to read session_map.json")
 
-                session_map[session_window_key] = {
-                    "session_id": session_id,
-                    "cwd": cwd,
-                    "window_name": window_name,
-                    "transcript_path": transcript_path,
-                    "provider_name": provider_name,
-                }
+                # Lazy: same hook fast-path rationale as _write_event.
+                from .hooks.state_files import serialize_session_map_entry
+
+                session_map[session_window_key] = serialize_session_map_entry(
+                    session_id, cwd, window_name, transcript_path, provider_name
+                )
 
                 # Clean up old-format key ("session:window_name") if it exists
                 old_key = f"{tmux_session_name}:{window_name}"
@@ -1023,7 +1071,9 @@ def _refresh_session_map_if_stale(
         )
     ):
         return
-    tmux_session_name = session_window_key.rsplit(":", 1)[0]
+    # Backend prefix token: split on the FIRST colon so herdr keys
+    # ("herdr:w2:t1") yield "herdr", not "herdr:w2" (the tab id has a colon).
+    tmux_session_name = session_window_key.split(":", 1)[0]
     _update_session_map(
         session_window_key,
         session_id,
@@ -1085,44 +1135,64 @@ def _locate_primary_window(
     claude in the pane. Returns ``None`` when the pane can't be resolved or
     when a nested claude (e.g. claude-mem observer) fired the hook — the
     nested case is logged at info so the rejection is visible to operators.
+
+    Identity resolution is backend-neutral via ``resolve_self_identity``: tmux
+    panes resolve through ``_resolve_window_id`` (``display-message``), herdr
+    panes resolve pane→tab via ``_resolve_herdr_tab_id`` so the session_map key
+    becomes ``herdr:<tab_id>`` (matching ``list_windows``).
     """
-    pane_id = os.environ.get("TMUX_PANE", "")
-    if not pane_id:
-        logger.warning("TMUX_PANE not set, cannot determine window")
+    identity = resolve_self_identity(
+        os.environ,
+        tmux_query=_resolve_window_id,
+        herdr_query=_resolve_herdr_tab_id,
+    )
+    if identity is None:
+        if not os.environ.get("TMUX_PANE") and not os.environ.get("HERDR_PANE_ID"):
+            logger.warning(
+                "Neither TMUX_PANE nor HERDR_PANE_ID set, cannot determine window"
+            )
+        elif os.environ.get("HERDR_PANE_ID"):
+            logger.warning(
+                "HERDR_PANE_ID=%s set but tab resolution failed "
+                "(herdr not installed, socket down, or pane gone); "
+                "hook event dropped",
+                os.environ.get("HERDR_PANE_ID"),
+            )
         return None
-    resolved = _resolve_window_id(pane_id)
-    if not resolved:
-        return None
-    session_window_key, window_id, window_name, pane_tty = resolved
     logger.debug(
-        "tmux key=%s, window_name=%s, session_id=%s, event=%s",
-        session_window_key,
-        window_name,
+        "%s key=%s, window_name=%s, session_id=%s, event=%s",
+        identity.mux,
+        identity.session_window_key,
+        identity.window_name,
         session_id,
         event,
     )
-    if provider_name == "claude" and _is_nested_session(pane_tty):
+    # pane_tty is "" for herdr (no tty exposed), so _is_nested_session fails
+    # open to False there — the nested-observer guard stays a tmux-only no-op.
+    if provider_name == "claude" and _is_nested_session(identity.pane_tty):
         logger.info(
             "Skipping hook from nested claude (window_key=%s, session_id=%s, event=%s)",
-            session_window_key,
+            identity.session_window_key,
             session_id,
             event,
         )
         return None
-    return session_window_key, window_id, window_name
+    return identity.session_window_key, identity.window_id, identity.window_name
 
 
-def _process_hook_stdin(provider_name: str | None = None) -> None:
+def _process_hook_stdin(
+    provider_name: str | None = None,
+) -> NormalizedHookEvent | None:
     """Process an agent hook event from stdin."""
     logger.debug("Processing hook event from stdin")
     try:
         raw_payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("Failed to parse stdin JSON: %s", e)
-        return
+        return None
     if not isinstance(raw_payload, dict):
         logger.warning("Hook stdin JSON must be an object")
-        return
+        return None
     payload: dict[str, object] = raw_payload
 
     payload_provider = detect_provider_from_payload(payload)
@@ -1135,36 +1205,37 @@ def _process_hook_stdin(provider_name: str | None = None) -> None:
         )
     detected_provider = provider_name or payload_provider
     if detected_provider is None:
-        pane_id = os.environ.get("TMUX_PANE", "")
-        resolved = _resolve_window_id(pane_id) if pane_id else None
-        if resolved:
-            detected_provider = _provider_from_pane_tty(resolved[3])
+        identity = resolve_self_identity(os.environ, tmux_query=_resolve_window_id)
+        if identity:
+            detected_provider = _provider_from_pane_tty(identity.pane_tty)
     if detected_provider is None:
         detected_provider = "claude"
 
     adapter = get_hook_adapter(detected_provider)
     if adapter is None:
         logger.debug("Ignoring hook for unsupported provider: %s", detected_provider)
-        return
+        return None
     normalized = adapter.normalize(payload)
     if normalized is None:
         logger.debug(
             "Ignoring invalid hook payload for provider: %s", detected_provider
         )
-        return
+        return None
 
     event = normalized.canonical_event_name
     if event not in _HOOK_EVENT_TYPES and event not in {"PreCompact", "PostCompact"}:
         logger.debug("Ignoring unhandled event: %s", event)
-        return
+        return None
 
     located = _locate_primary_window(normalized.session_id, event, detected_provider)
     if located is None:
-        return
+        return None
     session_window_key, _window_id, window_name = located
 
     if event == "SessionStart":
-        tmux_session_name = session_window_key.rsplit(":", 1)[0]
+        # Backend prefix token (see _refresh_session_map_if_stale): split on the
+        # first colon so herdr keys ("herdr:w2:t1") yield "herdr".
+        tmux_session_name = session_window_key.split(":", 1)[0]
         transcript_path = _resolve_transcript_path(
             detected_provider,
             normalized.session_id,
@@ -1190,7 +1261,7 @@ def _process_hook_stdin(provider_name: str | None = None) -> None:
             }
         )
         _write_event(event, normalized.session_id, session_window_key, data)
-        return
+        return normalized
 
     _refresh_session_map_if_stale(
         session_window_key,
@@ -1201,6 +1272,28 @@ def _process_hook_stdin(provider_name: str | None = None) -> None:
         str(normalized.transcript_path) if normalized.transcript_path else "",
     )
     _write_event(event, normalized.session_id, session_window_key, normalized.data)
+    return normalized
+
+
+def _configure_hook_logging() -> None:
+    """Keep hook diagnostics off stdout, which some providers parse as protocol."""
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        level=logging.DEBUG,
+        stream=sys.stderr,
+        force=True,
+    )
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.dev.ConsoleRenderer(colors=False),
+        ],
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        cache_logger_on_first_use=False,
+    )
 
 
 def hook_main(
@@ -1210,11 +1303,7 @@ def hook_main(
     provider_name: str = "claude",
 ) -> None:
     """Process a Claude Code hook event from stdin, or manage hook installation."""
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        level=logging.DEBUG,
-        stream=sys.stderr,
-    )
+    _configure_hook_logging()
 
     if install:
         logger.info("Hook install requested")
@@ -1231,4 +1320,12 @@ def hook_main(
     # keeps the explicit flag to surface the mismatch warning when payload
     # heuristics disagree). The CLI default also resolves to "claude", so the
     # None path covers the common case of an unannotated hook command.
-    _process_hook_stdin(provider_name if provider_name != "claude" else None)
+    normalized = _process_hook_stdin(
+        provider_name if provider_name != "claude" else None
+    )
+    if (
+        normalized
+        and normalized.provider_name == "codex"
+        and (normalized.canonical_event_name == "Stop")
+    ):
+        print("{}")

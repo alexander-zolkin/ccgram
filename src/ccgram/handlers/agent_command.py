@@ -29,7 +29,6 @@ from telegram import (
 
 from ..config import config
 from ..session import session_manager
-from ..session_map import session_map_sync
 from ..telegram_client import PTBTelegramClient, TelegramClient
 from ..thread_router import thread_router
 from ..window_state_ports import identity_state
@@ -172,13 +171,13 @@ async def _redetect_provider(window_id: str) -> str:
     from ..providers import detect_provider_from_pane
 
     # Lazy: tmux_manager imports providers; same cycle-break as above.
-    from ..tmux_manager import tmux_manager
+    from ..multiplexer import multiplexer as tmux_manager
 
     w = await tmux_manager.find_window_by_id(window_id)
     detected = ""
     if w and w.pane_current_command:
         detected = await detect_provider_from_pane(
-            w.pane_current_command, pane_tty=w.pane_tty, window_id=window_id
+            w.pane_current_command, window_id=window_id
         )
     return detected or "shell"
 
@@ -199,12 +198,9 @@ def _commit_switch(window_id: str, chosen: str, current: str, *, manual: bool) -
     if same_provider:
         return
     if chosen != "shell":
-        # Hookful providers: explicitly drop the previous provider's
-        # session_map entry so SessionMonitor stops polling the old
-        # transcript. Switching to shell already triggers the same clear via
-        # ``WindowStateStore._on_hookless_provider_switch`` — calling it
-        # twice would double-fire the lock-protected file write.
-        session_map_sync.clear_session_map_entry(window_id)
+        # session_map entry is now cleared unconditionally by
+        # set_window_provider via _on_hookless_provider_switch for any real
+        # provider switch — no explicit call needed here.
         return
     # Leaving a hookful provider for shell: drop monitor/orchestrator state.
     # Lazy: shell subpackage pulls shell_infra; only needed on the shell-switch branch.

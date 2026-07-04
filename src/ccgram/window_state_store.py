@@ -322,9 +322,18 @@ class WindowStateStore:
             self._schedule_save()
 
     def clear_window_session(self, window_id: str) -> None:
-        """Clear session association for a window (e.g., after /clear command)."""
+        """Clear session association for a window (e.g., after /clear command).
+
+        Session-reset commands such as Codex ``/clear`` can move the active
+        conversation to a new transcript while the tmux window stays alive. If
+        the old transcript path remains cached, transcript discovery treats the
+        hook-backed session as already resolved and the monitor keeps tailing the
+        stale file. Clear both fields so the next polling tick can discover and
+        register the new active transcript for the same topic.
+        """
         state = self.get_window_state(window_id)
         state.session_id = ""
+        state.transcript_path = ""
         self._schedule_save()
         logger.debug("Cleared session for window_id %s", window_id)
 
@@ -465,9 +474,10 @@ class WindowStateStore:
         Always saves state unconditionally. When *cwd* is provided, persists it
         in the same write so provider/cwd updates stay atomic.
 
-        When switching to a hookless provider (e.g. shell), invokes the
-        ``_on_hookless_provider_switch`` callback so the caller can clear the
-        stale session_map.json entry without a circular import.
+        On any real provider switch, invokes the ``_on_hookless_provider_switch``
+        callback so the caller can clear the stale session_map.json entry without
+        a circular import. For hookless providers (e.g. shell), also zeroes
+        session_id and transcript_path since those won't be refreshed by a hook.
 
         ``new_provider_supports_hook`` must be resolved by the caller (e.g.
         via ``registry.get(provider_name).capabilities.supports_hook``) so
@@ -480,15 +490,15 @@ class WindowStateStore:
             state.cwd = cwd
 
         # Guards: (1) only on real provider change, (2) only when non-empty
-        # (empty string is a reset-to-default and must NOT trigger cleanup),
-        # (3) only for hookless providers. Session fields are cleared only when
-        # set, but the hookless-switch callback is always invoked for hookless.
-        if (
-            old_provider != provider_name
-            and provider_name
-            and not new_provider_supports_hook
-        ):
-            if state.session_id:
+        # (empty string is a reset-to-default and must NOT trigger cleanup).
+        # Always clear the stale session_map.json entry on any provider switch
+        # so the poll loop doesn't fight a lingering entry from the old
+        # provider (e.g. claude → pi both support hooks, so the old path was
+        # never cleaned, causing repeated "Corrected provider" spam).
+        # Session fields are additionally zeroed only for hookless providers
+        # since hook-based providers update them via their own hooks.
+        if old_provider != provider_name and provider_name:
+            if not new_provider_supports_hook and state.session_id:
                 state.session_id = ""
                 state.transcript_path = ""
             self._on_hookless_provider_switch(window_id)
