@@ -39,6 +39,10 @@ _PTB_BOT_ALLOWLIST = frozenset(
         # /agent wraps get_bot() in PTBTelegramClient to pass through to
         # ensure_setup (so the shell-setup offer keyboard can render).
         "agent_command.py",
+        # CCGRAM-HOTFIX:autoresume — passes the raw Bot through to
+        # recovery_banner.auto_continue_from_message (recovery infra takes
+        # the PTB Bot; same shape as the recovery/ modules below).
+        "text/text_handler.py",
         "cleanup.py",
         "command_history.py",
         "commands/__init__.py",
@@ -76,6 +80,10 @@ _SINGLETON_ALLOWLIST = frozenset(
         # pattern as sync_command/sessions_dashboard) and clears session_map
         # for hookful provider switches (no equivalent in query layer).
         "agent_command.py",
+        # CCGRAM-HOTFIX:autoresume — passes the raw Bot through to
+        # recovery_banner.auto_continue_from_message (recovery infra takes
+        # the PTB Bot; same shape as the recovery/ modules below).
+        "text/text_handler.py",
         "callback_helpers.py",
         "callback_registry.py",
         "cleanup.py",

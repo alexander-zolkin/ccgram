@@ -152,11 +152,9 @@ class TestUpdateTopicEmoji:
         with patch(_PATCH_MONOTONIC, return_value=0.0):
             await update_topic_emoji(bot, -100, 42, "idle", "bun")
 
-        bot.edit_forum_topic.assert_called_once_with(
-            chat_id=-100,
-            message_thread_id=42,
-            name=f"{EMOJI_IDLE} bun",
-        )
+        # CCGRAM-HOTFIX:sticky-topic-name — the user owns the topic title; a
+        # window/display rename with unchanged state must NOT relabel the topic.
+        bot.edit_forum_topic.assert_not_called()
 
     async def test_strips_existing_prefix(self) -> None:
         bot = AsyncMock()
@@ -297,18 +295,18 @@ class TestUpdateTopicEmoji:
             return_value="yolo",
         ):
             await _debounced_update(bot, -100, 42, "active", "myproject")
+        # CCGRAM-HOTFIX:no-yolo-dice — the yolo badge is intentionally dropped.
         bot.edit_forum_topic.assert_called_once_with(
             chat_id=-100,
             message_thread_id=42,
-            name=f"{EMOJI_ACTIVE} {EMOJI_YOLO} myproject",
+            name=f"{EMOJI_ACTIVE} myproject",
         )
 
 
 class TestFormatTopicNameForMode:
     def test_formats_yolo_name(self) -> None:
-        assert (
-            format_topic_name_for_mode("myproject", "yolo") == f"{EMOJI_YOLO} myproject"
-        )
+        # CCGRAM-HOTFIX:no-yolo-dice — no badge in yolo mode either.
+        assert format_topic_name_for_mode("myproject", "yolo") == "myproject"
 
     def test_formats_normal_name(self) -> None:
         assert format_topic_name_for_mode("myproject", "normal") == "myproject"
@@ -329,10 +327,12 @@ class TestTopicNamePreservation:
         await _debounced_update(bot, -100, 42, "active", "myproject")
         bot.edit_forum_topic.reset_mock()
         await _debounced_update(bot, -100, 42, "idle", "renamed")
+        # CCGRAM-HOTFIX:sticky-topic-name — state change refreshes the emoji,
+        # but the label stays the stored (user-owned) name, not the new display.
         bot.edit_forum_topic.assert_called_once_with(
             chat_id=-100,
             message_thread_id=42,
-            name=f"{EMOJI_IDLE} renamed",
+            name=f"{EMOJI_IDLE} myproject",
         )
 
     async def test_emoji_prefix_does_not_trigger_name_change(self) -> None:
@@ -378,11 +378,9 @@ class TestHerdrToTelegramRename:
         with patch(_PATCH_MONOTONIC, return_value=1000.0):
             await update_topic_emoji(bot, -100, 42, "idle", "workspace ▸ new-agent")
 
-        bot.edit_forum_topic.assert_called_once_with(
-            chat_id=-100,
-            message_thread_id=42,
-            name=f"{EMOJI_IDLE} workspace ▸ new-agent",
-        )
+        # CCGRAM-HOTFIX:freeze-topic-name — backend tab renames must not
+        # relabel the Telegram topic; only a genuine Telegram-side rename may.
+        bot.edit_forum_topic.assert_not_called()
 
     async def test_same_display_name_after_sync_does_not_relabel(self) -> None:
         """No Telegram call when the tab name did not change."""
@@ -692,10 +690,11 @@ class TestRemoteControlBadge:
             ),
         ):
             await _debounced_update(bot, -100, 42, "active", "myproject")
+        # CCGRAM-HOTFIX:no-yolo-dice — RC badge survives, yolo badge does not.
         bot.edit_forum_topic.assert_called_once_with(
             chat_id=-100,
             message_thread_id=42,
-            name=f"{EMOJI_ACTIVE} {EMOJI_RC} {EMOJI_YOLO} myproject",
+            name=f"{EMOJI_ACTIVE} {EMOJI_RC} myproject",
         )
 
 

@@ -149,8 +149,10 @@ class TestDisplayNames:
     def test_sync_display_names(self, router: ThreadRouter) -> None:
         router.window_display_names["@1"] = "old-name"
         changed = router.sync_display_names([("@1", "new-name")])
-        assert changed is True
-        assert router.get_display_name("@1") == "new-name"
+        # CCGRAM-HOTFIX:freeze-topic-name — backend renames are ignored; the
+        # stored display name (and thus the topic title) is the source of truth.
+        assert changed is False
+        assert router.get_display_name("@1") == "old-name"
 
     def test_sync_no_change(self, router: ThreadRouter) -> None:
         router.window_display_names["@1"] = "same"

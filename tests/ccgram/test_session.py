@@ -561,8 +561,10 @@ class TestSyncDisplayNames:
     def test_updates_drifted_name(self, mgr: SessionManager) -> None:
         thread_router.window_display_names["@1"] = "old-name"
         changed = mgr.sync_display_names([("@1", "new-name")])
-        assert changed is True
-        assert thread_router.get_display_name("@1") == "new-name"
+        # CCGRAM-HOTFIX:freeze-topic-name — drifted backend names do not
+        # overwrite the stored display name.
+        assert changed is False
+        assert thread_router.get_display_name("@1") == "old-name"
 
     def test_updates_window_state_too(self, mgr: SessionManager) -> None:
         thread_router.window_display_names["@1"] = "old-name"
@@ -584,8 +586,9 @@ class TestSyncDisplayNames:
         thread_router.window_display_names["@1"] = "a"
         thread_router.window_display_names["@2"] = "b"
         changed = mgr.sync_display_names([("@1", "a-renamed"), ("@2", "b")])
-        assert changed is True
-        assert thread_router.get_display_name("@1") == "a-renamed"
+        # CCGRAM-HOTFIX:freeze-topic-name — renames ignored for known windows.
+        assert changed is False
+        assert thread_router.get_display_name("@1") == "a"
         assert thread_router.get_display_name("@2") == "b"
 
     def test_heals_stale_window_state_when_router_already_correct(

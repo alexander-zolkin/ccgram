@@ -108,17 +108,28 @@ _disabled_chats: set[int] = set()
 # Alexander owns the topic text; ccgram only manages the leading status emoji.
 # The tmux window name must never re-impose itself on the title. Only a genuine
 # Telegram rename (forum_topic_edited → update_stored_topic_name) changes text.
-_TOPIC_NAMES_PATH = os.path.expanduser("~/.ccgram/topic_base_names.json")
+
+
+def _topic_names_path() -> str:
+    """Resolve the persist path via ccgram_dir() (honors $CCGRAM_DIR).
+
+    Resolved per call, not at import: the test suite points CCGRAM_DIR at a
+    tmp dir, and a hardcoded ~/.ccgram here once let tests read/write the
+    LIVE daemon state."""
+    from ...utils import ccgram_dir
+
+    return str(ccgram_dir() / "topic_base_names.json")
 
 
 def _persist_topic_names() -> None:
     """Atomically write the clean base-name cache to disk."""
     try:
         data = {f"{c}:{t}": n for (c, t), n in _topic_names.items()}
-        tmp = f"{_TOPIC_NAMES_PATH}.tmp"
+        path = _topic_names_path()
+        tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, _TOPIC_NAMES_PATH)
+        os.replace(tmp, path)
     except OSError as e:
         logger.debug("Could not persist topic base names: %s", e)
 
@@ -126,7 +137,7 @@ def _persist_topic_names() -> None:
 def _load_topic_names() -> None:
     """Seed the in-memory base-name cache from disk on startup."""
     try:
-        with open(_TOPIC_NAMES_PATH, encoding="utf-8") as f:
+        with open(_topic_names_path(), encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return

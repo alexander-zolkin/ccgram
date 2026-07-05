@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ....telegram_client import PTBTelegramClient
-from ....tmux_manager import tmux_manager
+from ....multiplexer import multiplexer as tmux_manager
 from ...messaging_pipeline.message_queue import get_message_queue
 from ...recovery.transcript_discovery import discover_and_register_transcript
 from ..polling_runtime import PollingRuntime, get_default_runtime
