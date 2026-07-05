@@ -23,6 +23,7 @@ Flow state: topic_creation_draft.py
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,7 @@ from telegram import (
 )
 
 from ..callback_data import (
+    CB_DEFAULTS_MODEL,
     CB_DEFAULTS_NO,
     CB_DEFAULTS_YES,
     CB_DIR_CANCEL,
@@ -46,6 +48,8 @@ from ..callback_data import (
     CB_DIR_STAR,
     CB_DIR_UP,
     CB_MODE_SELECT,
+    CB_MODEL_BACK,
+    CB_MODEL_PICK,
     CB_PROV_SELECT,
     CB_WT_CONFIRM,
     CB_WT_EDIT_NAME,
@@ -78,6 +82,8 @@ from .directory_browser import (
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
     build_directory_browser,
+    build_model_picker,
+    build_quickstart_prompt,
     build_worktree_confirm,
     build_worktree_picker,
     clear_browse_state,
@@ -207,6 +213,12 @@ async def handle_directory_callback(
         await _handle_defaults_yes(query, user_id, update, context)
     elif data == CB_DEFAULTS_NO:  # CCGRAM-HOTFIX:quickstart-defaults
         await _handle_defaults_no(query, user_id, update, context)
+    elif data == CB_DEFAULTS_MODEL:  # CCGRAM-HOTFIX:model-picker
+        await _handle_defaults_model(query, update, context)
+    elif data == CB_MODEL_BACK:  # CCGRAM-HOTFIX:model-picker
+        await _handle_model_back(query, update, context)
+    elif data.startswith(CB_MODEL_PICK):  # CCGRAM-HOTFIX:model-picker
+        await _handle_model_pick(query, user_id, data, update, context)
     elif data.startswith(CB_DIR_FAV):
         await _handle_fav(query, user_id, data, update, context)
     elif data.startswith(CB_DIR_STAR):
@@ -728,6 +740,114 @@ async def _handle_defaults_yes(
     )
 
 
+# CCGRAM-HOTFIX:model-picker — model ids are typed into a shell via
+# send_keys(literal), so only allow safe characters from callback data.
+_MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+
+
+async def _handle_defaults_model(
+    query: CallbackQuery,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_DEFAULTS_MODEL: show the model picker.
+
+    CCGRAM-HOTFIX:model-picker — morphs the quick-start prompt into a list of
+    models fetched from the Anthropic API (``model_catalog.list_models()``,
+    static fallback when the API is unreachable). Flow state stays
+    STATE_CONFIRMING_DEFAULTS, so the same guards apply as for the prompt.
+    """
+    # Lazy: keep the httpx-based catalog out of the handlers import path
+    from ...model_catalog import list_models
+
+    pending_tid = (
+        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
+    )
+    if pending_tid is None:
+        await query.answer("Stale prompt (flow reset)", show_alert=True)
+        return
+    if get_thread_id(update) != pending_tid:
+        await query.answer("Stale prompt (topic mismatch)", show_alert=True)
+        return
+    await query.answer()
+    models = await list_models()
+    msg_text, keyboard = build_model_picker([(m.id, m.display_name) for m in models])
+    await safe_edit(query, msg_text, reply_markup=keyboard)
+
+
+async def _handle_model_back(
+    query: CallbackQuery,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_MODEL_BACK: return from the picker to the quick-start prompt.
+
+    CCGRAM-HOTFIX:model-picker
+    """
+    pending_tid = (
+        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
+    )
+    if pending_tid is None:
+        await query.answer("Stale prompt (flow reset)", show_alert=True)
+        return
+    await query.answer()
+    msg_text, keyboard = build_quickstart_prompt()
+    await safe_edit(query, msg_text, reply_markup=keyboard)
+
+
+async def _handle_model_pick(
+    query: CallbackQuery,
+    user_id: int,
+    data: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_MODEL_PICK: launch quick-start defaults with a chosen model.
+
+    CCGRAM-HOTFIX:model-picker — identical to ``_handle_defaults_yes`` except
+    the launch request carries ``model=<id>`` (appended as ``--model <id>``).
+    """
+    model_id = data[len(CB_MODEL_PICK) :]
+    if not _MODEL_ID_RE.fullmatch(model_id):
+        await query.answer("Invalid model id", show_alert=True)
+        return
+    pending_tid = (
+        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
+    )
+    if pending_tid is None:
+        await query.answer("Stale prompt (flow reset)", show_alert=True)
+        return
+    if not Path(QUICKSTART_DEFAULT_CWD).is_dir():
+        await query.answer()
+        await safe_edit(query, f"❌ Default directory missing: {QUICKSTART_DEFAULT_CWD}")
+        return
+
+    clear_browse_state(context.user_data)
+
+    if not await _validate_provider_select(
+        query, user_id, update, context, pending_tid
+    ):
+        return
+
+    await launch_window(
+        query,
+        context,
+        WindowLaunchRequest(
+            user_id=user_id,
+            thread_id=pending_tid,
+            provider_name=QUICKSTART_DEFAULT_PROVIDER,
+            cwd=QUICKSTART_DEFAULT_CWD,
+            mode=QUICKSTART_DEFAULT_MODE,
+            pending_text=(
+                context.user_data.get(PENDING_THREAD_TEXT)
+                if context.user_data
+                else None
+            ),
+            model=model_id,
+        ),
+    )
+
+
 async def _handle_defaults_no(
     query: CallbackQuery,
     user_id: int,
@@ -790,6 +910,9 @@ async def _handle_cancel(
 @register(
     CB_DEFAULTS_YES,  # CCGRAM-HOTFIX:quickstart-defaults
     CB_DEFAULTS_NO,  # CCGRAM-HOTFIX:quickstart-defaults
+    CB_DEFAULTS_MODEL,  # CCGRAM-HOTFIX:model-picker
+    CB_MODEL_PICK,  # CCGRAM-HOTFIX:model-picker
+    CB_MODEL_BACK,  # CCGRAM-HOTFIX:model-picker
     CB_DIR_FAV,
     CB_DIR_STAR,
     CB_DIR_SELECT,

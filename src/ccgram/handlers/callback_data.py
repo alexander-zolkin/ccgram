@@ -97,6 +97,13 @@ CB_WT_EDIT_NAME = "wt:ed"  # prompt for branch name via text reply
 CB_DEFAULTS_YES = "qs:yes"  # launch immediately with quick-start defaults
 CB_DEFAULTS_NO = "qs:no"  # fall through to the full directory-browser wizard
 
+# Model picker on the quick-start prompt — CCGRAM-HOTFIX:model-picker
+# "qs:model" opens a picker listing models fetched from the Anthropic API;
+# tapping one launches with the quick-start defaults + `--model <id>`.
+CB_DEFAULTS_MODEL = "qs:model"  # open the model picker
+CB_MODEL_PICK = "qs:m:"  # qs:m:<model_id> — launch defaults with this model
+CB_MODEL_BACK = "qs:back"  # back from the picker to the quick-start prompt
+
 # Workspace picker (directory browser flow — inserted before provider pick on
 # backends with native_agent_status=True, e.g. herdr; skipped on tmux).
 CB_WS_SELECT = "ws:sel:"  # ws:sel:<index> — select workspace at cached index

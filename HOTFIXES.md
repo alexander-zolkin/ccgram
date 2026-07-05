@@ -284,6 +284,37 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   binding between resolve and wizard, the file is delivered directly to the
   now-bound window.
 
+### `fresh-launch-args` — fresh sessions get the provider's launch args again
+- **Files:** `handlers/topics/window_launch_service.py`
+- **What:** upstream's v4 refactor routed fresh window creation through
+  `launch_window` → `create_window(launch_command=...)` without ever calling
+  the provider's fresh `make_launch_args()` — silently dropping our default
+  `--effort xhigh` for claude sessions. The args are now appended onto
+  `launch_command` (covers both the create_window and worktree branches).
+- **Why:** the effort default was added 2026-06-26 (Alexander's choice) and
+  died unnoticed in the v4.3.5 merge; this restores it and gives the model
+  picker its seam.
+
+### `model-picker` — model selection button on the quick-start prompt
+- **Files:** `model_catalog.py` (**new module**), `handlers/callback_data.py`,
+  `handlers/topics/directory_browser.py`, `handlers/topics/directory_callbacks.py`,
+  `handlers/topics/window_launch_service.py`
+  (+ `tests/ccgram/test_model_catalog.py`)
+- **What:** the quick-start "Use default settings?" prompt gains a
+  **🧠 Model…** button. It opens a picker listing models fetched live from
+  the Anthropic API (`GET /v1/models`, newest first, capped at 8; auth =
+  `ANTHROPIC_API_KEY` env or the Claude Code OAuth token from
+  `~/.claude/.credentials.json` + `anthropic-beta: oauth-2025-04-20`; static
+  fallback list when unreachable, 1h success cache / 1m failure cache).
+  Tapping a model launches with the quick-start defaults plus
+  `--model <id>` (`WindowLaunchRequest.model`, claude only).
+- **Why:** new sessions always started on the CLI default model; Alexander
+  wanted a one-tap model choice at session start, with the list coming from
+  the API so new models appear without code changes.
+- **Security note:** the model id round-trips through Telegram callback data
+  and is typed into a shell via `send_keys(literal)` — `_MODEL_ID_RE`
+  whitelists `[A-Za-z0-9._:-]` before it reaches the launch command.
+
 ---
 
 ## Marker → files quick map
@@ -308,6 +339,8 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `no-false-dead` | polling/window_tick/__init__.py | (see git log) |
 | `resume-own-session` | recovery/recovery_banner.py | (see git log) |
 | `file-first-unbound` | handlers/file_handler.py | (see git log) |
+| `fresh-launch-args` | topics/window_launch_service.py | (see git log) |
+| `model-picker` | model_catalog.py (new), callback_data.py, directory_browser.py, directory_callbacks.py, window_launch_service.py | (see git log) |
 
 Verify all present in an install:
 ```bash

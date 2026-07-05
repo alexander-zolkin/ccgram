@@ -63,6 +63,9 @@ class WindowLaunchRequest:
     cwd: str
     mode: str
     pending_text: str | None
+    # CCGRAM-HOTFIX:model-picker — optional model override for the fresh
+    # session; appended as `--model <id>` (claude provider only).
+    model: str | None = None
     # Worktree metadata is NOT carried in this request. It flows through
     # context.user_data via PENDING_WORKTREE_PATH / PENDING_WORKTREE_BRANCH /
     # PENDING_WORKTREE_REPO keys, read directly by _persist_worktree_state and
@@ -233,6 +236,23 @@ async def launch_window(  # noqa: PLR0915, C901
     approval_mode = request.mode
 
     launch_command = resolve_launch_command(provider_name, approval_mode=approval_mode)
+
+    # CCGRAM-HOTFIX:fresh-launch-args — upstream's v4 refactor stopped passing
+    # fresh-session args to the new window, which silently dropped the
+    # provider's fresh `make_launch_args()` (claude → `--effort xhigh`).
+    # Restore them, and append the model override from the quick-start model
+    # picker (CCGRAM-HOTFIX:model-picker). The args are appended onto
+    # launch_command so both the create_window and worktree branches get them.
+    try:
+        fresh_args = provider_registry.get(provider_name).make_launch_args()
+    except Exception:  # noqa: BLE001 — a bad provider must not block launch
+        fresh_args = ""
+    if not isinstance(fresh_args, str):
+        fresh_args = ""
+    if request.model and provider_name == "claude":
+        fresh_args = f"{fresh_args} --model {request.model}".strip()
+    if fresh_args:
+        launch_command = f"{launch_command} {fresh_args}"
 
     chosen_workspace_id: str | None = (
         context.user_data.get(PENDING_WORKSPACE_ID) if context.user_data else None

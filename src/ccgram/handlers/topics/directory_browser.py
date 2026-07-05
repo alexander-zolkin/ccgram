@@ -22,6 +22,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from ...config import config
 from ...user_preferences import user_preferences
 from ..callback_data import (
+    CB_DEFAULTS_MODEL,
     CB_DEFAULTS_NO,
     CB_DEFAULTS_YES,
     CB_DIR_CANCEL,
@@ -34,6 +35,8 @@ from ..callback_data import (
     CB_DIR_UP,
     CB_PROV_SELECT,
     CB_MODE_SELECT,
+    CB_MODEL_BACK,
+    CB_MODEL_PICK,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -162,8 +165,39 @@ def build_quickstart_prompt() -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("✅ Yes", callback_data=CB_DEFAULTS_YES),
             InlineKeyboardButton("⚙️ No", callback_data=CB_DEFAULTS_NO),
         ],
+        # CCGRAM-HOTFIX:model-picker — defaults with a different model
+        [InlineKeyboardButton("🧠 Model…", callback_data=CB_DEFAULTS_MODEL)],
         [InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL)],
     ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_model_picker(
+    models: list[tuple[str, str]],
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the model picker shown from the quick-start prompt.
+
+    CCGRAM-HOTFIX:model-picker — ``models`` is a list of ``(id, display_name)``
+    pairs (from ``model_catalog.list_models()``). Tapping a model launches the
+    quick-start defaults with ``--model <id>`` appended.
+
+    Returns: (text, keyboard).
+    """
+    text = (
+        "*Pick a model*\n\n"
+        "Quick-start defaults will be used; only the model changes.\n"
+        "List is fetched live from the Anthropic API."
+    )
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"{CB_MODEL_PICK}{model_id}")]
+        for model_id, name in models
+    ]
+    buttons.append(
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data=CB_MODEL_BACK),
+            InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL),
+        ]
+    )
     return text, InlineKeyboardMarkup(buttons)
 
 
