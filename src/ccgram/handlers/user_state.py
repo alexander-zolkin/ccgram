@@ -37,3 +37,8 @@ PENDING_WORKTREE_DIRTY = "_pending_worktree_dirty"
 PENDING_WORKTREE_SUBDIR = "_pending_worktree_subdir"
 PENDING_WORKTREE_CREATING = "_pending_worktree_creating"
 AWAITING_WORKTREE_BRANCH_NAME = "_awaiting_worktree_branch_name"
+
+# Quick-start model picker (CCGRAM-HOTFIX:model-picker) — the model selected on
+# the "Use default settings?" prompt, carried into the Yes launch as --model.
+PENDING_MODEL_ID = "_pending_model_id"  # str — API model id, or absent for default
+PENDING_MODEL_NAME = "_pending_model_name"  # str — display name shown on the prompt

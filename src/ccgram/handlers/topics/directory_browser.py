@@ -49,6 +49,8 @@ from ..callback_data import (
 )
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
+    PENDING_MODEL_ID,
+    PENDING_MODEL_NAME,
     PENDING_WORKSPACE_ID,
     PENDING_WORKSPACES,
     PENDING_WORKTREE_BRANCH,
@@ -141,13 +143,24 @@ def clear_window_picker_state(user_data: dict | None) -> None:
         user_data.pop(UNBOUND_WINDOWS_KEY, None)
 
 
-def build_quickstart_prompt() -> tuple[str, InlineKeyboardMarkup]:
+def clear_model_state(user_data: dict | None) -> None:
+    """Clear the quick-start model selection.  # CCGRAM-HOTFIX:model-picker"""
+    if user_data is not None:
+        user_data.pop(PENDING_MODEL_ID, None)
+        user_data.pop(PENDING_MODEL_NAME, None)
+
+
+def build_quickstart_prompt(model_label: str) -> tuple[str, InlineKeyboardMarkup]:
     """Build the "Use default settings?" yes/no prompt.  # CCGRAM-HOTFIX:quickstart-defaults
 
     Shown as the FIRST step when creating a new session on an unbound topic
     (no unbound windows to adopt). "Yes" skips the 4-step wizard and launches
     immediately with the quick-start defaults; "No" falls through to the
     directory browser and the full wizard.
+
+    ``model_label`` is the model the Yes launch will use — the selection made
+    via the model picker (CCGRAM-HOTFIX:model-picker), or the claude CLI
+    default when nothing has been picked.
 
     Returns: (text, keyboard).
     """
@@ -156,16 +169,17 @@ def build_quickstart_prompt() -> tuple[str, InlineKeyboardMarkup]:
         "*Use default settings?*\n\n"
         f"Launch right away in `{display_cwd}`:\n"
         "• Provider: 🟠 Claude\n"
+        f"• Model: `{model_label}`\n"
         "• Branch: current (no worktree)\n"
         "• Mode: 🎲 YOLO\n\n"
-        "Or tap *No* to choose directory, branch, provider and mode."
+        "Tap *🧠 Model* to change the model, or *No* for the full wizard."
     )
     buttons = [
         [
             InlineKeyboardButton("✅ Yes", callback_data=CB_DEFAULTS_YES),
             InlineKeyboardButton("⚙️ No", callback_data=CB_DEFAULTS_NO),
         ],
-        # CCGRAM-HOTFIX:model-picker — defaults with a different model
+        # CCGRAM-HOTFIX:model-picker — change the model for the Yes launch
         [InlineKeyboardButton("🧠 Model…", callback_data=CB_DEFAULTS_MODEL)],
         [InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL)],
     ]
@@ -174,22 +188,30 @@ def build_quickstart_prompt() -> tuple[str, InlineKeyboardMarkup]:
 
 def build_model_picker(
     models: list[tuple[str, str]],
+    selected_id: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build the model picker shown from the quick-start prompt.
 
     CCGRAM-HOTFIX:model-picker — ``models`` is a list of ``(id, display_name)``
-    pairs (from ``model_catalog.list_models()``). Tapping a model launches the
-    quick-start defaults with ``--model <id>`` appended.
+    pairs (from ``model_catalog.list_models()``). Tapping a model *selects* it
+    (stored as the pending model) and returns to the quick-start prompt, where
+    "Yes" then launches with ``--model <id>``. ``selected_id`` marks the
+    current selection with a check.
 
     Returns: (text, keyboard).
     """
     text = (
         "*Pick a model*\n\n"
-        "Quick-start defaults will be used; only the model changes.\n"
+        "The quick-start defaults stay the same; only the model changes.\n"
         "List is fetched live from the Anthropic API."
     )
     buttons = [
-        [InlineKeyboardButton(name, callback_data=f"{CB_MODEL_PICK}{model_id}")]
+        [
+            InlineKeyboardButton(
+                f"{'✅ ' if model_id == selected_id else ''}{name}",
+                callback_data=f"{CB_MODEL_PICK}{model_id}",
+            )
+        ]
         for model_id, name in models
     ]
     buttons.append(

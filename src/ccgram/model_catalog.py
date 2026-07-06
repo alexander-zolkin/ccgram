@@ -30,6 +30,8 @@ _MODELS_URL = "https://api.anthropic.com/v1/models"
 _ANTHROPIC_VERSION = "2023-06-01"
 _OAUTH_BETA = "oauth-2025-04-20"
 _CREDENTIALS_PATH = "~/.claude/.credentials.json"
+_SETTINGS_PATH = "~/.claude/settings.json"
+_DEFAULT_MODEL_FALLBACK = "Claude CLI default"
 _TIMEOUT_S = 8.0
 _CACHE_TTL_S = 3600.0
 _FAILURE_TTL_S = 60.0  # don't hammer the API after a failure
@@ -57,6 +59,25 @@ _cache: tuple[float, float, list[ModelChoice]] | None = None  # (ts, ttl, models
 
 def _fallback_models() -> list[ModelChoice]:
     return [ModelChoice(id=i, display_name=n) for i, n in STATIC_FALLBACK]
+
+
+def default_model_label() -> str:
+    """Best-effort label for the model a fresh ``claude`` launch will use.
+
+    CCGRAM-HOTFIX:model-picker — reads the ``model`` field from
+    ``~/.claude/settings.json`` (the model the claude CLI uses when no
+    ``--model`` flag is passed, e.g. ``"opus[1m]"``). Returns a generic
+    fallback string when the file is unreadable or has no model set.
+    Never raises.
+    """
+    try:
+        settings = json.loads(Path(_SETTINGS_PATH).expanduser().read_text())
+        model = settings.get("model")
+    except (OSError, ValueError):
+        return _DEFAULT_MODEL_FALLBACK
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return _DEFAULT_MODEL_FALLBACK
 
 
 def _resolve_auth_headers() -> dict[str, str] | None:

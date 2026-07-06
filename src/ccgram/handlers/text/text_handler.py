@@ -34,6 +34,7 @@ from ..topics.directory_browser import (
     build_window_picker,
     build_worktree_confirm,
     clear_browse_state,
+    clear_model_state,
     clear_window_picker_state,
     clear_worktree_state,
 )
@@ -325,7 +326,12 @@ async def _handle_unbound_topic(
         user_id,
         thread_id,
     )
-    msg_text, keyboard = build_quickstart_prompt()
+    # CCGRAM-HOTFIX:model-picker — fresh flow: drop any stale model selection
+    # and show the claude CLI default as the starting model on the prompt.
+    clear_model_state(user_data)
+    from ...model_catalog import default_model_label
+
+    msg_text, keyboard = build_quickstart_prompt(default_model_label())
     if user_data is not None:
         user_data[STATE_KEY] = STATE_CONFIRMING_DEFAULTS
         user_data[PENDING_THREAD_ID] = thread_id

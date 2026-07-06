@@ -11,6 +11,7 @@ from ccgram.model_catalog import (
     STATIC_FALLBACK,
     ModelChoice,
     _parse_models,
+    default_model_label,
     list_models,
 )
 
@@ -107,3 +108,23 @@ class TestListModels:
             "authorization": "Bearer tok-123",
             "anthropic-beta": "oauth-2025-04-20",
         }
+
+
+class TestDefaultModelLabel:
+    def test_reads_model_from_settings(self, tmp_path) -> None:
+        settings = tmp_path / "settings.json"
+        settings.write_text('{"model": "opus[1m]"}')
+        with patch.object(model_catalog, "_SETTINGS_PATH", str(settings)):
+            assert default_model_label() == "opus[1m]"
+
+    def test_missing_file_returns_fallback(self, tmp_path) -> None:
+        with patch.object(
+            model_catalog, "_SETTINGS_PATH", str(tmp_path / "nope.json")
+        ):
+            assert default_model_label() == model_catalog._DEFAULT_MODEL_FALLBACK
+
+    def test_no_model_field_returns_fallback(self, tmp_path) -> None:
+        settings = tmp_path / "settings.json"
+        settings.write_text('{"theme": "dark"}')
+        with patch.object(model_catalog, "_SETTINGS_PATH", str(settings)):
+            assert default_model_label() == model_catalog._DEFAULT_MODEL_FALLBACK

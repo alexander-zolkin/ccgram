@@ -306,11 +306,20 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   `ANTHROPIC_API_KEY` env or the Claude Code OAuth token from
   `~/.claude/.credentials.json` + `anthropic-beta: oauth-2025-04-20`; static
   fallback list when unreachable, 1h success cache / 1m failure cache).
-  Tapping a model launches with the quick-start defaults plus
-  `--model <id>` (`WindowLaunchRequest.model`, claude only).
+  The quick-start prompt shows a **`• Model:`** line: the picked model's
+  display name, or the claude CLI default read from `~/.claude/settings.json`
+  (`default_model_label()`) when nothing has been picked. Tapping a model in
+  the picker **selects** it (stored as `PENDING_MODEL_ID`/`PENDING_MODEL_NAME`
+  in `user_data`) and returns to the prompt with the new model shown — it does
+  **not** launch. "Yes" then launches with the quick-start defaults plus
+  `--model <id>` (`WindowLaunchRequest.model`, claude only). The selection is
+  cleared on Yes-launch, on "No" (the wizard picks its own model), and on
+  Cancel; `text_handler` clears it and shows the CLI default when a fresh
+  prompt opens.
 - **Why:** new sessions always started on the CLI default model; Alexander
-  wanted a one-tap model choice at session start, with the list coming from
-  the API so new models appear without code changes.
+  wanted a one-tap model choice at session start **and** to see which model
+  the default launch will use before tapping Yes. The list comes from the API
+  so new models appear without code changes.
 - **Security note:** the model id round-trips through Telegram callback data
   and is typed into a shell via `send_keys(literal)` — `_MODEL_ID_RE`
   whitelists `[A-Za-z0-9._:-]` before it reaches the launch command.
