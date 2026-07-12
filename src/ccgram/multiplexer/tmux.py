@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import structlog
 import subprocess
 from collections.abc import AsyncGenerator, Sequence
@@ -878,8 +879,19 @@ class TmuxManager:
         if not path.is_dir():
             return False, f"Not a directory: {work_dir}", "", ""
 
-        # Create window name, adding suffix if name already exists
-        final_window_name = window_name if window_name else path.name
+        # Create window name, adding suffix if name already exists.
+        # CCGRAM-HOTFIX:session-topic-name — the workspace-root basename
+        # ("workspace"/"openclaw") is a useless, misleading topic name that
+        # every Kara session shares, so the forum fills with near-identical
+        # auto-topics "workspace-2/-10/-27". When no explicit name is given AND
+        # the cwd is a generic root, use a time-stamped session label instead;
+        # sessions in a real project subdir keep their (meaningful) basename.
+        if window_name:
+            final_window_name = window_name
+        elif path.name in {"workspace", "openclaw"}:
+            final_window_name = "kara " + datetime.datetime.now().strftime("%m-%d %H-%M")
+        else:
+            final_window_name = path.name
 
         # Check for existing window name
         base_name = final_window_name
