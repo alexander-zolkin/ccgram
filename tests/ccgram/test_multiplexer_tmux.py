@@ -11,7 +11,7 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -90,6 +90,36 @@ async def test_ensure_session_calls_get_or_create(mgr: TmuxManager) -> None:
     with mock.patch.object(mgr, "get_or_create_session") as create:
         await mgr.ensure_session()
         create.assert_called_once_with()
+
+
+async def test_reconciliation_listing_returns_none_without_session(
+    mgr: TmuxManager,
+) -> None:
+    server = MagicMock()
+    server.sessions.get.return_value = None
+    mgr._server = server
+
+    assert await mgr.list_windows_for_reconciliation() == []
+
+    server.sessions.get.side_effect = OSError("tmux unavailable")
+    assert await mgr.list_windows_for_reconciliation() is None
+    assert mgr._server is None
+
+
+def test_reconciliation_window_keeps_identity_when_pane_query_fails() -> None:
+    class FailedPaneWindow:
+        window_id = "@7"
+        window_name = "project"
+
+        @property
+        def active_pane(self):
+            raise OSError("pane unavailable")
+
+    window = TmuxManager._window_ref_for_reconciliation(FailedPaneWindow())  # type: ignore[arg-type]
+
+    assert window is not None
+    assert window.window_id == "@7"
+    assert window.cwd == ""
 
 
 async def test_find_window_by_id_returns_windowref(mgr: TmuxManager) -> None:

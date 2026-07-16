@@ -11,6 +11,7 @@ Fixtures are trimmed from live herdr 0.7.0 output.
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Sequence
 
 import pytest
@@ -25,10 +26,11 @@ from ccgram.multiplexer.base import (
 )
 from ccgram.multiplexer.herdr import (
     HERDR_PROTOCOL_VERSION,
+    HERDR_SUPPORTED_PROTOCOLS,
     HerdrError,
     HerdrManager,
-    HerdrProtocolError,
 )
+import ccgram.multiplexer.herdr as herdr_module
 from ccgram.multiplexer.herdr_events import SUBSCRIBED, translate_event
 
 # ── Captured JSON fixtures (live herdr 0.7.0) ──────────────────────────
@@ -270,14 +272,16 @@ ERROR_NOT_FOUND = json.dumps(
 )
 
 
-def _status_json(protocol: int = HERDR_PROTOCOL_VERSION, running: bool = True) -> str:
+def _status_json(
+    protocol: object = HERDR_PROTOCOL_VERSION, running: bool = True
+) -> str:
     return json.dumps(
         {
-            "client": {"version": "0.7.0", "protocol": protocol},
+            "client": {"version": "0.7.3", "protocol": protocol},
             "server": {
                 "status": "running" if running else "stopped",
                 "running": running,
-                "version": "0.7.0",
+                "version": "0.7.3",
                 "protocol": protocol,
                 "compatible": True,
             },
@@ -351,6 +355,54 @@ def test_constructor_does_no_io() -> None:
     assert fake.calls == []
 
 
+async def test_subprocess_run_uses_host_spawn_path(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("ccgram.multiplexer.herdr.subprocess.run", fake_run)
+    monkeypatch.setattr("ccgram.multiplexer.herdr.asyncio.to_thread", fake_to_thread)
+    monkeypatch.setattr(
+        "ccgram.multiplexer.herdr.shutil.which", lambda _: "/opt/bin/herdr"
+    )
+
+    rc, out, err = await HerdrManager(socket_path="/tmp/herdr.sock")._subprocess_run(
+        ["status"]
+    )
+
+    assert (rc, out, err) == (0, "ok", "")
+    # Absolute path + close_fds=False keep CPython on the fork-free
+    # posix_spawn path (no MallocStackLogging spam from forked children).
+    assert seen["argv"] == ["/opt/bin/herdr", "status"]
+    kwargs = seen["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["capture_output"] is True
+    assert kwargs["text"] is True
+    assert kwargs["check"] is False
+    assert kwargs["close_fds"] is False
+    assert kwargs["timeout"] == 8.0
+    env = kwargs["env"]
+    assert isinstance(env, dict)
+    assert env["HERDR_SOCKET_PATH"] == "/tmp/herdr.sock"
+
+
+async def test_subprocess_run_maps_timeout(monkeypatch) -> None:
+    async def fake_to_thread(func, *args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["herdr", "status"], timeout=5.0)
+
+    monkeypatch.setattr("ccgram.multiplexer.herdr.asyncio.to_thread", fake_to_thread)
+
+    rc, out, err = await HerdrManager()._subprocess_run(["status"])
+
+    assert (rc, out, err) == (124, "", "herdr call timed out")
+
+
 # ── find_window_by_id: tab identity (window_id = tab_id) ───────────────
 
 
@@ -414,6 +466,21 @@ async def test_find_window_by_id_bypasses_internal_label_filter() -> None:
 
 
 # ── list_windows: one WindowRef per tab ────────────────────────────────
+
+
+async def test_reconciliation_listing_returns_none_on_tab_list_failure() -> None:
+    failed = _manager(FakeHerdr())
+    empty = _manager(
+        FakeHerdr().on(
+            "tab",
+            "list",
+            out=json.dumps({"result": {"tabs": [], "type": "tab_list"}}),
+        )
+    )
+
+    assert await failed.list_windows_for_reconciliation() is None
+    assert await failed.list_windows() == []
+    assert await empty.list_windows_for_reconciliation() == []
 
 
 async def test_list_windows_returns_one_ref_per_tab() -> None:
@@ -1394,8 +1461,9 @@ async def test_foreground_missing_process_returns_none() -> None:
     assert await _manager(fake).foreground("w2:t1") is None
 
 
-async def test_ensure_session_accepts_pinned_protocol() -> None:
-    fake = FakeHerdr().on("status", out=_status_json())
+@pytest.mark.parametrize("protocol", sorted(HERDR_SUPPORTED_PROTOCOLS))
+async def test_ensure_session_accepts_supported_protocol(protocol: int) -> None:
+    fake = FakeHerdr().on("status", out=_status_json(protocol=protocol))
     await _manager(fake).ensure_session()  # no raise
     assert fake.sent("status") is not None
 
@@ -1412,10 +1480,57 @@ async def test_ensure_session_raises_on_non_object_json_status() -> None:
         await _manager(fake).ensure_session()
 
 
-async def test_ensure_session_refuses_protocol_mismatch() -> None:
-    fake = FakeHerdr().on("status", out=_status_json(protocol=99))
-    with pytest.raises(HerdrProtocolError, match="99"):
-        await _manager(fake).ensure_session()
+@pytest.mark.parametrize("protocol", [13, 17, "17", None, []])
+async def test_ensure_session_warns_and_continues_for_unverified_protocol(
+    protocol: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warnings: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(
+        herdr_module.logger,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    fake = FakeHerdr().on("status", out=_status_json(protocol=protocol))
+    await _manager(fake).ensure_session()
+
+    assert warnings == [
+        (
+            ("herdr protocol is unverified; continuing",),
+            {
+                "server_protocol": protocol,
+                "supported_protocols": sorted(HERDR_SUPPORTED_PROTOCOLS),
+                "cli_server_compatible": True,
+            },
+        )
+    ]
+
+
+async def test_ensure_session_warns_and_continues_when_cli_is_incompatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(
+        herdr_module.logger,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+    status = json.loads(_status_json())
+    status["server"]["compatible"] = False
+
+    fake = FakeHerdr().on("status", out=json.dumps(status))
+    await _manager(fake).ensure_session()
+
+    assert warnings == [
+        (
+            ("herdr protocol is unverified; continuing",),
+            {
+                "server_protocol": HERDR_PROTOCOL_VERSION,
+                "supported_protocols": sorted(HERDR_SUPPORTED_PROTOCOLS),
+                "cli_server_compatible": False,
+            },
+        )
+    ]
 
 
 async def test_ensure_session_raises_when_socket_down() -> None:

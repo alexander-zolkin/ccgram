@@ -399,6 +399,8 @@ class TestForwardCommandResolution:
             await forward_command_handler(update, _make_context())
 
         self.mock_send_to_window.assert_called_once_with("@1", "/status")
+        self.mock_probe_ctx.assert_not_called()
+        self.mock_probe_spawn.assert_not_called()
         codex_provider.build_status_snapshot.assert_called_once_with(
             "/tmp/codex.jsonl",
             display_name="project",
@@ -427,6 +429,8 @@ class TestForwardCommandResolution:
             await forward_command_handler(update, _make_context())
 
         self.mock_send_to_window.assert_called_once_with("@1", "/status")
+        self.mock_probe_ctx.assert_not_called()
+        self.mock_probe_spawn.assert_not_called()
         claude_provider.build_status_snapshot.assert_not_called()
         assert update.message.reply_text.call_count == 1
 

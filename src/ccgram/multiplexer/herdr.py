@@ -29,10 +29,11 @@ macOS), ``native_agent_status`` and ``supports_event_stream`` are True,
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
 import re
+import shutil
+import subprocess
 from collections.abc import (
     AsyncGenerator,
     AsyncIterator,
@@ -65,6 +66,7 @@ from .topic_mapping import format_agent_topic_prefix
 
 __all__ = [
     "HERDR_PROTOCOL_VERSION",
+    "HERDR_SUPPORTED_PROTOCOLS",
     "HerdrError",
     "HerdrManager",
     "HerdrProtocolError",
@@ -72,10 +74,11 @@ __all__ = [
 
 logger = structlog.get_logger()
 
-# Pinned herdr socket protocol version (``herdr status`` → ``server.protocol``).
-# herdr v0.7.0 speaks protocol 14. Bump deliberately after re-running the
-# contract test against a newer herdr (design risk "herdr maturity").
-HERDR_PROTOCOL_VERSION = 14
+# Supported herdr socket protocols (``herdr status`` → ``server.protocol``).
+# 14–16 are accepted without warnings. Other versions are attempted with a
+# warning so ccgram remains usable across herdr upgrades and downgrades.
+HERDR_SUPPORTED_PROTOCOLS = frozenset({14, 15, 16})
+HERDR_PROTOCOL_VERSION = max(HERDR_SUPPORTED_PROTOCOLS)
 
 # Static capability declaration for the herdr backend (design Task 7).
 _HERDR_CAPABILITIES = MultiplexerCapabilities(
@@ -124,7 +127,7 @@ class HerdrError(RuntimeError):
 
 
 class HerdrProtocolError(HerdrError):
-    """The running herdr server speaks an unsupported protocol version."""
+    """Reserved for callers that require a strict herdr protocol policy."""
 
 
 def _pane_index(pane_id: str) -> int:
@@ -165,7 +168,11 @@ class HerdrManager:
                 the live unix-socket reader (``open_socket_stream``).
         """
         self._socket_path = socket_path or os.environ.get("HERDR_SOCKET_PATH", "")
-        self._binary = binary
+        # Resolve to an absolute path: CPython only takes the fork-free
+        # ``posix_spawn`` fast path when the executable has a dirname (see
+        # subprocess.Popen._execute_child). Bare names force fork_exec, which
+        # triggers macOS ``MallocStackLogging`` spam from long-lived parents.
+        self._binary = shutil.which(binary) or binary
         self._run: HerdrRunner = runner or self._subprocess_run
         self._open_stream: HerdrStreamOpener = stream_opener or self._default_stream
 
@@ -182,30 +189,29 @@ class HerdrManager:
         env = dict(os.environ)
         if self._socket_path:
             env["HERDR_SOCKET_PATH"] = self._socket_path
-        proc: asyncio.subprocess.Process | None = None
         try:
-            proc = await asyncio.create_subprocess_exec(
-                self._binary,
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            # Force CPython's fork-free ``posix_spawn`` path: it requires an
+            # absolute executable (resolved in ``__init__``) and, on macOS
+            # builds without ``posix_spawn_file_actions_addclosefrom_np``,
+            # ``close_fds=False``. Forking from this long-lived async process
+            # makes every child print macOS ``MallocStackLogging`` warnings.
+            # fd inheritance is acceptable: herdr is a trusted, short-lived
+            # CLI that only talks to its socket.
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                [self._binary, *args],
+                capture_output=True,
+                text=True,
                 env=env,
+                timeout=_CALL_TIMEOUT_SECONDS,
+                check=False,
+                close_fds=False,
             )
-            async with asyncio.timeout(_CALL_TIMEOUT_SECONDS):
-                stdout, stderr = await proc.communicate()
-        except TimeoutError:
-            if proc:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                    await proc.wait()
+        except subprocess.TimeoutExpired:
             return (_RC_TIMEOUT, "", "herdr call timed out")
         except OSError as exc:
             return (_RC_NO_BINARY, "", str(exc))
-        return (
-            proc.returncode or 0,
-            stdout.decode("utf-8", errors="replace"),
-            stderr.decode("utf-8", errors="replace"),
-        )
+        return (completed.returncode, completed.stdout, completed.stderr)
 
     async def _call_json(self, args: Sequence[str]) -> dict | None:
         """Run ``herdr <args>`` and return the JSON ``result`` dict, or None.
@@ -289,11 +295,11 @@ class HerdrManager:
         chosen = focused or panes[0]
         return chosen.get("pane_id") or None
 
-    async def _tab_list(self) -> list[dict]:
-        """Return the raw tab dicts from ``tab list`` (private, full objects)."""
+    async def _tab_list(self) -> list[dict] | None:
+        """Return raw tab dicts, or None when ``tab list`` is unavailable."""
         result = await self._call_json(["tab", "list"])
-        if not result:
-            return []
+        if result is None:
+            return None
         return [t for t in result.get("tabs", []) if t.get("tab_id")]
 
     async def _tab_get(self, tab_id: str) -> dict | None:
@@ -347,11 +353,14 @@ class HerdrManager:
     # ── Multiplexer Protocol surface ───────────────────────────────────
 
     async def ensure_session(self) -> None:
-        """Verify the herdr server is reachable and speaks a pinned protocol.
+        """Verify the herdr server is reachable; warn for unverified protocols.
+
+        ``HERDR_SUPPORTED_PROTOCOLS`` are accepted without a warning. Other
+        protocol versions are best-effort: ccgram logs a warning and
+        continues so CLI-backed operations can still work after a herdr change.
 
         Raises:
-            HerdrProtocolError: server protocol ≠ ``HERDR_PROTOCOL_VERSION``.
-            HerdrError: socket unreachable / ``herdr status`` failed.
+            HerdrError: socket unreachable, malformed status, or stopped server.
         """
         rc, out, err = await self._run(["status", "--json"])
         if rc != 0:
@@ -362,14 +371,23 @@ class HerdrManager:
             raise HerdrError("herdr status returned non-JSON") from exc
         if not isinstance(status, dict):
             raise HerdrError("herdr status returned non-object JSON")
-        server = status.get("server") or {}
+        server = status.get("server")
+        if not isinstance(server, dict):
+            raise HerdrError("herdr status returned invalid server object")
         if not server.get("running"):
             raise HerdrError("herdr server is not running")
         proto = server.get("protocol")
-        if proto != HERDR_PROTOCOL_VERSION:
-            raise HerdrProtocolError(
-                f"herdr protocol {proto!r} unsupported "
-                f"(ccgram pins {HERDR_PROTOCOL_VERSION})"
+        cli_server_compatible = server.get("compatible")
+        is_supported_protocol = isinstance(proto, int) and not isinstance(proto, bool)
+        is_supported_protocol = (
+            is_supported_protocol and proto in HERDR_SUPPORTED_PROTOCOLS
+        )
+        if not is_supported_protocol or cli_server_compatible is False:
+            logger.warning(
+                "herdr protocol is unverified; continuing",
+                server_protocol=proto,
+                supported_protocols=sorted(HERDR_SUPPORTED_PROTOCOLS),
+                cli_server_compatible=cli_server_compatible,
             )
 
     @staticmethod
@@ -393,6 +411,10 @@ class HerdrManager:
         return "", cwd
 
     async def list_windows(self) -> list[WindowRef]:
+        """List windows, degrading an unavailable herdr server to an empty list."""
+        return await self.list_windows_for_reconciliation() or []
+
+    async def list_windows_for_reconciliation(self) -> list[WindowRef] | None:
         """List one ``WindowRef`` per herdr tab with its adaptive topic label.
 
         Identity: ``window_id = tab_id`` (tab identity — design Task 1). Builds
@@ -408,6 +430,8 @@ class HerdrManager:
         poll without touching the binding key (agent session id, Task 2).
         """
         tabs = await self._tab_list()
+        if tabs is None:
+            return None
         if not tabs:
             return []
         workspace_labels = await self._workspace_labels()

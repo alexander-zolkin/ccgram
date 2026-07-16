@@ -191,8 +191,14 @@ def format_pane_block(window_id: str) -> str | None:
     visible = [p for p in projections if p.state != "dead"]
     if len(visible) <= 1:
         return None
-    # Sort numerically so %2 comes before %10 — lexicographic puts %10 first.
-    visible.sort(key=lambda p: (int(p.pane_id.lstrip("%")), p.pane_id))
+    # Preserve tmux's numeric order while allowing opaque backend pane IDs.
+    visible.sort(
+        key=lambda p: (
+            (0, int(p.pane_id[1:]), p.pane_id)
+            if p.pane_id.startswith("%") and p.pane_id[1:].isdigit()
+            else (1, 0, p.pane_id)
+        )
+    )
     now_wall = time.time()
     items = [_format_pane_item(p, now_wall) for p in visible]
     if len(visible) >= _PANE_BLOCK_EXPAND_THRESHOLD:

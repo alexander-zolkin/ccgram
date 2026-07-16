@@ -24,6 +24,9 @@ def _patch_deps():
         patch("ccgram.handlers.sync_command.window_query") as mock_wq,
         patch("ccgram.handlers.sync_command.thread_router") as mock_tr,
         patch("ccgram.handlers.sync_command.tmux_manager") as mock_tm,
+        patch(
+            "ccgram.handlers.sync_command.list_windows_for_reconciliation"
+        ) as mock_listing,
         patch("ccgram.handlers.sync_command.config") as mock_cfg,
     ):
         mock_sm.audit_state.return_value = AuditResult(
@@ -32,6 +35,8 @@ def _patch_deps():
         mock_tr.iter_thread_bindings.return_value = []
         mock_sm.window_states = {}
         mock_tm.list_windows = AsyncMock(return_value=[])
+        mock_tm.list_windows_for_reconciliation = mock_listing
+        mock_listing.return_value = []
         mock_cfg.is_user_allowed.return_value = True
         yield mock_sm, mock_sms, mock_wq, mock_tr, mock_tm, mock_cfg
 
@@ -128,24 +133,28 @@ class TestBuildReport:
 
 
 class TestSyncDismiss:
-    async def test_dismiss_removes_keyboard(self, _patch_deps) -> None:
-        query = MagicMock()
+    async def test_dismiss_deletes_message(self, _patch_deps) -> None:
+        query = AsyncMock()
+        query.delete_message = AsyncMock()
         msg = MagicMock()
         msg.text = "some report text"
         query.message = msg
 
         with patch("ccgram.handlers.sync_command.safe_edit") as mock_edit:
             await handle_sync_dismiss(query)
-            mock_edit.assert_called_once_with(
-                query, "some report text", reply_markup=None
-            )
+            query.delete_message.assert_awaited_once()
+            mock_edit.assert_not_called()
 
-    async def test_dismiss_fallback_when_no_text(self, _patch_deps) -> None:
-        query = MagicMock()
-        query.message = None
+    async def test_dismiss_fallback_when_delete_fails(self, _patch_deps) -> None:
+        query = AsyncMock()
+        query.delete_message = AsyncMock(side_effect=TelegramError("Forbidden"))
+        msg = MagicMock()
+        msg.text = None
+        query.message = msg
 
         with patch("ccgram.handlers.sync_command.safe_edit") as mock_edit:
             await handle_sync_dismiss(query)
+            query.delete_message.assert_awaited_once()
             mock_edit.assert_called_once_with(query, "Dismissed", reply_markup=None)
 
 
@@ -182,11 +191,21 @@ class TestSyncCommand:
         update.effective_user = MagicMock(id=100)
         update.message = AsyncMock()
 
-        with patch("ccgram.handlers.sync_command.safe_reply") as mock_reply:
+        with (
+            patch(
+                "ccgram.handlers.sync_command.safe_reply",
+                new_callable=AsyncMock,
+            ) as mock_reply,
+            patch(
+                "ccgram.handlers.sync_command.safe_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
             await sync_command(update, MagicMock())
-            mock_reply.assert_called_once()
+            mock_reply.assert_awaited_once_with(update.message, "🔍 State audit…")
             mock_sm.audit_state.assert_called_once()
-            assert "2 topics bound" in mock_reply.call_args[0][1]
+            mock_edit.assert_awaited_once()
+            assert "2 topics bound" in mock_edit.call_args.args[1]
 
     async def test_reconciles_live_topic_names_before_reporting(
         self, _patch_deps
@@ -227,6 +246,21 @@ class TestSyncCommand:
 
 
 class TestSyncFix:
+    async def test_unavailable_listing_does_not_change_state(self, _patch_deps) -> None:
+        mock_sm, mock_sms, _, _, mock_tm, _ = _patch_deps
+        mock_tm.list_windows_for_reconciliation.return_value = None
+        query = MagicMock()
+
+        with patch("ccgram.handlers.sync_command.safe_edit") as mock_edit:
+            await handle_sync_fix(query)
+
+        mock_sm.sync_display_names.assert_not_called()
+        mock_sm.prune_stale_state.assert_not_called()
+        mock_sms.prune_session_map.assert_not_called()
+        mock_sm.prune_stale_window_states.assert_not_called()
+        assert mock_edit.call_count == 2
+        assert "No state changes were made" in mock_edit.call_args.args[1]
+
     async def test_fix_runs_cleanup_and_re_audits(self, _patch_deps) -> None:
         mock_sm, mock_sms, _, _, _, _ = _patch_deps
         mock_sm.audit_state.side_effect = [
@@ -249,8 +283,9 @@ class TestSyncFix:
             mock_sms.prune_session_map.assert_called_once_with(set())
             mock_sm.prune_stale_window_states.assert_called_once_with(set())
             assert mock_sm.audit_state.call_count == 2
-            mock_edit.assert_called_once()
-            assert "\u2705 Fixed 1 issue" in mock_edit.call_args[0][1]
+            assert mock_edit.call_count == 2
+            assert "🔧 Fixing…" in mock_edit.call_args_list[0].args[1]
+            assert "\u2705 Fixed 1 issue" in mock_edit.call_args_list[1].args[1]
 
     async def test_fix_computes_actual_fixed_count(self, _patch_deps) -> None:
         mock_sm, _, _, _, _, _ = _patch_deps
@@ -285,7 +320,7 @@ class TestSyncFix:
                 issues=[
                     AuditIssue(
                         "ghost_binding",
-                        "user:100 thread:42 window:@7 (dead)",
+                        "user:100 thread:42 window:w2:t1 (dead)",
                         fixable=True,
                     ),
                 ],
@@ -295,7 +330,7 @@ class TestSyncFix:
             AuditResult(issues=[], total_bindings=0, live_binding_count=0),
         ]
         mock_tr.resolve_chat_id.return_value = -999
-        mock_tr.get_window_for_thread.return_value = "@7"
+        mock_tr.get_window_for_thread.return_value = "w2:t1"
 
         query = MagicMock()
         mock_bot = AsyncMock()
@@ -312,7 +347,7 @@ class TestSyncFix:
             mock_cleanup.assert_called_once()
             cleanup_args = mock_cleanup.call_args
             assert cleanup_args.args[:2] == (100, 42)
-            assert cleanup_args.kwargs["window_id"] == "@7"
+            assert cleanup_args.kwargs["window_id"] == "w2:t1"
             assert cleanup_args.kwargs["client"].bot is mock_bot
             mock_tr.unbind_thread.assert_called_once_with(100, 42)
             report_text = mock_edit.call_args[0][1]
@@ -325,7 +360,7 @@ class TestSyncFix:
                 issues=[
                     AuditIssue(
                         "ghost_binding",
-                        "user:100 thread:42 window:@7 (dead)",
+                        "user:100 thread:42 window:w2:t1 (dead)",
                         fixable=True,
                     ),
                 ],
@@ -336,7 +371,7 @@ class TestSyncFix:
                 issues=[
                     AuditIssue(
                         "ghost_binding",
-                        "user:100 thread:42 window:@7 (dead)",
+                        "user:100 thread:42 window:w2:t1 (dead)",
                         fixable=True,
                     ),
                 ],
@@ -345,7 +380,7 @@ class TestSyncFix:
             ),
         ]
         mock_tr.resolve_chat_id.return_value = -999
-        mock_tr.get_window_for_thread.return_value = "@7"
+        mock_tr.get_window_for_thread.return_value = "w2:t1"
 
         query = MagicMock()
         mock_bot = AsyncMock()
@@ -354,7 +389,7 @@ class TestSyncFix:
         query.get_bot = MagicMock(return_value=mock_bot)
 
         with (
-            patch("ccgram.handlers.sync_command.safe_edit"),
+            patch("ccgram.handlers.sync_command.safe_edit") as mock_edit,
             patch("ccgram.handlers.sync_command.clear_topic_state") as mock_cleanup,
         ):
             await handle_sync_fix(query)
@@ -362,6 +397,8 @@ class TestSyncFix:
             mock_bot.close_forum_topic.assert_called_once()
             mock_cleanup.assert_not_called()
             mock_tr.unbind_thread.assert_not_called()
+            report_text = mock_edit.call_args[0][1]
+            assert "safe to close manually" in report_text
 
     async def test_fix_skips_close_when_no_group_chat(self, _patch_deps) -> None:
         mock_sm, _, _, mock_tr, _, _ = _patch_deps
@@ -404,7 +441,7 @@ class TestSyncFix:
         mock_sm.audit_state.side_effect = [
             AuditResult(
                 issues=[
-                    AuditIssue("orphaned_window", "@5 (stray)", fixable=True),
+                    AuditIssue("orphaned_window", "w2:t5 (stray)", fixable=True),
                 ],
                 total_bindings=1,
                 live_binding_count=1,
@@ -427,7 +464,7 @@ class TestSyncFix:
             await handle_sync_fix(query)
             mock_handle.assert_called_once()
             event = mock_handle.call_args[0][0]
-            assert event.window_id == "@5"
+            assert event.window_id == "w2:t5"
             assert event.window_name == "stray-proj"
 
     def test_orphaned_window_label(self) -> None:
@@ -519,10 +556,11 @@ class TestDeadTopicRecreation:
             new_callable=AsyncMock,
         ) as mock_handle:
             recreated = await _recreate_dead_topics(bot, issues)
-            closed = await _close_ghost_topics(bot, issues)
+            closed, manual_close = await _close_ghost_topics(bot, issues)
 
         assert recreated == 0
         assert closed == 0
+        assert manual_close == 0
         mock_handle.assert_not_called()
         mock_tr.unbind_thread.assert_not_called()
         bot.delete_forum_topic.assert_not_called()
@@ -532,12 +570,12 @@ class TestDeadTopicRecreation:
         mock_wq.view_window.return_value = MagicMock(
             session_id="s1", cwd="/tmp/proj", window_name="qmd-go"
         )
-        mock_tr.get_window_for_thread.return_value = "@2"
+        mock_tr.get_window_for_thread.return_value = "w2:t2"
 
         issues = [
             AuditIssue(
                 "dead_topic",
-                "user:100 thread:42 window:@2 (qmd-go)",
+                "user:100 thread:42 window:w2:t2 (qmd-go)",
                 fixable=True,
             ),
         ]
@@ -553,7 +591,7 @@ class TestDeadTopicRecreation:
             mock_tr.unbind_thread.assert_called_once_with(100, 42)
             mock_handle.assert_called_once()
             event = mock_handle.call_args[0][0]
-            assert event.window_id == "@2"
+            assert event.window_id == "w2:t2"
             assert event.window_name == "qmd-go"
 
     async def test_recreate_skips_non_dead_topic_issues(self, _patch_deps) -> None:

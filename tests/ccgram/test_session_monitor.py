@@ -26,6 +26,39 @@ def monitor(tmp_path) -> SessionMonitor:
     )
 
 
+class TestMonitorLoop:
+    async def test_unavailable_listing_skips_pruning(
+        self, monitor: SessionMonitor
+    ) -> None:
+        async def _stop_after_cycle(_delay: float) -> None:
+            monitor._running = False
+
+        with (
+            patch.object(monitor, "_cleanup_all_stale_sessions", AsyncMock()),
+            patch.object(
+                monitor, "_load_current_session_map", AsyncMock(return_value={})
+            ),
+            patch.object(
+                monitor, "_detect_and_cleanup_changes", AsyncMock(return_value={})
+            ),
+            patch(
+                "ccgram.session_monitor.read_session_map_raw",
+                AsyncMock(return_value={}),
+            ),
+            patch("ccgram.session_map.session_map_sync") as mock_sync,
+            patch(
+                "ccgram.session_monitor.list_windows_for_reconciliation",
+                AsyncMock(return_value=None),
+            ),
+            patch("ccgram.session_monitor.asyncio.sleep", _stop_after_cycle),
+        ):
+            mock_sync.load_session_map = AsyncMock()
+            monitor._running = True
+            await monitor._monitor_loop()
+
+        mock_sync.prune_session_map.assert_not_called()
+
+
 class TestPendingToolsCleanup:
     async def test_cleanup_stale_removes_pending_tools(
         self, monitor: SessionMonitor

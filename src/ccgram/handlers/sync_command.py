@@ -32,6 +32,7 @@ from ..session_map import session_map_sync
 from ..telegram_client import PTBTelegramClient, TelegramClient
 from ..thread_router import thread_router
 from ..multiplexer import multiplexer as tmux_manager
+from ..multiplexer.reconciliation import list_windows_for_reconciliation
 from ..user_preferences import user_preferences
 from .callback_data import CB_SYNC_DISMISS, CB_SYNC_FIX
 from .callback_registry import register
@@ -44,8 +45,8 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-_GHOST_RE = re.compile(r"user:(\d+) thread:(\d+) window:(@\d+)")
-_WINDOW_RE = re.compile(r"(@\d+)")
+_GHOST_RE = re.compile(r"user:(\d+)\s+thread:(\d+)\s+window:([^\s(]+)")
+_WINDOW_RE = re.compile(r"([^\s(]+)")
 
 _CATEGORY_LABELS: dict[str, str] = {
     "ghost_binding": "ghost binding (dead window)",
@@ -113,6 +114,7 @@ def _format_report(
     fixed_count: int = 0,
     closed_topic_count: int = 0,
     recreated_topic_count: int = 0,
+    manual_close_count: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     """Build report text and optional keyboard."""
     lines: list[str] = []
@@ -121,7 +123,7 @@ def _format_report(
         issue_word = "issue" if fixed_count == 1 else "issues"
         lines.append(f"✅ Fixed {fixed_count} {issue_word}\n")
     else:
-        lines.append("\U0001f50d State audit\n")
+        lines.append("🔍 State audit\n")
 
     if closed_topic_count > 0:
         topic_word = "topic" if closed_topic_count == 1 else "topics"
@@ -130,6 +132,13 @@ def _format_report(
     if recreated_topic_count > 0:
         topic_word = "topic" if recreated_topic_count == 1 else "topics"
         lines.append(f"ℹ Recreated {recreated_topic_count} {topic_word}")
+
+    if manual_close_count > 0:
+        topic_word = "topic" if manual_close_count == 1 else "topics"
+        lines.append(
+            f"⚠ {manual_close_count} {topic_word} could not be closed automatically; "
+            "safe to close manually"
+        )
 
     # Binding summary
     if audit.total_bindings == 0:
@@ -195,15 +204,18 @@ async def _remove_topic(client: TelegramClient, chat_id: int, thread_id: int) ->
         return False
 
 
-async def _close_ghost_topics(client: TelegramClient, issues: list[AuditIssue]) -> int:
+async def _close_ghost_topics(
+    client: TelegramClient, issues: list[AuditIssue]
+) -> tuple[int, int]:
     """Delete (or close) Telegram topics for ghost bindings.
 
     Tries ``delete_forum_topic`` first to fully remove the dead topic from the
     sidebar.  Falls back to ``close_forum_topic`` if deletion fails (e.g.
-    missing ``can_manage_topics`` or General topic).  Returns count of
-    topics successfully deleted/closed.
+    missing ``can_manage_topics`` or General topic).  Returns
+    ``(closed_count, manual_close_count)``.
     """
     closed_count = 0
+    manual_close_count = 0
     for issue in issues:
         if issue.category != "ghost_binding":
             continue
@@ -231,6 +243,8 @@ async def _close_ghost_topics(client: TelegramClient, issues: list[AuditIssue]) 
                     thread_id,
                     window_id,
                 )
+                manual_close_count += 1
+                continue
         if topic_removed or chat_id == user_id:
             try:
                 await clear_topic_state(
@@ -245,7 +259,7 @@ async def _close_ghost_topics(client: TelegramClient, issues: list[AuditIssue]) 
                     thread_id,
                     window_id,
                 )
-    return closed_count
+    return closed_count, manual_close_count
 
 
 async def _adopt_orphaned_windows(
@@ -419,6 +433,7 @@ async def sync_command(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, "You are not authorized to use this bot.")
         return
 
+    status_msg = await safe_reply(update.message, "🔍 State audit…")
     client = PTBTelegramClient(update.get_bot())
     await _sync_live_topic_names(client)
     audit = await _run_audit()
@@ -426,13 +441,26 @@ async def sync_command(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> N
     dead_issues = await _probe_dead_topics(client)
     audit.issues.extend(dead_issues)
     text, keyboard = _format_report(audit)
-    await safe_reply(update.message, text, reply_markup=keyboard)
+    if status_msg is not None:
+        await safe_edit(status_msg, text, reply_markup=keyboard)
+    else:
+        await safe_reply(update.message, text, reply_markup=keyboard)
 
 
 async def handle_sync_fix(query: CallbackQuery) -> None:
     """Run all fix operations, re-audit, and edit message in place."""
-    # Single list_windows call — reused for both audit and fix
-    all_windows = await tmux_manager.list_windows()
+    await safe_edit(query, "🔧 Fixing…", reply_markup=None)
+
+    # A destructive repair requires a confirmed multiplexer listing.
+    all_windows = await list_windows_for_reconciliation(tmux_manager)
+    if all_windows is None:
+        await safe_edit(
+            query,
+            "⚠ Multiplexer unavailable. No state changes were made.",
+            reply_markup=None,
+        )
+        return
+
     live_ids = {w.window_id for w in all_windows}
     live_pairs = [(w.window_id, w.window_name) for w in all_windows]
 
@@ -460,7 +488,9 @@ async def handle_sync_fix(query: CallbackQuery) -> None:
 
     # Enforcement: adopt orphans first so stale same-name topics can be rebound.
     await _adopt_orphaned_windows(client, pre_audit.issues)
-    closed_count = await _close_ghost_topics(client, pre_audit.issues)
+    closed_count, manual_close_count = await _close_ghost_topics(
+        client, pre_audit.issues
+    )
     recreated_count = await _recreate_dead_topics(client, pre_audit.issues)
 
     # Re-audit and compute actual fixed count (handles partial failures).
@@ -476,13 +506,21 @@ async def handle_sync_fix(query: CallbackQuery) -> None:
         fixed_count=actual_fixed,
         closed_topic_count=closed_count,
         recreated_topic_count=recreated_count,
+        manual_close_count=manual_close_count,
     )
     await safe_edit(query, text, reply_markup=keyboard)
 
 
 async def handle_sync_dismiss(query: CallbackQuery) -> None:
-    """Remove keyboard from sync message."""
-    original_text = getattr(query.message, "text", None) if query.message else None
+    """Delete the sync dialog message."""
+    if query.message is None:
+        return
+    try:
+        await query.delete_message()
+        return
+    except TelegramError:
+        pass
+    original_text = getattr(query.message, "text", None)
     await safe_edit(query, original_text or "Dismissed", reply_markup=None)
 
 

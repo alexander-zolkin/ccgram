@@ -4,9 +4,52 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [4.3.11] - 2026-07-11
+
+### Fixed
+
+- Continue in best-effort mode when Herdr reports an unverified protocol version
+- Support Herdr protocols 14, 15, and 16 without a startup warning
+
+## [4.3.10] - 2026-07-10
+
+### Fixed
+- Preserve routing state when a multiplexer window listing is unavailable
+- Thanks to @NatBrian for reporting this issue in [#128](https://github.com/alexei-led/ccgram/pull/128).
+
+## [4.3.9] - 2026-07-10
+
+### Fixed
+- Render status blocks for Herdr's opaque pane IDs
+
+## [4.3.8] - 2026-07-09
+
+### Fixed
+- Force posix_spawn path to stop MallocStackLogging spam
+
+## [4.3.7] - 2026-07-06
+
+### Documentation
+- Update CHANGELOG.md for v4.3.7
+
+
+### Fixed
+- Make herdr status actions responsive
+
+## [4.3.6] - 2026-07-05
+
+### Documentation
+- Update CHANGELOG.md for v4.3.6
+
+
+### Fixed
+- Avoid MallocStackLogging spam in service runner
+
 ## [4.3.5] - 2026-06-29
 
 ### Documentation
+- Update CHANGELOG.md for v4.3.5
 - Update CHANGELOG.md for v4.3.5
 
 

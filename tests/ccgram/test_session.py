@@ -1014,10 +1014,9 @@ class TestResolveStaleIdsPreservesDeadBindings:
         mgr.window_states["@2"] = WindowState(cwd="/tmp/dead", provider_name="claude")
 
         alive = SimpleNamespace(window_id="@1", window_name="alive-proj")
-        from ccgram.multiplexer.tmux import tmux_manager
-
-        with patch.object(
-            tmux_manager, "list_windows", AsyncMock(return_value=[alive])
+        with patch(
+            "ccgram.session.list_windows_for_reconciliation",
+            AsyncMock(return_value=[alive]),
         ):
             await mgr.resolve_stale_ids()
 
@@ -1028,10 +1027,10 @@ class TestResolveStaleIdsPreservesDeadBindings:
     async def test_alive_bindings_unchanged(self, mgr: SessionManager) -> None:
         thread_router.bind_thread(100, 1, "@1", window_name="proj")
         alive = SimpleNamespace(window_id="@1", window_name="proj")
-        from ccgram.multiplexer.tmux import tmux_manager
 
-        with patch.object(
-            tmux_manager, "list_windows", AsyncMock(return_value=[alive])
+        with patch(
+            "ccgram.session.list_windows_for_reconciliation",
+            AsyncMock(return_value=[alive]),
         ):
             await mgr.resolve_stale_ids()
 
@@ -1040,14 +1039,57 @@ class TestResolveStaleIdsPreservesDeadBindings:
     async def test_dead_window_state_preserved(self, mgr: SessionManager) -> None:
         thread_router.bind_thread(100, 1, "@1", window_name="proj")
         mgr.window_states["@1"] = WindowState(cwd="/my/project", provider_name="codex")
-        from ccgram.multiplexer.tmux import tmux_manager
 
-        with patch.object(tmux_manager, "list_windows", AsyncMock(return_value=[])):
+        with patch(
+            "ccgram.session.list_windows_for_reconciliation",
+            AsyncMock(return_value=[]),
+        ):
             await mgr.resolve_stale_ids()
 
         assert "@1" in mgr.window_states
         assert mgr.window_states["@1"].cwd == "/my/project"
         assert mgr.window_states["@1"].provider_name == "codex"
+
+    async def test_unavailable_listing_preserves_session_map(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps({"ccgram:@1": {"session_id": "sid-1", "cwd": "/a"}})
+        )
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "tmux")
+        thread_router.bind_thread(100, 1, "@1", window_name="proj")
+        mgr.window_states["@1"] = WindowState(session_id="sid-1", cwd="/a")
+
+        with patch(
+            "ccgram.session.list_windows_for_reconciliation",
+            AsyncMock(return_value=None),
+        ):
+            await mgr.resolve_stale_ids()
+
+        assert "ccgram:@1" in json.loads(session_map_file.read_text())
+        assert "@1" in mgr.window_states
+
+    async def test_confirmed_empty_listing_prunes_session_map(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps({"ccgram:@1": {"session_id": "sid-1", "cwd": "/a"}})
+        )
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "tmux")
+        mgr.window_states["@1"] = WindowState(session_id="sid-1", cwd="/a")
+
+        with patch(
+            "ccgram.session.list_windows_for_reconciliation",
+            AsyncMock(return_value=[]),
+        ):
+            await mgr.resolve_stale_ids()
+
+        assert "ccgram:@1" not in json.loads(session_map_file.read_text())
+        assert "@1" not in mgr.window_states
 
 
 class _FakeMux:
@@ -1058,6 +1100,9 @@ class _FakeMux:
         self._windows = windows
 
     async def list_windows(self) -> list:
+        return self._windows
+
+    async def list_windows_for_reconciliation(self) -> list:
         return self._windows
 
 
@@ -1089,7 +1134,6 @@ class TestResolveStaleIdsHerdrRestart:
             "ccgram.session.tmux_manager",
             _FakeMux(ids_stable=False, windows=live),
         )
-
         await mgr.resolve_stale_ids()
 
         assert "w3:p1" in mgr.window_states
@@ -1109,7 +1153,6 @@ class TestResolveStaleIdsHerdrRestart:
             "ccgram.session.tmux_manager",
             _FakeMux(ids_stable=True, windows=live),
         )
-
         await mgr.resolve_stale_ids()
 
         assert thread_router.get_window_for_thread(100, 1) == "@1"

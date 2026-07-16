@@ -33,6 +33,7 @@ from .session_map import (
 )
 from .state_persistence import StatePersistence
 from .multiplexer import multiplexer as tmux_manager
+from .multiplexer.reconciliation import list_windows_for_reconciliation
 from .thread_router import ThreadRouter, install_thread_router, thread_router
 from .user_preferences import (
     UserPreferences,
@@ -208,7 +209,13 @@ class SessionManager:
         # Lazy: window_resolver pulls back into session manager
         from .window_resolver import LiveWindow, resolve_stale_ids as _resolve
 
-        windows = await tmux_manager.list_windows()
+        windows = await list_windows_for_reconciliation(tmux_manager)
+        if windows is None:
+            logger.warning(
+                "Startup window reconciliation skipped: multiplexer listing unavailable"
+            )
+            return
+
         live = [
             LiveWindow(window_id=w.window_id, window_name=w.window_name)
             for w in windows

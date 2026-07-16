@@ -457,14 +457,25 @@ class TestFormatPaneBlock:
         _seed_panes(
             "@0",
             [
-                PaneInfo(pane_id="%9", state="active"),
+                PaneInfo(pane_id="%10", state="active"),
                 PaneInfo(pane_id="%2", state="idle"),
             ],
         )
         result = format_pane_block("@0")
         assert result is not None
-        # %2 comes before %9 lexicographically — stable order.
-        assert result.index("%2") < result.index("%9")
+        assert result.index("%2") < result.index("%10")
+
+    def test_supports_opaque_herdr_pane_ids(self, _isolated_window_store):
+        _seed_panes(
+            "wMM:t1",
+            [
+                PaneInfo(pane_id="wMM:p2", state="idle"),
+                PaneInfo(pane_id="wMM:p1", state="active"),
+            ],
+        )
+        result = format_pane_block("wMM:t1")
+        assert result is not None
+        assert result.index("wMM:p1") < result.index("wMM:p2")
 
     def test_dead_panes_excluded_when_others_visible(self, _isolated_window_store):
         _seed_panes(

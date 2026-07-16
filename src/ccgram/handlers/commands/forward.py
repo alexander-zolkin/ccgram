@@ -181,6 +181,57 @@ def _arm_rc_probe_if_remote_control(
     arm_rc_probe(window_id, PTBTelegramClient(update.get_bot()))
 
 
+async def _capture_forward_probe_context(
+    window_id: str,
+    provider,
+    cc_slash: str,
+    status_like: bool,
+) -> tuple[str | None, int | None, str | None, int | None]:
+    """Capture pre-send probe context, skipping /status-like commands."""
+    if status_like:
+        return None, None, None, _status_snapshot_probe_offset(window_id, cc_slash)
+    (
+        probe_transcript_path,
+        probe_transcript_offset,
+        probe_pane_before,
+    ) = await _capture_command_probe_context(window_id, provider)
+    return probe_transcript_path, probe_transcript_offset, probe_pane_before, None
+
+
+async def _send_forward_post_probes(
+    message: Message,
+    window_id: str,
+    display: str,
+    cc_slash: str,
+    provider,
+    status_like: bool,
+    status_probe_offset: int | None,
+    probe_transcript_path: str | None,
+    probe_transcript_offset: int | None,
+    probe_pane_before: str | None,
+) -> None:
+    """Send post-forward status/failure probes with one status-only fast path."""
+    await _maybe_send_status_snapshot(
+        message,
+        window_id,
+        display,
+        cc_slash,
+        since_offset=status_probe_offset,
+    )
+    if status_like:
+        return
+    _spawn_command_failure_probe(
+        message,
+        window_id,
+        display,
+        cc_slash,
+        provider=provider,
+        transcript_path=probe_transcript_path,
+        since_offset=probe_transcript_offset,
+        pane_before=probe_pane_before,
+    )
+
+
 async def forward_command_handler(
     update: Update, _context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -225,6 +276,7 @@ async def forward_command_handler(
     cc_name = _provider_command_name(provider_name, resolved_name.lstrip("/"))
     args = _default_command_args(cc_name, args, display)
     cc_slash = f"/{cc_name} {args}".rstrip() if args else f"/{cc_name}"
+    status_like = cc_name.lower() in {"status", "stats"}
 
     if provider_name == "pi" and cc_name.lower() == _PI_FOLLOWUP_COMMAND:
         await _handle_pi_followup_command(
@@ -244,8 +296,8 @@ async def forward_command_handler(
         probe_transcript_path,
         probe_transcript_offset,
         probe_pane_before,
-    ) = await _capture_command_probe_context(window_id, provider)
-    status_probe_offset = _status_snapshot_probe_offset(window_id, cc_slash)
+        status_probe_offset,
+    ) = await _capture_forward_probe_context(window_id, provider, cc_slash, status_like)
 
     lifecycle_strategy.clear_probe_failures(window_id)
     success, error_msg = await send_to_window(window_id, cc_slash)
@@ -263,22 +315,17 @@ async def forward_command_handler(
         confirmation += _picker_hint(provider_name)
     await safe_reply(update.message, confirmation)
     _arm_rc_probe_if_remote_control(update, window_id, cc_name)
-    await _maybe_send_status_snapshot(
+    await _send_forward_post_probes(
         update.message,
         window_id,
         display,
         cc_slash,
-        since_offset=status_probe_offset,
-    )
-    _spawn_command_failure_probe(
-        update.message,
-        window_id,
-        display,
-        cc_slash,
-        provider=provider,
-        transcript_path=probe_transcript_path,
-        since_offset=probe_transcript_offset,
-        pane_before=probe_pane_before,
+        provider,
+        status_like,
+        status_probe_offset,
+        probe_transcript_path,
+        probe_transcript_offset,
+        probe_pane_before,
     )
     await _handle_session_reset_command(
         update, user.id, window_id, display, cc_slash, thread_id, provider_name

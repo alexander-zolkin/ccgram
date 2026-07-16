@@ -159,12 +159,46 @@ class TmuxManager:
             session.windows[0].rename_window(config.tmux_main_window_name)
         return session
 
-    async def list_windows(self) -> list[TmuxWindow]:
-        """List all windows in the session with their working directories.
+    @staticmethod
+    def _window_ref_for_reconciliation(window: libtmux.Window) -> TmuxWindow | None:
+        """Build a window ref while treating pane metadata as optional."""
+        name = window.window_name or ""
+        window_id = window.window_id or ""
+        if name == config.tmux_main_window_name:
+            return None
+        if config.own_window_id and window_id == config.own_window_id:
+            return None
+        if name.startswith("_"):
+            return None
 
-        Returns:
-            List of TmuxWindow with window info and cwd
-        """
+        cwd = ""
+        pane_cmd = ""
+        pane_tty = ""
+        pw = 0
+        ph = 0
+        try:
+            pane = window.active_pane
+            if pane:
+                cwd = pane.pane_current_path or ""
+                pane_cmd = pane.pane_current_command or ""
+                pane_tty = getattr(pane, "pane_tty", "") or ""
+                pw = int(pane.pane_width or 0)
+                ph = int(pane.pane_height or 0)
+        except _TmuxError as exc:
+            logger.debug("Error getting window info: %s", exc)
+
+        return TmuxWindow(
+            window_id=window_id,
+            window_name=name,
+            cwd=cwd,
+            pane_current_command=pane_cmd,
+            pane_tty=pane_tty,
+            pane_width=pw,
+            pane_height=ph,
+        )
+
+    async def list_windows(self) -> list[TmuxWindow]:
+        """List all windows in the session with their working directories."""
 
         def _sync_list_windows() -> list[TmuxWindow]:
             windows = []
@@ -216,6 +250,28 @@ class TmuxManager:
                 except _TmuxError as e:
                     logger.debug("Error getting window info: %s", e)
 
+            return windows
+
+        return await asyncio.to_thread(_sync_list_windows)
+
+    async def list_windows_for_reconciliation(self) -> list[TmuxWindow] | None:
+        """List windows, or return None when tmux cannot confirm the session."""
+
+        def _sync_list_windows() -> list[TmuxWindow] | None:
+            try:
+                session = self.server.sessions.get(
+                    session_name=self.session_name, default=None
+                )
+                if session is None:
+                    return []
+                windows = [
+                    ref
+                    for window in session.windows
+                    if (ref := self._window_ref_for_reconciliation(window)) is not None
+                ]
+            except _TmuxError:
+                self._reset_server()
+                return None
             return windows
 
         return await asyncio.to_thread(_sync_list_windows)

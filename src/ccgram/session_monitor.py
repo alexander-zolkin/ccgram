@@ -32,6 +32,7 @@ from .providers import get_provider_for_window, registry  # noqa: F401 (used by 
 from .session_map import parse_session_map, read_session_map_raw, session_map_prefix
 from .session_lifecycle import session_lifecycle
 from .multiplexer import multiplexer as tmux_manager
+from .multiplexer.reconciliation import list_windows_for_reconciliation
 from .multiplexer.topic_mapping import is_agent_topic_window
 from .monitor_events import NewMessage, NewWindowEvent, SessionInfo
 from .transcript_reader import TranscriptReader
@@ -428,14 +429,21 @@ class SessionMonitor:
 
                 current_map = await self._detect_and_cleanup_changes(raw_session_map)
 
-                all_windows = await tmux_manager.list_windows()
-                live_window_ids = {w.window_id for w in all_windows}
-                session_map_sync.prune_session_map(live_window_ids)
-                known_window_ids = set(current_map.keys())
-                await self._emit_unbound_window_events(all_windows, known_window_ids)
-                await self._emit_known_unbound_window_events(
-                    current_map, live_window_ids
-                )
+                all_windows = await list_windows_for_reconciliation(tmux_manager)
+                if all_windows is None:
+                    logger.warning(
+                        "Multiplexer listing unavailable; skipping window reconciliation"
+                    )
+                else:
+                    live_window_ids = {w.window_id for w in all_windows}
+                    session_map_sync.prune_session_map(live_window_ids)
+                    known_window_ids = set(current_map.keys())
+                    await self._emit_unbound_window_events(
+                        all_windows, known_window_ids
+                    )
+                    await self._emit_known_unbound_window_events(
+                        current_map, live_window_ids
+                    )
 
                 new_messages = await self.check_for_updates(current_map)
 
