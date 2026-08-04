@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Provider-aware model picker in the session-creation wizard (Claude and Grok),
   gated by the new `supports_model_picker` capability.
 
+## [4.3.12] - 2026-08-02
+
+### Fixed
+
+- Detect Claude hooks when `CLAUDE_CONFIG_DIR` changes the transcript path ([#133](https://github.com/alexei-led/ccgram/issues/133))
+- Skip status polling when a multiplexer cannot provide a reliable window list ([#130](https://github.com/alexei-led/ccgram/issues/130))
+- Add `CCGRAM_HIDE_THINKING` and `--hide-thinking` to suppress thinking messages ([#139](https://github.com/alexei-led/ccgram/issues/139))
+
+### Documentation
+
+- State Linux, macOS, and WSL2 support. State that native Windows is unsupported. ([#136](https://github.com/alexei-led/ccgram/issues/136))
+
 ## [4.3.11] - 2026-07-11
 
 ### Fixed
