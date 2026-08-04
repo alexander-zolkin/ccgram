@@ -37,13 +37,69 @@ CCGRAM-HOTFIX:<name>
 cd /home/openclaw/ccgram-fork
 git fetch upstream
 git merge upstream/main          # resolve conflicts — KEEP every CCGRAM-HOTFIX:* block
-python3 -m py_compile $(git diff --name-only HEAD~ -- '*.py')   # Py2-except landmine guard
+
+# Compile guard — use the interpreter that will actually RUN the code (uv venv,
+# 3.14), NOT the system python3 (3.13 here).
+VENV_PY=$(find ~/.local/share/uv/tools/ccgram/bin -name 'python3.*' | head -1)
+"$VENV_PY" -c "import pathlib
+bad=0
+for d in ('src','tests'):
+    for f in pathlib.Path(d).rglob('*.py'):
+        try: compile(f.read_text(), str(f), 'exec')
+        except SyntaxError as e: print('FAIL', f, e); bad+=1
+print('syntax errors:', bad)"
+
+grep -rho 'CCGRAM-HOTFIX:[a-z0-9-]*' src/ | sort -u | wc -l   # must equal EXPECTED_MARKERS
 git push origin main
 # then on N100:  ~/.ccgram/ccgram-upgrade.sh
 ```
 
+> **Do NOT "fix" unparenthesized `except A, B:` on sight.** Upstream's refactor
+> tooling de-parenthesizes these, and **PEP 758 made the syntax legal in Python
+> 3.14** — which is what the uv venv runs, so it is not a bug there. It *is* a
+> `SyntaxError` on ≤3.13 (the N100 system `python3` is 3.13.5), so keep the
+> `py3-parenthesize-except` pass as hygiene, but check the interpreter before
+> touching the line.
+
+Also eyeball after every merge: `rich-tables` still applied, claude fresh
+sessions still get `--effort xhigh`, and `fresh-launch-args` still appends fresh
+args in `window_launch_service` — that one died silently in the v4.3.5 merge.
+
 If a marker block can't be reconciled (upstream rewrote the function), re-derive
 the behaviour, keep the marker, and update this file's entry.
+
+---
+
+## Fork-only features (not hotfixes)
+
+Whole capabilities this fork adds on top of upstream. They are not marker-tagged
+line patches, so a merge won't "drop" them — but upstream refactors can still
+break their seams, so they belong on the post-merge checklist:
+
+- **Grok Build provider** — `providers/grok{,_format,_discovery,_models,_private,_status}.py`,
+  plus the `supports_model_picker` / `accepts_initial_prompt` capability flags on
+  `providers/base.py` and the grok branches in `hooks/adapters.py`, `hook.py`,
+  `model_catalog.py`, `doctor_cmd.py`, `toolbar_config.py`,
+  `providers/process_detection.py`. Commit `2bcea89`.
+- **Remembered model default** — `last_model.py` + the `seed_remembered_model`
+  seam in `directory_browser.py`. Commit `b075a58`. (Tagged `model-picker`.)
+
+## Known test failures (pre-existing, NOT merge regressions)
+
+As of `v4.3.12` merge: **17 failures, 6418 passed**. All 17 are caused by this
+fork's own behaviour, and reproduce identically on the pre-merge commit:
+
+- **15 × `tests/e2e/*_lifecycle.py`** — `TimeoutError` in the shared helper
+  `tests/e2e/_helpers.py:setup_bound_topic → wait_for_send`. Upstream's helper
+  expects the old direct-bind `sendMessage`, but `quickstart-defaults` shows the
+  "Use default settings?" prompt first, so the predicate never matches and the
+  setup times out. Product behaviour is intentional and correct.
+- **2 × `tests/ccgram/handlers/polling/test_status_polling.py::TestMaybeDiscoverTranscript`**
+  — the tests assume a fixed provider-iteration order/count; adding `grok` to the
+  registry makes discovery try two providers instead of one.
+
+Optional cleanup: adapt the e2e helper to drive the quickstart-Yes flow, the way
+the other anti-fork tests were adapted.
 
 ---
 
@@ -324,6 +380,46 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   and is typed into a shell via `send_keys(literal)` — `_MODEL_ID_RE`
   whitelists `[A-Za-z0-9._:-]` before it reaches the launch command.
 
+### `grok-initial-prompt` — first message goes in as a launch positional
+- **Files:** `handlers/topics/window_launch_service.py`
+- **What:** for providers that declare `accepts_initial_prompt` (grok), the
+  topic's pending first message is `shlex.quote`d onto the launch command
+  instead of being typed into the pane afterwards; the keystroke-delivery path
+  is then skipped (`initial_prompt_consumed`).
+- **Why:** the Grok CLI's welcome screen swallows keystrokes sent right after
+  launch, so the first Telegram message vanished and no hooks fired. Claude
+  keeps the keystroke path (its multiline/quoted text would break `send_keys
+  literal` on a command line — see `skip-synthetic-continue`).
+
+### `private-session` — grok sessions that stay out of the assistant's reach
+- **Files:** `handlers/topics/window_launch_service.py`,
+  `handlers/topics/directory_callbacks.py` (+ `providers/grok_private.py`)
+- **What:** `WindowLaunchRequest.private` (grok only). The quick-start prompt
+  gains a private-launch button; a private launch runs in an isolated working
+  directory and prefixes the pane command with a redirected `GROK_HOME`
+  (`ensure_grok_private_home()`), which grok's hooks inherit.
+- **Why:** Alexander's private Grok sessions must never land in a path the
+  assistant reads, indexes or distills. Redirecting `GROK_HOME` puts both the
+  session files and `chat_history.jsonl` outside every scan path, rather than
+  relying on the assistant to avoid them.
+
+### `status-bubble-persist` — the "✓ Ready" bubble survives a restart
+- **Files:** `handlers/status/status_bubble.py`
+- **What:** the `(user_id, thread_key) -> (message_id, window_id, last_text,
+  chat_id)` map is mirrored to `<CCGRAM_DIR>/status_msg_info.json` on every
+  mutation and reloaded on startup (`_PersistentStatusMap`).
+- **Why:** the map was in-memory only, so every daemon restart (upgrade or
+  crash) orphaned the live bubble: the next Stop couldn't find the existing
+  message, posted a fresh one and left the old one behind. In quiet forum
+  topics these piled up and read as replies to the "topic created" service
+  message.
+
+### `transcript-decode-guard` — a bad byte doesn't kill the relay
+- **Files:** `transcript_reader.py`
+- **What:** transcript reads tolerate non-UTF-8 bytes instead of raising.
+- **Why:** one malformed byte in a transcript took down the whole relay for
+  that window.
+
 ---
 
 ## Marker → files quick map
@@ -349,7 +445,13 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `resume-own-session` | recovery/recovery_banner.py | (see git log) |
 | `file-first-unbound` | handlers/file_handler.py | (see git log) |
 | `fresh-launch-args` | topics/window_launch_service.py | (see git log) |
-| `model-picker` | model_catalog.py (new), callback_data.py, directory_browser.py, directory_callbacks.py, window_launch_service.py | (see git log) |
+| `model-picker` | model_catalog.py (new), last_model.py (new), callback_data.py, directory_browser.py, directory_callbacks.py, provider_mode_callbacks.py, text_handler.py, window_launch_service.py | (see git log) |
+| `session-topic-name` | multiplexer/tmux.py | (see git log) |
+| `resolve-1to1-binding` | window_resolver.py | (see git log) |
+| `grok-initial-prompt` | topics/window_launch_service.py | 2bcea89 |
+| `private-session` | topics/window_launch_service.py, topics/directory_callbacks.py | 2bcea89 |
+| `status-bubble-persist` | status/status_bubble.py | 2bcea89 |
+| `transcript-decode-guard` | transcript_reader.py | 2bcea89 |
 
 Verify all present in an install:
 ```bash
