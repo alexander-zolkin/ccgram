@@ -40,8 +40,8 @@ _MAX_MODELS = 8  # keep the inline keyboard sane
 # Used when the API is unreachable or no credentials are available.
 STATIC_FALLBACK: list[tuple[str, str]] = [
     ("claude-fable-5", "Claude Fable 5"),
-    ("claude-opus-4-8", "Claude Opus 4.8"),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("claude-opus-5", "Claude Opus 5"),
+    ("claude-sonnet-5", "Claude Sonnet 5"),
     ("claude-haiku-4-5", "Claude Haiku 4.5"),
 ]
 

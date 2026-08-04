@@ -150,13 +150,41 @@ def clear_window_picker_state(user_data: dict | None) -> None:
 
 
 def clear_model_state(user_data: dict | None) -> None:
-    """Clear the quick-start model selection.  # CCGRAM-HOTFIX:model-picker"""
+    """Clear the quick-start model + provider + private selection."""
     if user_data is not None:
         user_data.pop(PENDING_MODEL_ID, None)
         user_data.pop(PENDING_MODEL_NAME, None)
+        user_data.pop(PENDING_PROVIDER, None)
+        user_data.pop(PENDING_PRIVATE, None)
 
 
-def build_quickstart_prompt(model_label: str) -> tuple[str, InlineKeyboardMarkup]:
+def seed_remembered_model(user_data: dict | None, provider: str) -> None:
+    """Pre-fill the pending model from the last pick for *provider*.
+
+    CCGRAM-HOTFIX:model-picker — so a fresh quick-start prompt defaults to the
+    model Alexander last selected (persisted in ``last_model``) instead of the
+    CLI default. No-op when a pending model is already set (an in-flight pick
+    wins) or nothing is remembered. Never raises.
+    """
+    if user_data is None or user_data.get(PENDING_MODEL_ID):
+        return
+    # Lazy: keep the file-IO module off the handlers import path.
+    from ...last_model import recall_model
+
+    remembered = recall_model(provider)
+    if remembered is None:
+        return
+    model_id, name = remembered
+    user_data[PENDING_MODEL_ID] = model_id
+    user_data[PENDING_MODEL_NAME] = name
+
+
+def build_quickstart_prompt(
+    provider_name: str,
+    model_label: str | None = None,
+    *,
+    private_available: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
     """Build the "Use default settings?" yes/no prompt.  # CCGRAM-HOTFIX:quickstart-defaults
 
     Shown as the FIRST step when creating a new session on an unbound topic

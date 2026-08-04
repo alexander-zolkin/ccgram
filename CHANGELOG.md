@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Quick-start model picker now **remembers the last model you picked** (per
+  provider) and defaults to it on the next new-session prompt, instead of the
+  CLI default. Persisted to `<CCGRAM_DIR>/last_model.json`; only explicit picks
+  are remembered (launching on the provider default never overwrites it).
+  Refreshed the offline model fallback list (Claude Opus 5).
 - First-class **Grok Build** provider (xAI's official `grok` CLI). Enable with
   `CCGRAM_PROVIDER=grok`.
   - Provider picker entry, YOLO mode (`--always-approve`), and session-start

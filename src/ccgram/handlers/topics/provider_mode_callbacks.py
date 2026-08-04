@@ -280,6 +280,19 @@ async def _handle_mode_select(
     ):
         return
 
+    # CCGRAM-HOTFIX:model-picker — carry the model chosen in the wizard model
+    # step (if any) into the fresh launch, then clear it so it can't leak.
+    model_id = context.user_data.get(PENDING_MODEL_ID) if context.user_data else None
+    if model_id:
+        # Remember the pick so the next quick-start prompt defaults to it.
+        from ...last_model import remember_model
+
+        picked_name = (
+            context.user_data.get(PENDING_MODEL_NAME) if context.user_data else None
+        )
+        remember_model(provider_name, model_id, picked_name or model_id)
+    clear_model_state(context.user_data)
+
     await launch_window(
         query,
         context,

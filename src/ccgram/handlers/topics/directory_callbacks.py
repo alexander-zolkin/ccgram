@@ -100,10 +100,12 @@ from .directory_browser import (
     clear_workspace_state,
     clear_worktree_state,
     get_favorites,
+    seed_remembered_model,
 )
 from .provider_mode_callbacks import (
     _handle_mode_select,
     _handle_provider_select,
+    _handle_wizard_model_pick,
     _parse_mode_select,
     _validate_provider_select,
 )
@@ -738,10 +740,34 @@ async def _quickstart_launch(
     ):
         return
 
-    # CCGRAM-HOTFIX:model-picker — carry the picked model (if any) into launch.
-    model_id = (
-        context.user_data.get(PENDING_MODEL_ID) if context.user_data else None
+    is_private = private and _private_supported(provider)
+    if is_private:
+        # Lazy: grok_private pulls filesystem setup; only on the private path.
+        from ...providers.grok_private import create_private_cwd
+
+        cwd = str(create_private_cwd())
+    else:
+        if not Path(QUICKSTART_DEFAULT_CWD).is_dir():
+            await query.answer()
+            await safe_edit(
+                query, f"❌ Default directory missing: {QUICKSTART_DEFAULT_CWD}"
+            )
+            return
+        cwd = QUICKSTART_DEFAULT_CWD
+
+    pending_text = (
+        context.user_data.get(PENDING_THREAD_TEXT) if context.user_data else None
     )
+    use_model = model_id if _provider_supports_model_picker(provider) else None
+    if use_model:
+        # CCGRAM-HOTFIX:model-picker — remember this pick so the next quick-start
+        # prompt defaults to it (read PENDING_MODEL_NAME before it's cleared).
+        from ...last_model import remember_model
+
+        picked_name = (
+            context.user_data.get(PENDING_MODEL_NAME) if context.user_data else None
+        )
+        remember_model(provider, use_model, picked_name or use_model)
     clear_model_state(context.user_data)
 
     await launch_window(
@@ -750,16 +776,37 @@ async def _quickstart_launch(
         WindowLaunchRequest(
             user_id=user_id,
             thread_id=pending_tid,
-            provider_name=QUICKSTART_DEFAULT_PROVIDER,
-            cwd=QUICKSTART_DEFAULT_CWD,
+            provider_name=provider,
+            cwd=cwd,
             mode=QUICKSTART_DEFAULT_MODE,
-            pending_text=(
-                context.user_data.get(PENDING_THREAD_TEXT)
-                if context.user_data
-                else None
-            ),
-            model=model_id,
+            pending_text=pending_text,
+            model=use_model,
+            private=is_private,
         ),
+    )
+
+
+async def _handle_defaults_yes(
+    query: CallbackQuery,
+    user_id: int,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_DEFAULTS_YES: launch with the current quick-start selection.
+
+    CCGRAM-HOTFIX:quickstart-defaults — workspace cwd, current branch (no
+    worktree), the chosen provider + model, YOLO.
+    """
+    provider = _current_provider(context)
+    model_id = context.user_data.get(PENDING_MODEL_ID) if context.user_data else None
+    await _quickstart_launch(
+        query,
+        user_id,
+        update,
+        context,
+        provider=provider,
+        private=False,
+        model_id=model_id,
     )
 
 
@@ -768,19 +815,145 @@ async def _quickstart_launch(
 _MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 
 
+def _current_provider(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Provider the Yes launch will use — the quick-start pick, else the default."""
+    p = context.user_data.get(PENDING_PROVIDER) if context.user_data else None
+    return p if isinstance(p, str) and p else QUICKSTART_DEFAULT_PROVIDER
+
+
+def _provider_supports_model_picker(name: str) -> bool:
+    """Whether *name* exposes a session-start model picker (claude/grok)."""
+    # Lazy: providers package heavy bootstrap.
+    from ...providers import registry as _registry
+
+    try:
+        return _registry.get(name).capabilities.supports_model_picker
+    except Exception:  # noqa: BLE001 — a bad provider must not break the prompt
+        return False
+
+
+def _provider_display_label(name: str) -> str:
+    """Human label for a provider (from the picker metadata)."""
+    return _PROVIDER_META.get(name, (name.title(), ""))[0]
+
+
 def _current_model_label(context: ContextTypes.DEFAULT_TYPE) -> str:
     """Label of the model the Yes launch will use.  # CCGRAM-HOTFIX:model-picker
 
-    The picked model's display name if one was selected, else the claude CLI
-    default read from ``~/.claude/settings.json``.
+    The picked model's display name if one was selected, else the current
+    provider's CLI default.
     """
     name = context.user_data.get(PENDING_MODEL_NAME) if context.user_data else None
     if name:
         return name
     # Lazy: keep the httpx-importing catalog module out of the import path
-    from ...model_catalog import default_model_label
+    from ...model_catalog import default_model_label_for_provider
 
-    return default_model_label()
+    return default_model_label_for_provider(_current_provider(context))
+
+
+def _private_supported(provider: str) -> bool:
+    """Private mode is currently grok-only."""
+    return provider == "grok"
+
+
+async def _show_quickstart_prompt(
+    query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Re-render the quick-start prompt for the current provider + model."""
+    provider = _current_provider(context)
+    if _provider_supports_model_picker(provider):
+        # CCGRAM-HOTFIX:model-picker — default to Alexander's last pick.
+        seed_remembered_model(context.user_data, provider)
+    model_label = (
+        _current_model_label(context)
+        if _provider_supports_model_picker(provider)
+        else None
+    )
+    # The 🕵 Private Grok button is always shown; tapping it launches immediately.
+    msg_text, keyboard = build_quickstart_prompt(
+        provider, model_label, private_available=True
+    )
+    await safe_edit(query, msg_text, reply_markup=keyboard)
+
+
+async def _handle_defaults_private(
+    query: CallbackQuery,
+    user_id: int,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_DEFAULTS_PRIVATE: one-tap launch of a private Grok session (YOLO).
+
+    Not a toggle — launches straight away with grok, an isolated private folder,
+    the grok default model, and YOLO.
+    """
+    await _quickstart_launch(
+        query, user_id, update, context, provider="grok", private=True, model_id=None
+    )
+
+
+async def _handle_defaults_provider(
+    query: CallbackQuery,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_DEFAULTS_PROVIDER: show the provider picker.
+
+    Lists only providers whose CLI is installed (shell excluded — quick-start
+    always launches an agent with YOLO). Picking one returns to the prompt.
+    """
+    # Lazy: providers package heavy bootstrap.
+    from ...providers import available_provider_names
+
+    pending_tid = (
+        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
+    )
+    if pending_tid is None:
+        await query.answer("Stale prompt (flow reset)", show_alert=True)
+        return
+    if get_thread_id(update) != pending_tid:
+        await query.answer("Stale prompt (topic mismatch)", show_alert=True)
+        return
+    await query.answer()
+    available = [p for p in available_provider_names() if p != "shell"]
+    msg_text, keyboard = build_quickstart_provider_picker(
+        available, selected=_current_provider(context)
+    )
+    await safe_edit(query, msg_text, reply_markup=keyboard)
+
+
+async def _handle_provider_pick(
+    query: CallbackQuery,
+    user_id: int,  # noqa: ARG001 — signature parity with other handlers
+    data: str,
+    update: Update,  # noqa: ARG001
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_PROVIDER_PICK: set the quick-start provider, back to the prompt.
+
+    The model is provider-specific, so any prior model pick is dropped when the
+    provider changes.
+    """
+    # Lazy: providers package heavy bootstrap.
+    from ...providers import registry as _registry
+
+    name = data[len(CB_PROVIDER_PICK) :]
+    if not _registry.is_valid(name):
+        await query.answer("Unknown provider", show_alert=True)
+        return
+    pending_tid = (
+        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
+    )
+    if pending_tid is None:
+        await query.answer("Stale prompt (flow reset)", show_alert=True)
+        return
+    if context.user_data is not None:
+        context.user_data[PENDING_PROVIDER] = name
+        context.user_data.pop(PENDING_MODEL_ID, None)
+        context.user_data.pop(PENDING_MODEL_NAME, None)
+    await query.answer(f"Provider: {_provider_display_label(name)}")
+    await _show_quickstart_prompt(query, context)
 
 
 async def _handle_defaults_model(

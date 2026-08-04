@@ -327,12 +327,28 @@ async def _handle_unbound_topic(
         user_id,
         thread_id,
     )
-    # CCGRAM-HOTFIX:model-picker — fresh flow: drop any stale model selection
-    # and show the claude CLI default as the starting model on the prompt.
+    # CCGRAM-HOTFIX:model-picker — fresh flow: drop any stale provider/model
+    # selection, then default the model to Alexander's last pick (falling back
+    # to the CLI default when nothing is remembered).
     clear_model_state(user_data)
-    from ...model_catalog import default_model_label
+    from ...model_catalog import default_model_label_for_provider
+    from ..topics.directory_browser import (
+        QUICKSTART_DEFAULT_PROVIDER,
+        seed_remembered_model,
+    )
 
-    msg_text, keyboard = build_quickstart_prompt(default_model_label())
+    seed_remembered_model(user_data, QUICKSTART_DEFAULT_PROVIDER)
+    model_label = (
+        user_data.get(PENDING_MODEL_NAME) if user_data else None
+    ) or default_model_label_for_provider(QUICKSTART_DEFAULT_PROVIDER)
+
+    # private_available=True always shows the 🕵 Private toggle (tapping it on a
+    # non-grok default switches to grok — private is grok-only).
+    msg_text, keyboard = build_quickstart_prompt(
+        QUICKSTART_DEFAULT_PROVIDER,
+        model_label,
+        private_available=True,
+    )
     if user_data is not None:
         user_data[STATE_KEY] = STATE_CONFIRMING_DEFAULTS
         user_data[PENDING_THREAD_ID] = thread_id
