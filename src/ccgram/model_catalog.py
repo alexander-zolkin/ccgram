@@ -73,7 +73,7 @@ def default_model_label() -> str:
     try:
         settings = json.loads(Path(_SETTINGS_PATH).expanduser().read_text())
         model = settings.get("model")
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return _DEFAULT_MODEL_FALLBACK
     if isinstance(model, str) and model.strip():
         return model.strip()
@@ -88,7 +88,7 @@ def _resolve_auth_headers() -> dict[str, str] | None:
     try:
         creds = json.loads(Path(_CREDENTIALS_PATH).expanduser().read_text())
         token = creds.get("claudeAiOauth", {}).get("accessToken", "")
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     if not token:
         return None
@@ -135,9 +135,7 @@ async def list_models() -> list[ModelChoice]:
     headers["anthropic-version"] = _ANTHROPIC_VERSION
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
-            resp = await client.get(
-                _MODELS_URL, headers=headers, params={"limit": 50}
-            )
+            resp = await client.get(_MODELS_URL, headers=headers, params={"limit": 50})
             resp.raise_for_status()
             models = _parse_models(resp.json())
     except Exception as e:  # noqa: BLE001 — the picker must always render
@@ -152,3 +150,40 @@ async def list_models() -> list[ModelChoice]:
     _cache = (now, _CACHE_TTL_S, models)
     logger.info("model_catalog: fetched %d models from API", len(models))
     return models
+
+
+# ── Provider-aware dispatch ───────────────────────────────────────────────
+#
+# The session-creation model picker is provider-agnostic: it asks the catalog
+# for a provider's models and the label of its default. Claude keeps the live
+# Anthropic ``/v1/models`` path above; Grok discovers models via its own CLI
+# (``ccgram.providers.grok_models``), kept out of this module so the Grok path
+# never drags in httpx / Anthropic auth.
+
+
+async def list_models_for_provider(provider: str) -> list[ModelChoice]:
+    """Return selectable models for *provider*. Never raises.
+
+    Falls back to the Claude/Anthropic catalog for unknown providers so callers
+    (which already gate on ``supports_model_picker``) always get a usable list.
+    """
+    if provider == "grok":
+        # Lazy: asyncio.to_thread only needed to offload the blocking grok CLI.
+        import asyncio
+
+        # Lazy: keep the Grok CLI shell-out off the Anthropic import path.
+        from ccgram.providers.grok_models import list_grok_models
+
+        pairs = await asyncio.to_thread(list_grok_models)
+        return [ModelChoice(id=i, display_name=n) for i, n in pairs]
+    return await list_models()
+
+
+def default_model_label_for_provider(provider: str) -> str:
+    """Best-effort label for the model a fresh launch of *provider* will use."""
+    if provider == "grok":
+        # Lazy: keep the Grok CLI shell-out off the Anthropic import path.
+        from ccgram.providers.grok_models import default_grok_model_label
+
+        return default_grok_model_label()
+    return default_model_label()

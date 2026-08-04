@@ -143,6 +143,18 @@ class ProviderCapabilities:
     # pointing at /toolbar so users know how to drive the picker from
     # Telegram. Empty for providers without modal pickers.
     tui_picker_commands: frozenset[str] = frozenset()
+    # When true, the session-creation flow offers a model picker (quick-start
+    # and full wizard) whose selection is passed to the fresh launch as
+    # ``--model <id>``. True for providers with a model catalog + ``--model``
+    # launch flag (claude, grok); False for providers that pick the model
+    # in-TUI only (codex/gemini/pi).
+    supports_model_picker: bool = False
+    # When true, the topic's initial message is passed to the CLI as a launch
+    # positional argument (``cli … "<prompt>"``) instead of being typed into the
+    # pane after launch. Needed for CLIs whose home/welcome screen would swallow
+    # keystrokes sent before a session is ready (grok), and it also starts the
+    # session immediately so hooks fire without a first manual prompt.
+    launch_accepts_initial_prompt: bool = False
 
 
 # ── Provider protocol ────────────────────────────────────────────────────

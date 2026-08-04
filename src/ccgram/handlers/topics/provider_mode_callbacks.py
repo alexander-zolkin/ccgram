@@ -8,18 +8,22 @@ Both ultimately call ``launch_window`` from ``window_launch_service``.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import structlog
 
 from ...providers import registry as provider_registry
 from ...thread_router import thread_router
-from ..callback_data import CB_MODE_SELECT, CB_PROV_SELECT
+from ..callback_data import CB_MODE_SELECT, CB_PROV_SELECT, CB_WIZ_MODEL_PICK
 from ..callback_helpers import get_thread_id
 from ..messaging_pipeline.message_sender import safe_edit
+from ..user_state import PENDING_MODEL_ID, PENDING_MODEL_NAME
 from .directory_browser import (
     build_mode_picker,
+    build_wizard_model_picker,
     clear_browse_state,
+    clear_model_state,
     clear_worktree_state,
 )
 from .topic_creation_draft import (
@@ -35,11 +39,17 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+# Model ids are typed into a shell via send_keys, so restrict them to safe
+# characters even though they arrive from our own catalog (defence in depth).
+_WIZ_MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+
 __all__ = [
     "_validate_provider_select",
     "_handle_provider_select",
     "_parse_mode_select",
     "_handle_mode_select",
+    "_handle_wizard_model_pick",
+    "_show_mode_picker_after_model",
 ]
 
 
@@ -139,8 +149,89 @@ async def _handle_provider_select(
         )
         return
 
+    # CCGRAM-HOTFIX:model-picker — providers with a model catalog (claude, grok)
+    # get a model step before the mode picker. Start from a clean slate so a
+    # stale pick from an earlier attempt can't leak into this launch.
+    caps = provider_registry.get(provider_name).capabilities
+    if caps.supports_model_picker:
+        clear_model_state(context.user_data)
+        await _show_wizard_model_picker(query, provider_name)
+        return
+
     text, keyboard = build_mode_picker(selected_path, provider_name)
     await safe_edit(query, text, reply_markup=keyboard)
+
+
+async def _show_wizard_model_picker(
+    query: CallbackQuery, provider_name: str, selected_id: str | None = None
+) -> None:
+    """Render the provider-aware model picker (mid-wizard step)."""
+    # Lazy: keep the httpx-based catalog off the handlers import path.
+    from ...model_catalog import list_models_for_provider
+
+    models = await list_models_for_provider(provider_name)
+    text, keyboard = build_wizard_model_picker(
+        provider_name, [(m.id, m.display_name) for m in models], selected_id=selected_id
+    )
+    await safe_edit(query, text, reply_markup=keyboard)
+
+
+async def _show_mode_picker_after_model(
+    query: CallbackQuery, provider_name: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Advance from the model picker to the mode picker."""
+    selected_path = _required_selected_path(context)
+    if selected_path is None:
+        await safe_edit(query, "❌ Selection expired. Tap Cancel and retry.")
+        return
+    text, keyboard = build_mode_picker(selected_path, provider_name)
+    await safe_edit(query, text, reply_markup=keyboard)
+
+
+async def _handle_wizard_model_pick(
+    query: CallbackQuery,
+    user_id: int,  # noqa: ARG001 — signature parity with other handlers
+    data: str,
+    update: Update,  # noqa: ARG001
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle CB_WIZ_MODEL_PICK: store the chosen model, then show the mode picker.
+
+    Callback data is ``wm:<provider>:<model_id>`` where an empty ``model_id``
+    means "keep the provider default" (clears any pending override).
+    """
+    raw = data[len(CB_WIZ_MODEL_PICK) :]
+    provider_name, sep, model_id = raw.partition(":")
+    if not sep or not provider_registry.is_valid(provider_name):
+        await query.answer("Invalid model selection", show_alert=True)
+        return
+
+    pending_tid = (
+        context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
+    )
+    if pending_tid is None:
+        await query.answer("Stale prompt (flow reset)", show_alert=True)
+        return
+
+    if model_id:
+        if not _WIZ_MODEL_ID_RE.fullmatch(model_id):
+            await query.answer("Invalid model id", show_alert=True)
+            return
+        # Resolve the display name from the (cached) catalog; fall back to the id.
+        # Lazy: keep the httpx-based catalog off the handlers import path.
+        from ...model_catalog import list_models_for_provider
+
+        models = await list_models_for_provider(provider_name)
+        name = next((m.display_name for m in models if m.id == model_id), model_id)
+        if context.user_data is not None:
+            context.user_data[PENDING_MODEL_ID] = model_id
+            context.user_data[PENDING_MODEL_NAME] = name
+        await query.answer(f"Model: {name}")
+    else:
+        clear_model_state(context.user_data)
+        await query.answer("Using provider default")
+
+    await _show_mode_picker_after_model(query, provider_name, context)
 
 
 def _parse_mode_select(data: str) -> tuple[str, str] | None:
@@ -203,5 +294,6 @@ async def _handle_mode_select(
                 if context.user_data
                 else None
             ),
+            model=model_id,
         ),
     )

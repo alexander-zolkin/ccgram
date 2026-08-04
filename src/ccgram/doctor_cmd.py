@@ -195,10 +195,12 @@ def _resolve_hook_check_config(
     from .hook import (
         _CODEX_HOOK_EVENTS,
         _GEMINI_HOOK_EVENTS,
+        _GROK_HOOK_EVENTS,
         _HOOK_EVENT_TYPES,
         _claude_settings_file,
         _codex_hooks_file,
         _gemini_settings_file,
+        _grok_hooks_file,
         _json_hook_command_predicate,
     )
 
@@ -213,6 +215,12 @@ def _resolve_hook_check_config(
             _gemini_settings_file(),
             _GEMINI_HOOK_EVENTS,
             _json_hook_command_predicate("gemini"),
+        )
+    if provider_name == "grok":
+        return (
+            _grok_hooks_file(),
+            _GROK_HOOK_EVENTS,
+            _json_hook_command_predicate("grok"),
         )
     if provider_name == "claude":
         return _claude_settings_file(), _HOOK_EVENT_TYPES, None

@@ -57,6 +57,7 @@ from ..polling.polling_state import lifecycle_strategy
 from ...topic_state_registry import topic_state
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
+    PENDING_MODEL_NAME,
     PENDING_THREAD_ID,
     PENDING_THREAD_TEXT,
     PENDING_WORKTREE_BRANCH,

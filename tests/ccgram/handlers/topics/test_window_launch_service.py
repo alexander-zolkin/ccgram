@@ -202,6 +202,7 @@ class TestLaunchWindowSuccess:
             caps.chat_first_command_path = False
             caps.has_yolo_confirmation = False
             caps.supports_hook = False
+            caps.launch_accepts_initial_prompt = False
             mock_reg.get.return_value.capabilities = caps
 
             await launch_window(
@@ -259,6 +260,7 @@ class TestLaunchWindowSuccess:
             caps.chat_first_command_path = False
             caps.has_yolo_confirmation = False
             caps.supports_hook = False
+            caps.launch_accepts_initial_prompt = False
             mock_reg.get.return_value.capabilities = caps
 
             await launch_window(
@@ -335,6 +337,7 @@ class TestLaunchWindowSuccess:
             caps.chat_first_command_path = False
             caps.has_yolo_confirmation = False
             caps.supports_hook = False
+            caps.launch_accepts_initial_prompt = False
             mock_reg.get.return_value.capabilities = caps
 
             await launch_window(

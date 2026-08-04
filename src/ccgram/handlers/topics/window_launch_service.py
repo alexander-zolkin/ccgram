@@ -66,6 +66,11 @@ class WindowLaunchRequest:
     # CCGRAM-HOTFIX:model-picker — optional model override for the fresh
     # session; appended as `--model <id>` (claude provider only).
     model: str | None = None
+    # CCGRAM-HOTFIX:private-session — when True (grok only), the session runs in
+    # an isolated private folder with a private GROK_HOME so its files + history
+    # stay out of the assistant's scan paths. ``cwd`` is expected to already be
+    # the private working directory.
+    private: bool = False
     # Worktree metadata is NOT carried in this request. It flows through
     # context.user_data via PENDING_WORKTREE_PATH / PENDING_WORKTREE_BRANCH /
     # PENDING_WORKTREE_REPO keys, read directly by _persist_worktree_state and
@@ -210,7 +215,7 @@ async def _accept_yolo_confirmation(window_id: str, *, timeout: float = 8.0) -> 
 # ── main entry point ──────────────────────────────────────────────────────────
 
 
-async def launch_window(  # noqa: PLR0915, C901
+async def launch_window(  # noqa: PLR0915, PLR0912, C901
     query: CallbackQuery,
     context: ContextTypes.DEFAULT_TYPE,
     request: WindowLaunchRequest,
@@ -244,15 +249,59 @@ async def launch_window(  # noqa: PLR0915, C901
     # picker (CCGRAM-HOTFIX:model-picker). The args are appended onto
     # launch_command so both the create_window and worktree branches get them.
     try:
-        fresh_args = provider_registry.get(provider_name).make_launch_args()
+        provider = provider_registry.get(provider_name)
+        fresh_args = provider.make_launch_args()
+        supports_model = provider.capabilities.supports_model_picker
+        accepts_prompt = provider.capabilities.launch_accepts_initial_prompt
     except Exception:  # noqa: BLE001 — a bad provider must not block launch
         fresh_args = ""
+        supports_model = False
+        accepts_prompt = False
     if not isinstance(fresh_args, str):
         fresh_args = ""
-    if request.model and provider_name == "claude":
-        fresh_args = f"{fresh_args} --model {request.model}".strip()
+    # CCGRAM-HOTFIX:model-picker — append the chosen model as `--model <id>` for
+    # any provider with a model picker (claude, grok). When no model was picked,
+    # grok honours the CCGRAM_GROK_MODEL env default; other providers fall back
+    # to their own CLI default.
+    model_id = request.model
+    if not model_id and provider_name == "grok":
+        # Lazy: os is only needed on the grok default-model path.
+        import os
+
+        model_id = os.environ.get("CCGRAM_GROK_MODEL", "").strip() or None
+    if model_id and supports_model:
+        fresh_args = f"{fresh_args} --model {model_id}".strip()
     if fresh_args:
         launch_command = f"{launch_command} {fresh_args}"
+
+    # CCGRAM-HOTFIX:grok-initial-prompt — for CLIs whose welcome screen would
+    # swallow keystrokes sent right after launch (grok), pass the topic's first
+    # message as a launch positional so the session starts immediately (hooks
+    # fire, no lost keystrokes). The keystroke-delivery path below is skipped.
+    initial_prompt_consumed = False
+    if accepts_prompt and request.pending_text:
+        # Lazy: shlex only needed on this initial-prompt path.
+        import shlex
+
+        launch_command = f"{launch_command} {shlex.quote(request.pending_text)}"
+        initial_prompt_consumed = True
+
+    # CCGRAM-HOTFIX:private-session — a private grok launch redirects GROK_HOME to
+    # the private root so the transcript/history lands outside the assistant's
+    # scan paths (the cwd is already the private folder). Prefixed as an env
+    # assignment on the pane command; grok's hooks inherit it too.
+    if request.private and provider_name == "grok":
+        import shlex
+
+        from ...providers.grok_private import ensure_grok_private_home
+
+        try:
+            private_home = ensure_grok_private_home()
+            launch_command = (
+                f"GROK_HOME={shlex.quote(str(private_home))} {launch_command}"
+            )
+        except Exception:  # noqa: BLE001 — never block launch on private setup
+            logger.exception("private grok: failed to set up private home")
 
     chosen_workspace_id: str | None = (
         context.user_data.get(PENDING_WORKSPACE_ID) if context.user_data else None
@@ -343,7 +392,17 @@ async def launch_window(  # noqa: PLR0915, C901
     )
 
     pending_text = request.pending_text
-    if pending_text:
+    if pending_text and initial_prompt_consumed:
+        # Already delivered as a launch positional (grok) — just clear state.
+        logger.debug(
+            "Initial prompt passed as launch arg for window %s (len=%d)",
+            created_wname,
+            len(pending_text),
+        )
+        if context.user_data is not None:
+            context.user_data.pop(PENDING_THREAD_TEXT, None)
+            context.user_data.pop(PENDING_THREAD_ID, None)
+    elif pending_text:
         logger.debug(
             "Forwarding pending text to window %s (len=%d)",
             created_wname,

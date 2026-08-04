@@ -255,7 +255,15 @@ class TranscriptReader:
 
         new_entries: list[dict] = []
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            # CCGRAM-HOTFIX:transcript-decode-guard — tolerate non-UTF-8 bytes
+            # in a corrupt/binary transcript file instead of raising
+            # UnicodeDecodeError on every poll cycle (which spammed the log and
+            # burned CPU forever on a single bad session file). Bad bytes become
+            # U+FFFD; the JSON parse of that line then fails gracefully and the
+            # line is skipped like any other partial line.
+            async with aiofiles.open(
+                file_path, "r", encoding="utf-8", errors="replace"
+            ) as f:
                 await f.seek(0, 2)
                 file_size = await f.tell()
 

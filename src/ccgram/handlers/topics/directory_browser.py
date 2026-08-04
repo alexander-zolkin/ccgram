@@ -24,7 +24,10 @@ from ...user_preferences import user_preferences
 from ..callback_data import (
     CB_DEFAULTS_MODEL,
     CB_DEFAULTS_NO,
+    CB_DEFAULTS_PRIVATE,
+    CB_DEFAULTS_PROVIDER,
     CB_DEFAULTS_YES,
+    CB_PROVIDER_PICK,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_FAV,
@@ -37,6 +40,7 @@ from ..callback_data import (
     CB_MODE_SELECT,
     CB_MODEL_BACK,
     CB_MODEL_PICK,
+    CB_WIZ_MODEL_PICK,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -51,6 +55,8 @@ from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
     PENDING_MODEL_ID,
     PENDING_MODEL_NAME,
+    PENDING_PRIVATE,
+    PENDING_PROVIDER,
     PENDING_WORKSPACE_ID,
     PENDING_WORKSPACES,
     PENDING_WORKTREE_BRANCH,
@@ -158,52 +164,115 @@ def build_quickstart_prompt(model_label: str) -> tuple[str, InlineKeyboardMarkup
     immediately with the quick-start defaults; "No" falls through to the
     directory browser and the full wizard.
 
-    ``model_label`` is the model the Yes launch will use — the selection made
-    via the model picker (CCGRAM-HOTFIX:model-picker), or the claude CLI
-    default when nothing has been picked.
+    ``provider_name`` is the provider the Yes launch will use (changeable via the
+    Provider button). ``model_label`` is the model it will use — shown only for
+    providers with a model picker (claude/grok); pass None for providers that
+    pick their model in-TUI (codex/gemini), which also hides the Model button.
+    ``private_available`` adds a *🕵 Private Grok* button that **launches
+    immediately** — an isolated private folder + GROK_HOME (YOLO), kept out of
+    assistant memory. It is not a toggle.
 
     Returns: (text, keyboard).
     """
+    label, icon = _PROVIDER_META.get(provider_name, (provider_name.title(), "🤖"))
     display_cwd = QUICKSTART_DEFAULT_CWD.replace(str(Path.home()), "~")
-    text = (
-        "*Use default settings?*\n\n"
-        f"Launch right away in `{display_cwd}`:\n"
-        "• Provider: 🟠 Claude\n"
-        f"• Model: `{model_label}`\n"
-        "• Branch: current (no worktree)\n"
-        "• Mode: 🎲 YOLO\n\n"
-        "Tap *🧠 Model* to change the model, or *No* for the full wizard."
-    )
+    lines = [
+        "*Use default settings?*",
+        "",
+        f"Launch right away in `{display_cwd}`:",
+        f"• Provider: {icon} {label}",
+    ]
+    if model_label is not None:
+        lines.append(f"• Model: `{model_label}`")
+    lines += [
+        "• Branch: current (no worktree)",
+        "• Mode: 🎲 YOLO",
+        "",
+        "Tap *🤖 Provider* / *🧠 Model* to change, or *No* for the full wizard.",
+    ]
+    if private_available:
+        lines.append("*🕵 Private Grok* launches an isolated session right away.")
+    text = "\n".join(lines)
+
+    change_row = [
+        InlineKeyboardButton("🤖 Provider…", callback_data=CB_DEFAULTS_PROVIDER)
+    ]
+    if model_label is not None:
+        change_row.append(
+            InlineKeyboardButton("🧠 Model…", callback_data=CB_DEFAULTS_MODEL)
+        )
     buttons = [
         [
             InlineKeyboardButton("✅ Yes", callback_data=CB_DEFAULTS_YES),
             InlineKeyboardButton("⚙️ No", callback_data=CB_DEFAULTS_NO),
         ],
-        # CCGRAM-HOTFIX:model-picker — change the model for the Yes launch
-        [InlineKeyboardButton("🧠 Model…", callback_data=CB_DEFAULTS_MODEL)],
-        [InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL)],
+        change_row,
     ]
+    if private_available:
+        buttons.append(
+            [InlineKeyboardButton("🕵 Private Grok", callback_data=CB_DEFAULTS_PRIVATE)]
+        )
+    buttons.append([InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL)])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_quickstart_provider_picker(
+    available: list[str], selected: str | None = None
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the provider picker shown from the quick-start prompt.
+
+    ``available`` is the list of provider names to offer (already filtered to
+    installed CLIs, shell excluded). Tapping one sets it as the quick-start
+    provider and returns to the prompt. ``selected`` marks the current pick.
+
+    Returns: (text, keyboard).
+    """
+    text = (
+        "*Pick a provider*\n\n"
+        "The quick-start defaults stay the same; only the agent changes."
+    )
+    buttons: list[list[InlineKeyboardButton]] = []
+    for name in available:
+        label, icon = _PROVIDER_META.get(name, (name.title(), "🤖"))
+        check = "✅ " if name == selected else ""
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{check}{icon} {label}",
+                    callback_data=f"{CB_PROVIDER_PICK}{name}",
+                )
+            ]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data=CB_MODEL_BACK),
+            InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL),
+        ]
+    )
     return text, InlineKeyboardMarkup(buttons)
 
 
 def build_model_picker(
     models: list[tuple[str, str]],
     selected_id: str | None = None,
+    provider_label: str = "",
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build the model picker shown from the quick-start prompt.
 
     CCGRAM-HOTFIX:model-picker — ``models`` is a list of ``(id, display_name)``
-    pairs (from ``model_catalog.list_models()``). Tapping a model *selects* it
-    (stored as the pending model) and returns to the quick-start prompt, where
-    "Yes" then launches with ``--model <id>``. ``selected_id`` marks the
-    current selection with a check.
+    pairs (from ``model_catalog.list_models_for_provider``). Tapping a model
+    *selects* it (stored as the pending model) and returns to the quick-start
+    prompt, where "Yes" then launches with ``--model <id>``. ``selected_id``
+    marks the current selection; ``provider_label`` names the provider in the
+    header.
 
     Returns: (text, keyboard).
     """
+    header = f"*Pick a model*{f' — {provider_label}' if provider_label else ''}"
     text = (
-        "*Pick a model*\n\n"
+        f"{header}\n\n"
         "The quick-start defaults stay the same; only the model changes.\n"
-        "List is fetched live from the Anthropic API."
+        "List is discovered live from the provider."
     )
     buttons = [
         [
@@ -220,6 +289,51 @@ def build_model_picker(
             InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL),
         ]
     )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_wizard_model_picker(
+    provider_name: str,
+    models: list[tuple[str, str]],
+    selected_id: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the model picker shown mid-wizard, after the provider is chosen.
+
+    CCGRAM-HOTFIX:model-picker — ``models`` is a list of ``(id, display_name)``
+    pairs (from ``model_catalog.list_models_for_provider(provider)``). Tapping a
+    model selects it and proceeds to the mode picker; the launch appends
+    ``--model <id>``. A "Provider default" row (empty model id) skips the
+    override. ``selected_id`` marks the current selection with a check.
+
+    Returns: (text, keyboard).
+    """
+    label, icon = _PROVIDER_META.get(provider_name, (provider_name.title(), "🤖"))
+    text = (
+        "*Pick a model*\n\n"
+        f"Provider: {icon} {label}\n\n"
+        "Choose the model for this session, or keep the provider default."
+    )
+    buttons: list[list[InlineKeyboardButton]] = []
+    default_selected = "✅ " if not selected_id else ""
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                f"{default_selected}⚙️ Provider default",
+                callback_data=f"{CB_WIZ_MODEL_PICK}{provider_name}:",
+            )
+        ]
+    )
+    for model_id, name in models:
+        check = "✅ " if model_id == selected_id else ""
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{check}{name}",
+                    callback_data=f"{CB_WIZ_MODEL_PICK}{provider_name}:{model_id}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL)])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -411,21 +525,38 @@ _PROVIDER_META: dict[str, tuple[str, str]] = {
     "codex": ("Codex", "\U0001f9e9"),
     "gemini": ("Gemini", "\u264a"),
     "pi": ("Pi", "\U0001f916"),
+    "grok": ("Grok", "\U0001f52e"),
     "shell": ("Shell", "\U0001f41a"),
 }
 
 
-def build_provider_picker(selected_path: str) -> tuple[str, InlineKeyboardMarkup]:
+def build_provider_picker(
+    selected_path: str, available: list[str] | None = None
+) -> tuple[str, InlineKeyboardMarkup]:
     """Build provider selection keyboard shown after directory confirmation.
+
+    Only providers whose launch CLI is present on this host are offered
+    (dynamic, not a static list). ``available`` overrides the detected set
+    (mainly for tests); when None it is resolved from
+    ``providers.available_provider_names()``.
 
     Returns: (text, keyboard).
     """
+    if available is None:
+        # Lazy: providers package heavy bootstrap; only needed at picker time.
+        from ...providers import available_provider_names
+
+        available = available_provider_names()
+    available_set = set(available)
+
     display_path = selected_path.replace(str(Path.home()), "~")
     text = (
         f"*Select Provider*\n\nDirectory: `{display_path}`\n\nWhich agent CLI to use?"
     )
     buttons: list[list[InlineKeyboardButton]] = []
     for name, (label, icon) in _PROVIDER_META.items():
+        if name not in available_set:
+            continue
         suffix = " (default)" if name == "claude" else ""
         buttons.append(
             [

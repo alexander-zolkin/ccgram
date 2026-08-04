@@ -13,7 +13,7 @@ from typing import Literal, Protocol, TypeAlias
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
-ProviderName: TypeAlias = Literal["claude", "pi", "codex", "gemini"]
+ProviderName: TypeAlias = Literal["claude", "pi", "codex", "gemini", "grok"]
 
 
 @dataclass(frozen=True, slots=True)

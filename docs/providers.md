@@ -10,18 +10,19 @@ CCGram supports multiple agent CLI backends. Each Telegram topic can use a diffe
 | Codex CLI   | `codex`     | Yes         | Yes    | Yes      | JSONL      | Hook Stop + pyte VT100 interactive UI + transcript activity heuristic |
 | Gemini CLI  | `gemini`    | Yes         | Yes    | Yes      | JSONL      | Hook AfterAgent + pane title + interactive UI + `/status` snapshot    |
 | Pi          | `pi`        | Yes         | Yes    | Yes      | JSONL (v3) | Hook-runner Stop + transcript activity heuristic                      |
+| Grok Build  | `grok`      | Yes         | Yes    | Yes      | JSONL      | Hook SessionStart/Stop + transcript activity + `/status` snapshot     |
 | Shell       | `bash`      | No          | No     | No       | None       | Shell prompt idle detection                                           |
 
 ## Choosing a Provider
 
-**From Telegram**: When you create a new topic and select a directory, then — if the directory is an eligible git repo — choose whether to use the current branch or create a new worktree on a new branch (non-git directories skip this step), a provider picker appears with Claude (default), Codex, Gemini, Pi, and Shell options. After provider selection, CCGram asks for session mode:
+**From Telegram**: When you create a new topic and select a directory, then — if the directory is an eligible git repo — choose whether to use the current branch or create a new worktree on a new branch (non-git directories skip this step), a provider picker appears with Claude (default), Codex, Gemini, Pi, Grok, and Shell options. For providers with a model catalog (Claude, Grok), a model picker step follows the provider pick. After that, CCGram asks for session mode:
 
 - `✅ Standard` (normal approvals)
 - `🚀 YOLO` (provider-specific permissive mode)
 
 **From the terminal**: If you create a window manually and start an agent CLI, CCGram auto-detects the provider from the running process name. When the pane command is a JS runtime wrapper (node, bun), it inspects the pane's foreground process to reliably identify the actual CLI. How the foreground process is read is owned by the multiplexer backend — tmux uses `ps -t <tty>`, herdr reads `pane process-info` (no tty needed) — so detection works the same on both. The shell provider uses the same seam to classify a bare shell pane. As a last resort, Gemini pane-title symbols (`✦`, `✋`, `◇`) are checked.
 
-**Default provider**: Set `CCGRAM_PROVIDER=codex` (or `gemini`, `pi`, `shell`) to change the default. Claude is the default if unset.
+**Default provider**: Set `CCGRAM_PROVIDER=codex` (or `gemini`, `pi`, `grok`, `shell`) to change the default. Claude is the default if unset.
 
 ## Session Mode (Standard vs YOLO)
 
@@ -32,6 +33,7 @@ CCGram stores mode per window and reuses it for recover/continue/resume flows.
   - Claude: `--dangerously-skip-permissions`
   - Codex: `--dangerously-bypass-approvals-and-sandbox`
   - Gemini: `--yolo`
+  - Grok: `--always-approve`
 
 YOLO sessions are indicated in Telegram topic titles with a `🚀` badge and in `/sessions` with a `[YOLO]` tag. When Remote Control is active, a `📡` badge also appears in the topic title.
 
@@ -44,9 +46,10 @@ CCGRAM_CLAUDE_COMMAND=ce --current
 CCGRAM_CODEX_COMMAND=my-codex-wrapper
 CCGRAM_GEMINI_COMMAND=/opt/gemini/run
 CCGRAM_PI_COMMAND=pi --model sonnet
+CCGRAM_GROK_COMMAND=grok
 ```
 
-`<NAME>` is uppercase: `CLAUDE`, `CODEX`, `GEMINI`, `PI`. Defaults to the provider's built-in command (`claude`, `codex`, `gemini`, `pi`) when unset. New providers automatically support `CCGRAM_<NAME>_COMMAND` without code changes.
+`<NAME>` is uppercase: `CLAUDE`, `CODEX`, `GEMINI`, `PI`, `GROK`. Defaults to the provider's built-in command (`claude`, `codex`, `gemini`, `pi`, `grok`) when unset. New providers automatically support `CCGRAM_<NAME>_COMMAND` without code changes.
 
 You can use this for a global "today" setup (all new sessions), for example:
 
@@ -64,6 +67,7 @@ Each provider exposes its own slash commands to the Telegram menu. Examples:
 - **Codex**: `/model`, `/mode`, `/status`, `/diff`, `/compact`, `/mcp`...
 - **Gemini**: `/chat`, `/clear`, `/compress`, `/model`, `/memory`, `/vim`...
 - **Pi**: `/new`, `/compact`, `/followup`, `/scoped_models`, `/export`, `/name`, `/reload`, `/session`, `/share`, `/changelog`... (plus discovered skills/prompts/extensions)
+- **Grok**: `/model`, `/effort`, `/compact`, `/context`, `/session-info`, `/new`, `/plan`, `/view-plan`, `/usage`, `/mcps`, `/rewind`, `/fork`...
 
 ---
 
@@ -187,6 +191,67 @@ Pi's default toolbar omits Mode/Think/YOLO (pi has no mode cycling) and adds a d
 - Row 3: `🔼 Up, ⏎ Enter, 🔽 Down, 📤 Send, ✖ Close`
 
 Override with a `[providers.pi]` block in `~/.ccgram/toolbar.toml`.
+
+## Grok Build
+
+Grok Build is xAI's official terminal agent (the `grok` CLI — not the npm `@vibe-kit/grok-cli`). It ships Claude-compatible lifecycle hooks, a structured JSONL transcript, `--resume`/`--continue` recovery, and a `--model` launch flag, so it works in Telegram/tmux close to Claude Code: provider pick → **model pick** → Standard/YOLO → launch → transcript relay → hooks → resume/continue.
+
+### Enabling
+
+```ini
+CCGRAM_PROVIDER=grok
+# Optional: launch command override (defaults to `grok`).
+# Use `kara_grok` ONLY if you accept always-approve semantics baked into the
+# wrapper — otherwise keep `grok` and let YOLO add --always-approve.
+CCGRAM_GROK_COMMAND=grok
+# Optional: default model when the picker is skipped.
+# CCGRAM_GROK_MODEL=grok-4.5
+```
+
+`GROK_HOME` overrides Grok's config/session root (defaults to `~/.grok`); ccgram honours it for discovery, model cache, and hook install.
+
+### Model Selection
+
+Grok exposes `--model <id>`, so ccgram offers a model picker at session start (same UX class as Claude's quick-start picker): after choosing Grok in the provider picker, a model list appears before the Standard/YOLO step. The list is discovered live via `grok models` (falling back to `$GROK_HOME/models_cache.json`, then a static list containing at least `grok-4.5`). The chosen id is passed to the fresh launch as `--model <id>`; picking **Provider default** launches without an override (Grok uses `CCGRAM_GROK_MODEL` or its own default). Mid-session, use `/model` (opens the in-TUI picker, drive it from the toolbar) or `/effort high|medium|low`.
+
+### Session Mode (YOLO)
+
+`yolo` mode appends `--always-approve` (auto-approve all tool executions). `normal` mode launches plain `grok`.
+
+### Private Sessions
+
+A **🕵 Private** toggle on the quick-start prompt (Grok only) runs the session in an isolated folder tree so its working files and conversation history stay out of the assistant's memory. When on:
+
+- **cwd** is a fresh `$CCGRAM_PRIVATE_DIR/grok-<timestamp>/` (default `~/private`, `0700`) instead of the workspace.
+- **GROK_HOME** is redirected to `$CCGRAM_PRIVATE_DIR/.grok-home/` (shared login via a symlink to the main `auth.json`; ccgram hooks installed there), so the transcript lands under the private root, **not** `~/.grok/sessions`.
+
+Both paths live under `$CCGRAM_PRIVATE_DIR`, which is outside every path the primary assistant scans (workspace, `~/.grok/sessions`, `~/.claude`). The bot still reads the transcript (same OS user) to relay the session to Telegram — the isolation is by location, not by OS user (a separate user would break the bot's own read/relay). It is not a hard security boundary against the `openclaw` user; it keeps private work out of memory/indexing.
+
+### Hooks
+
+Install ccgram's lifecycle hooks with `ccgram hook --provider grok --install`; ccgram writes `~/.grok/hooks/ccgram.json` (a global, always-trusted hooks file) with `SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`, `SubagentStart`, and `SubagentStop` entries pointing at `python -m ccgram.main hook --provider grok`. Grok sends the event JSON on stdin (camelCase `hookEventName`/`sessionId`); ccgram maps its snake_case event names to the canonical lifecycle set and reconstructs the transcript path from the session id + cwd (Grok omits it from the payload). Transcript discovery remains the fallback and message source of truth. `ccgram doctor` reports missing Grok hooks when Grok is the active provider.
+
+### Sessions & Recovery
+
+Grok stores each session under `$GROK_HOME/sessions/<url-encoded-cwd>/<session-uuid>/` (e.g. `/root` → `%2Froot`). Discovery scans the group for the newest `summary.json` whose `info.cwd` matches the window's cwd (covering the long-path slug+hash fallback too). Dead panes recover with `--continue` (most recent for cwd) or `--resume <session-id>` (the UUIDv7 read from `summary.json`).
+
+### Grok Transcript
+
+Message relay reads `chat_history.jsonl` incrementally (byte offsets). Line types: `system` (skipped), `user` (setup blobs like `<user_info>`/`<system-reminder>` and `synthetic_reason` turns are dropped; the real prompt is unwrapped from `<user_query>`), `assistant` (text + `tool_calls`), `reasoning` (the plaintext `summary` is relayed as thinking; `encrypted_content` is **never** relayed), `backend_tool_call` (server-side web_search/web_fetch, shown compactly), and `tool_result` (resolved back to its call). Native tool names are mapped to canonical labels (`run_terminal_command` → Bash, `read_file` → Read, `search_replace` → Edit, …).
+
+### Status Snapshot
+
+`/status`-style queries fall back to a transcript+metadata snapshot built from `summary.json` (id, cwd, model, effort, counts) and `signals.json` (context-window usage, turn/tool counters), because Grok's `/session-info` renders in the TUI without appending to the transcript.
+
+### Toolbar
+
+Grok's default toolbar mirrors Pi's, surfacing the `/model` picker:
+
+- Row 1: `📷 Screen, ⏹ Ctrl-C, 📺 Live`
+- Row 2: `⎋ Esc, ⇥ Tab, π Model`
+- Row 3: `🔼 Up, ⏎ Enter, 🔽 Down, 📤 Send, ✖ Close`
+
+Override with a `[providers.grok]` block in `~/.ccgram/toolbar.toml`.
 
 ## Shell
 

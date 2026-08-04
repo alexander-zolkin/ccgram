@@ -42,3 +42,7 @@ AWAITING_WORKTREE_BRANCH_NAME = "_awaiting_worktree_branch_name"
 # the "Use default settings?" prompt, carried into the Yes launch as --model.
 PENDING_MODEL_ID = "_pending_model_id"  # str — API model id, or absent for default
 PENDING_MODEL_NAME = "_pending_model_name"  # str — display name shown on the prompt
+# Provider chosen on the quick-start prompt (absent → QUICKSTART_DEFAULT_PROVIDER).
+PENDING_PROVIDER = "_pending_provider"  # str — provider name for the Yes launch
+# Private-session toggle on the quick-start prompt (grok only).
+PENDING_PRIVATE = "_pending_private"  # bool — launch in an isolated private folder

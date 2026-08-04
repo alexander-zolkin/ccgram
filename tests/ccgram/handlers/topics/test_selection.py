@@ -21,24 +21,42 @@ from ccgram.handlers.topics.directory_callbacks import (
 from ccgram.handlers.user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
 
 
+_ALL_PROVIDERS = ["claude", "codex", "gemini", "pi", "grok", "shell"]
+
+
 class TestBuildProviderPicker:
     def test_returns_text_and_keyboard(self) -> None:
-        text, keyboard = build_provider_picker("/home/user/project")
+        text, keyboard = build_provider_picker(
+            "/home/user/project", available=_ALL_PROVIDERS
+        )
         assert "Select Provider" in text
         assert isinstance(keyboard, InlineKeyboardMarkup)
 
-    def test_shows_all_providers(self) -> None:
-        text, keyboard = build_provider_picker("/tmp/test")
+    def test_shows_all_available_providers(self) -> None:
+        text, keyboard = build_provider_picker("/tmp/test", available=_ALL_PROVIDERS)
         buttons = keyboard.inline_keyboard
         labels = [btn.text for row in buttons for btn in row]
         assert any("Claude" in label for label in labels)
         assert any("Codex" in label for label in labels)
         assert any("Gemini" in label for label in labels)
         assert any("Pi" in label for label in labels)
+        assert any("Grok" in label for label in labels)
         assert any("Shell" in label for label in labels)
 
+    def test_hides_unavailable_providers(self) -> None:
+        # Only grok/codex/claude/shell installed → gemini/pi absent from picker.
+        _text, keyboard = build_provider_picker(
+            "/tmp/test", available=["claude", "codex", "grok", "shell"]
+        )
+        callbacks = [
+            btn.callback_data for row in keyboard.inline_keyboard for btn in row
+        ]
+        assert f"{CB_PROV_SELECT}grok" in callbacks
+        assert f"{CB_PROV_SELECT}gemini" not in callbacks
+        assert f"{CB_PROV_SELECT}pi" not in callbacks
+
     def test_claude_marked_as_default(self) -> None:
-        _text, keyboard = build_provider_picker("/tmp/test")
+        _text, keyboard = build_provider_picker("/tmp/test", available=_ALL_PROVIDERS)
         buttons = keyboard.inline_keyboard
         claude_labels = [
             btn.text for row in buttons for btn in row if "Claude" in btn.text
@@ -46,7 +64,7 @@ class TestBuildProviderPicker:
         assert any("default" in label for label in claude_labels)
 
     def test_callback_data_uses_prov_prefix(self) -> None:
-        _text, keyboard = build_provider_picker("/tmp/test")
+        _text, keyboard = build_provider_picker("/tmp/test", available=_ALL_PROVIDERS)
         buttons = keyboard.inline_keyboard
         provider_callbacks = [
             btn.callback_data
@@ -59,10 +77,11 @@ class TestBuildProviderPicker:
         assert f"{CB_PROV_SELECT}codex" in provider_callbacks
         assert f"{CB_PROV_SELECT}gemini" in provider_callbacks
         assert f"{CB_PROV_SELECT}pi" in provider_callbacks
+        assert f"{CB_PROV_SELECT}grok" in provider_callbacks
         assert f"{CB_PROV_SELECT}shell" in provider_callbacks
 
     def test_has_cancel_button(self) -> None:
-        _text, keyboard = build_provider_picker("/tmp/test")
+        _text, keyboard = build_provider_picker("/tmp/test", available=_ALL_PROVIDERS)
         buttons = keyboard.inline_keyboard
         cancel_callbacks = [btn.callback_data for row in buttons for btn in row]
         assert CB_DIR_CANCEL in cancel_callbacks
@@ -196,6 +215,9 @@ class TestHandleProviderSelect:
         mock_edit: AsyncMock,
     ) -> None:
         mock_registry.is_valid.return_value = True
+        # Codex has no model picker → provider select goes straight to the mode
+        # picker (claude/grok would show the model step first).
+        mock_registry.get.return_value.capabilities.supports_model_picker = False
         mock_tr.get_window_for_thread.return_value = None
         mock_tmux.create_window = AsyncMock()
 
@@ -426,6 +448,7 @@ class TestHandleModeSelect:
         mock_provider = MagicMock()
         mock_provider.capabilities.supports_hook = False
         mock_provider.capabilities.chat_first_command_path = False
+        mock_provider.capabilities.launch_accepts_initial_prompt = False
         mock_registry.is_valid.return_value = True
         mock_registry.get.return_value = mock_provider
         mock_registry_wls.get.return_value = mock_provider

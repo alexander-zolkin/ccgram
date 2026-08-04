@@ -8,6 +8,8 @@ require Config (doctor, status).
 """
 
 import re
+import shlex
+import shutil
 
 import structlog
 import os
@@ -32,6 +34,7 @@ _YOLO_FLAGS: dict[str, str] = {
     "claude": "--dangerously-skip-permissions",
     "codex": "--dangerously-bypass-approvals-and-sandbox",
     "gemini": "--yolo",
+    "grok": "--always-approve",
 }
 
 
@@ -65,12 +68,16 @@ def _ensure_registered() -> None:
     from ccgram.providers.pi import PiProvider
 
     # Lazy: provider classes register against the registry at import; defer until the registry factory runs
+    from ccgram.providers.grok import GrokProvider
+
+    # Lazy: provider classes register against the registry at import; defer until the registry factory runs
     from ccgram.providers.shell import ShellProvider
 
     registry.register("claude", ClaudeProvider)
     registry.register("codex", CodexProvider)
     registry.register("gemini", GeminiProvider)
     registry.register("pi", PiProvider)
+    registry.register("grok", GrokProvider)
     registry.register("shell", ShellProvider)
     _registered = True
 
@@ -140,9 +147,12 @@ def detect_provider_from_command(pane_current_command: str) -> str:
     # Match basename only (first token) to avoid false positives
     # from paths like /home/claude/bin/vim
     basename = os.path.basename(cmd.split()[0])
-    for name in ("claude", "codex", "gemini", "pi"):
+    for name in ("claude", "codex", "gemini", "pi", "grok"):
         if basename == name or basename.startswith(name + "-"):
             return name
+    # Grok's ccgram launcher wrapper execs the official binary; treat it as grok.
+    if basename == "kara_grok":
+        return "grok"
 
     # Lazy: providers.shell pulls in shell_infra (prompt-marker machinery
     # + readline lookups) at import; only load when we have to fall
@@ -179,6 +189,8 @@ def detect_provider_from_transcript_path(transcript_path: str) -> str:
         return "gemini"
     if "/.pi/agent/sessions/" in normalized:
         return "pi"
+    if "/.grok/sessions/" in normalized:
+        return "grok"
     return ""
 
 
@@ -303,6 +315,59 @@ def resolve_launch_command(
     return f"{command} {yolo_flag}"
 
 
+def _provider_base_command(provider_name: str) -> str:
+    """Return the bare executable for a provider (env override or CLI default).
+
+    Strips YOLO/hardening wrappers — this is just the binary whose presence
+    decides whether the provider can run. Empty for shell (no external CLI).
+    """
+    name = provider_name.lower()
+    override = os.environ.get(f"CCGRAM_{name.upper()}_COMMAND", "").strip()
+    if override:
+        try:
+            parts = shlex.split(override)
+        except ValueError:
+            parts = override.split()
+        return parts[0] if parts else ""
+    try:
+        return registry.get(name).capabilities.launch_command
+    except UnknownProviderError:
+        return ""
+
+
+def is_provider_available(provider_name: str) -> bool:
+    """Return True when the provider's launch CLI is resolvable on this host.
+
+    Resolution honours ``CCGRAM_<NAME>_COMMAND`` (first token). An absolute path
+    must be an executable file; a bare name must be found on ``PATH`` via
+    ``which``. Providers with no external binary (shell) are always available.
+    """
+    _ensure_registered()
+    name = provider_name.lower()
+    if not registry.is_valid(name):
+        return False
+    base = _provider_base_command(name)
+    if not base:
+        return True  # shell / no external CLI
+    if os.path.isabs(base):
+        return os.path.isfile(base) and os.access(base, os.X_OK)
+    return shutil.which(base) is not None
+
+
+def available_provider_names() -> list[str]:
+    """Registered providers whose launch CLI is present, in registration order.
+
+    Used by the session-creation provider picker so only installed agents are
+    offered (dynamic, not a static list). ``shell`` is always included.
+    """
+    _ensure_registered()
+    return [
+        name
+        for name in registry.provider_names()
+        if name == "shell" or is_provider_available(name)
+    ]
+
+
 def resolve_capabilities(provider_name: str | None = None) -> ProviderCapabilities:
     """Resolve provider capabilities without requiring full Config.
 
@@ -332,6 +397,8 @@ __all__ = [
     "SessionStartEvent",
     "StatusUpdate",
     "UnknownProviderError",
+    "available_provider_names",
+    "is_provider_available",
     "detect_provider_from_command",
     "detect_provider_from_pane",
     "detect_provider_from_transcript_path",

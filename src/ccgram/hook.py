@@ -99,6 +99,24 @@ def _installable_events_for(provider_name: str) -> tuple[str, ...]:
 # without a churny import migration.
 _CODEX_HOOK_EVENTS: tuple[str, ...] = _installable_events_for("codex")
 _GEMINI_HOOK_EVENTS: tuple[str, ...] = _installable_events_for("gemini")
+_GROK_HOOK_EVENTS: tuple[str, ...] = _installable_events_for("grok")
+
+
+def _grok_home() -> Path:
+    """Resolve the Grok home dir (``$GROK_HOME`` or ``~/.grok``).
+
+    Inlined (not imported from providers) so the hook fast path stays free of
+    the providers package bootstrap.
+    """
+    override = os.environ.get("GROK_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".grok"
+
+
+def _grok_hooks_file() -> Path:
+    """Return the ccgram-managed Grok hooks JSON path (``~/.grok/hooks/ccgram.json``)."""
+    return _grok_home() / "hooks" / "ccgram.json"
 
 
 def _codex_hooks_file() -> Path:
@@ -326,6 +344,7 @@ def _ensure_codex_feature_flag() -> int:
 
 _CODEX_HOOK_TIMEOUT_SECONDS = 5
 _GEMINI_HOOK_TIMEOUT_MS = 5_000
+_GROK_HOOK_TIMEOUT_SECONDS = 5
 
 
 def _install_codex_hook() -> int:
@@ -341,6 +360,19 @@ def _install_gemini_hook() -> int:
     """Install user-level Gemini hooks."""
     return _install_json_hooks(
         _gemini_settings_file(), "gemini", _GEMINI_HOOK_EVENTS, _GEMINI_HOOK_TIMEOUT_MS
+    )
+
+
+def _install_grok_hook() -> int:
+    """Install ccgram's Grok hooks into ``~/.grok/hooks/ccgram.json``.
+
+    Grok's hook JSON schema (``{"hooks": {Event: [{"hooks": [entry]}]}}``)
+    matches the Codex/Gemini installer's structure, so the shared JSON writer
+    produces a valid Grok hook file. Timeouts are in seconds. Global
+    ``~/.grok/hooks/`` files are always trusted (no folder-trust gate).
+    """
+    return _install_json_hooks(
+        _grok_hooks_file(), "grok", _GROK_HOOK_EVENTS, _GROK_HOOK_TIMEOUT_SECONDS
     )
 
 
@@ -416,7 +448,7 @@ def _json_hook_status(path: Path, provider_name: str, events: tuple[str, ...]) -
     return 1
 
 
-def _install_hook(provider_name: str = "claude") -> int:  # noqa: PLR0912
+def _install_hook(provider_name: str = "claude") -> int:  # noqa: PLR0912, PLR0911
     """Install ccgram hooks for all event types into provider settings.
 
     Returns 0 on success, 1 on error.
@@ -426,6 +458,8 @@ def _install_hook(provider_name: str = "claude") -> int:  # noqa: PLR0912
             return _install_codex_hook()
         case "gemini":
             return _install_gemini_hook()
+        case "grok":
+            return _install_grok_hook()
         case "pi":
             print(
                 "Pi hooks are provided by the hook-runner extension; nothing to install."
@@ -528,6 +562,8 @@ def _uninstall_hook(provider_name: str = "claude") -> int:  # noqa: PLR0911
             return _uninstall_json_hooks(_codex_hooks_file(), "codex")
         case "gemini":
             return _uninstall_json_hooks(_gemini_settings_file(), "gemini")
+        case "grok":
+            return _uninstall_json_hooks(_grok_hooks_file(), "grok")
         case "pi":
             print(
                 "Pi hooks are managed by the hook-runner extension; nothing to uninstall."
@@ -606,6 +642,8 @@ def _hook_status(provider_name: str = "claude") -> int:  # noqa: PLR0911
             return _json_hook_status(
                 _gemini_settings_file(), "gemini", _GEMINI_HOOK_EVENTS
             )
+        case "grok":
+            return _json_hook_status(_grok_hooks_file(), "grok", _GROK_HOOK_EVENTS)
         case "pi":
             print("Pi hook status depends on the hook-runner extension.")
             print(
@@ -749,7 +787,7 @@ def _ps_snapshot() -> dict[int, tuple[int, int, str, str]]:
             text=True,
             timeout=5,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired, OSError:
         return {}
     snapshot: dict[int, tuple[int, int, str, str]] = {}
     for line in result.stdout.splitlines():
@@ -785,7 +823,7 @@ def _foreground_pgid_on_tty(
             text=True,
             timeout=5,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired, OSError:
         return None
     for line in result.stdout.splitlines():
         try:
@@ -992,10 +1030,51 @@ def _resolve_pi_transcript_path(session_id: str, cwd: str) -> str:
     return str(candidates[0][1]) if candidates else ""
 
 
+def _encode_grok_cwd_dirname(cwd: str) -> str:
+    """Encode cwd using Grok's URL-percent-encoding session-group convention."""
+    # Lazy: quote is stdlib; import at call site to keep module import lean.
+    from urllib.parse import quote
+
+    trimmed = cwd.rstrip("/\\") or "/"
+    return quote(trimmed, safe="")
+
+
+def _resolve_grok_transcript_path(session_id: str, cwd: str) -> str:
+    """Compute the Grok ``chat_history.jsonl`` path from session id + cwd.
+
+    Grok hook payloads omit the transcript path, so it is reconstructed from the
+    session storage layout: ``$GROK_HOME/sessions/<encoded-cwd>/<id>/``.  When
+    the encoded-cwd group is absent (long-path slug+hash case), the session
+    directory is located by id across all groups.
+    """
+    if not session_id:
+        return ""
+    sessions_root = _grok_home() / "sessions"
+    if cwd:
+        direct = sessions_root / _encode_grok_cwd_dirname(cwd) / session_id
+        if direct.is_dir():
+            return str(direct / "chat_history.jsonl")
+    if not sessions_root.is_dir():
+        return ""
+    try:
+        for group in sessions_root.iterdir():
+            if not group.is_dir():
+                continue
+            candidate = group / session_id
+            if candidate.is_dir():
+                return str(candidate / "chat_history.jsonl")
+    except OSError:
+        return ""
+    return ""
+
+
 def _resolve_transcript_path(
     provider_name: str, session_id: str, cwd: str, transcript_path: str
 ) -> str:
     """Return transcript path from payload or provider-specific fallback."""
+    if provider_name == "grok":
+        resolved = _resolve_grok_transcript_path(session_id, cwd)
+        return resolved or transcript_path
     if provider_name == "pi":
         if transcript_path and session_id in Path(transcript_path).name:
             return transcript_path
@@ -1026,7 +1105,7 @@ def _read_session_map_entry(session_window_key: str) -> dict[str, str]:
         return {}
     try:
         raw = json.loads(map_file.read_text())
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         return {}
     if not isinstance(raw, dict):
         return {}
@@ -1112,9 +1191,11 @@ def _provider_from_pane_tty(pane_tty: str) -> ProviderName | None:
             text=True,
             timeout=5,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired, OSError:
         return None
     text = result.stdout.lower()
+    if "grok" in text:
+        return "grok"
     if "gemini" in text:
         return "gemini"
     if "codex" in text:

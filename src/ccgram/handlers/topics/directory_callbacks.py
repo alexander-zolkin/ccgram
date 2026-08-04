@@ -38,6 +38,8 @@ from telegram import (
 from ..callback_data import (
     CB_DEFAULTS_MODEL,
     CB_DEFAULTS_NO,
+    CB_DEFAULTS_PRIVATE,
+    CB_DEFAULTS_PROVIDER,
     CB_DEFAULTS_YES,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
@@ -51,6 +53,8 @@ from ..callback_data import (
     CB_MODEL_BACK,
     CB_MODEL_PICK,
     CB_PROV_SELECT,
+    CB_PROVIDER_PICK,
+    CB_WIZ_MODEL_PICK,
     CB_WT_CONFIRM,
     CB_WT_EDIT_NAME,
     CB_WT_NEW,
@@ -65,6 +69,7 @@ from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
     PENDING_MODEL_ID,
     PENDING_MODEL_NAME,
+    PENDING_PROVIDER,
     PENDING_THREAD_ID,
     PENDING_THREAD_TEXT,
     PENDING_WORKTREE_BRANCH,
@@ -75,6 +80,7 @@ from ..user_state import (
     PENDING_WORKTREE_SUBDIR,
 )
 from .directory_browser import (
+    _PROVIDER_META,
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
@@ -86,6 +92,7 @@ from .directory_browser import (
     build_directory_browser,
     build_model_picker,
     build_quickstart_prompt,
+    build_quickstart_provider_picker,
     build_worktree_confirm,
     build_worktree_picker,
     clear_browse_state,
@@ -201,7 +208,7 @@ async def _render_directory_browser(
     await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
-async def handle_directory_callback(
+async def handle_directory_callback(  # noqa: PLR0912 — flat prefix-dispatch table
     query: CallbackQuery,
     user_id: int,
     data: str,
@@ -218,6 +225,12 @@ async def handle_directory_callback(
         await _handle_defaults_no(query, user_id, update, context)
     elif data == CB_DEFAULTS_MODEL:  # CCGRAM-HOTFIX:model-picker
         await _handle_defaults_model(query, update, context)
+    elif data == CB_DEFAULTS_PROVIDER:  # CCGRAM-HOTFIX:model-picker
+        await _handle_defaults_provider(query, update, context)
+    elif data == CB_DEFAULTS_PRIVATE:  # CCGRAM-HOTFIX:private-session
+        await _handle_defaults_private(query, user_id, update, context)
+    elif data.startswith(CB_PROVIDER_PICK):  # CCGRAM-HOTFIX:model-picker
+        await _handle_provider_pick(query, user_id, data, update, context)
     elif data == CB_MODEL_BACK:  # CCGRAM-HOTFIX:model-picker
         await _handle_model_back(query, update, context)
     elif data.startswith(CB_MODEL_PICK):  # CCGRAM-HOTFIX:model-picker
@@ -238,6 +251,8 @@ async def handle_directory_callback(
         await _handle_confirm(query, user_id, update, context)
     elif data.startswith(CB_PROV_SELECT):
         await _handle_provider_select(query, user_id, data, update, context)
+    elif data.startswith(CB_WIZ_MODEL_PICK):  # CCGRAM-HOTFIX:model-picker
+        await _handle_wizard_model_pick(query, user_id, data, update, context)
     elif data.startswith(CB_MODE_SELECT):
         await _handle_mode_select(query, user_id, data, update, context)
     elif data in (CB_WT_USE_CURRENT, CB_WT_NEW, CB_WT_CONFIRM, CB_WT_EDIT_NAME):
@@ -428,7 +443,7 @@ def _subdir_within_repo(selected_path: str, repo_path: Path) -> str:
     """
     try:
         rel = Path(selected_path).resolve().relative_to(repo_path.resolve())
-    except (ValueError, OSError):
+    except ValueError, OSError:
         return ""
     return str(rel) if rel.parts else ""
 
@@ -692,30 +707,28 @@ async def _handle_wt_edit_name(
     )
 
 
-async def _handle_defaults_yes(
+async def _quickstart_launch(
     query: CallbackQuery,
     user_id: int,
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    *,
+    provider: str,
+    private: bool,
+    model_id: str | None,
 ) -> None:
-    """Handle CB_DEFAULTS_YES: skip the wizard, launch with quick-start defaults.
+    """Shared quick-start launch: validate → resolve cwd → ``launch_window``.
 
-    CCGRAM-HOTFIX:quickstart-defaults — workspace cwd, current branch (no
-    worktree), Claude, YOLO. Reuses the same finalize tail as the mode picker
-    (clear browse state → validate → ``launch_window``), so bind + launch +
-    pending-text delivery are identical to completing the full wizard.
+    ``private`` (grok only) runs the session in a fresh isolated private folder
+    instead of the default workspace cwd. Reuses the same finalize tail as the
+    mode picker so bind + launch + pending-text delivery are identical.
     """
     pending_tid = (
         context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
     )
     if pending_tid is None:
         # Flow was reset (e.g. /start cleared PENDING_THREAD_ID) — a stale tap.
-        # Fail closed rather than spawn an unbound window in the default cwd.
         await query.answer("Stale prompt (flow reset)", show_alert=True)
-        return
-    if not Path(QUICKSTART_DEFAULT_CWD).is_dir():
-        await query.answer()
-        await safe_edit(query, f"❌ Default directory missing: {QUICKSTART_DEFAULT_CWD}")
         return
 
     clear_browse_state(context.user_data)
@@ -775,15 +788,15 @@ async def _handle_defaults_model(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Handle CB_DEFAULTS_MODEL: show the model picker.
+    """Handle CB_DEFAULTS_MODEL: show the model picker for the chosen provider.
 
     CCGRAM-HOTFIX:model-picker — morphs the quick-start prompt into a list of
-    models fetched from the Anthropic API (``model_catalog.list_models()``,
-    static fallback when the API is unreachable). The current selection (if
-    any) is checked. Flow state stays STATE_CONFIRMING_DEFAULTS.
+    models discovered live for the current provider
+    (``model_catalog.list_models_for_provider``), static fallback when
+    unreachable. The current selection (if any) is checked.
     """
     # Lazy: keep the httpx-based catalog out of the handlers import path
-    from ...model_catalog import list_models
+    from ...model_catalog import list_models_for_provider
 
     pending_tid = (
         context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
@@ -794,11 +807,17 @@ async def _handle_defaults_model(
     if get_thread_id(update) != pending_tid:
         await query.answer("Stale prompt (topic mismatch)", show_alert=True)
         return
+    provider = _current_provider(context)
+    if not _provider_supports_model_picker(provider):
+        await query.answer("This provider picks its model in-session", show_alert=True)
+        return
     await query.answer()
-    models = await list_models()
+    models = await list_models_for_provider(provider)
     selected = context.user_data.get(PENDING_MODEL_ID) if context.user_data else None
     msg_text, keyboard = build_model_picker(
-        [(m.id, m.display_name) for m in models], selected_id=selected
+        [(m.id, m.display_name) for m in models],
+        selected_id=selected,
+        provider_label=_provider_display_label(provider),
     )
     await safe_edit(query, msg_text, reply_markup=keyboard)
 
@@ -808,9 +827,9 @@ async def _handle_model_back(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Handle CB_MODEL_BACK: return from the picker to the quick-start prompt.
+    """Handle CB_MODEL_BACK: return from the model/provider picker to the prompt.
 
-    CCGRAM-HOTFIX:model-picker — re-renders the prompt with the current model.
+    CCGRAM-HOTFIX:model-picker — re-renders the prompt with the current pick.
     """
     pending_tid = (
         context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
@@ -819,8 +838,7 @@ async def _handle_model_back(
         await query.answer("Stale prompt (flow reset)", show_alert=True)
         return
     await query.answer()
-    msg_text, keyboard = build_quickstart_prompt(_current_model_label(context))
-    await safe_edit(query, msg_text, reply_markup=keyboard)
+    await _show_quickstart_prompt(query, context)
 
 
 async def _handle_model_pick(
@@ -849,16 +867,16 @@ async def _handle_model_pick(
         return
 
     # Resolve the display name from the (cached) catalog; fall back to the id.
-    from ...model_catalog import list_models
+    from ...model_catalog import list_models_for_provider
 
-    models = await list_models()
+    provider = _current_provider(context)
+    models = await list_models_for_provider(provider)
     name = next((m.display_name for m in models if m.id == model_id), model_id)
     if context.user_data is not None:
         context.user_data[PENDING_MODEL_ID] = model_id
         context.user_data[PENDING_MODEL_NAME] = name
     await query.answer(f"Model: {name}")
-    msg_text, keyboard = build_quickstart_prompt(_current_model_label(context))
-    await safe_edit(query, msg_text, reply_markup=keyboard)
+    await _show_quickstart_prompt(query, context)
 
 
 async def _handle_defaults_no(
@@ -928,6 +946,9 @@ async def _handle_cancel(
     CB_DEFAULTS_YES,  # CCGRAM-HOTFIX:quickstart-defaults
     CB_DEFAULTS_NO,  # CCGRAM-HOTFIX:quickstart-defaults
     CB_DEFAULTS_MODEL,  # CCGRAM-HOTFIX:model-picker
+    CB_DEFAULTS_PROVIDER,  # CCGRAM-HOTFIX:model-picker
+    CB_DEFAULTS_PRIVATE,  # CCGRAM-HOTFIX:private-session
+    CB_PROVIDER_PICK,  # CCGRAM-HOTFIX:model-picker
     CB_MODEL_PICK,  # CCGRAM-HOTFIX:model-picker
     CB_MODEL_BACK,  # CCGRAM-HOTFIX:model-picker
     CB_DIR_FAV,
@@ -938,6 +959,7 @@ async def _handle_cancel(
     CB_DIR_PAGE,
     CB_DIR_CONFIRM,
     CB_PROV_SELECT,
+    CB_WIZ_MODEL_PICK,  # CCGRAM-HOTFIX:model-picker
     CB_MODE_SELECT,
     CB_WT_USE_CURRENT,
     CB_WT_NEW,

@@ -228,6 +228,16 @@ DEFAULT_LAYOUTS: dict[str, ToolbarLayout] = {
             ("last", "getfile", "close"),
         ),
     ),
+    # Grok supports /model (opens a picker) — surface it on the toolbar like Pi.
+    "grok": ToolbarLayout(
+        style="emoji_text",
+        buttons=(
+            ("screen", "ctrlc", "live"),
+            ("esc", "tab", "model"),
+            ("up", "enter", "down"),
+            ("last", "getfile", "close"),
+        ),
+    ),
     "shell": ToolbarLayout(
         style="emoji_text",
         buttons=(

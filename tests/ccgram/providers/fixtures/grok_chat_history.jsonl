@@ -1,0 +1,10 @@
+{"type": "system", "content": "You are Grok 4.5 released by xAI. You are an autonomous agent."}
+{"type": "user", "content": [{"type": "text", "text": "<user_info>\nOS Version: linux\nShell: /bin/bash\nWorkspace Path: /tmp/proj\n</user_info>"}]}
+{"type": "user", "content": [{"type": "text", "text": "<system-reminder>\nThe following skills are available for use.\n</system-reminder>"}], "synthetic_reason": "skills"}
+{"type": "user", "content": [{"type": "text", "text": "<user_query>\nlist the files then say done\n</user_query>"}], "prompt_index": 0}
+{"type": "reasoning", "id": "rs_test", "summary": [{"type": "summary_text", "text": "The user wants me to list files then confirm."}], "encrypted_content": "SECRET_BLOB_MUST_NOT_LEAK", "status": "completed"}
+{"type": "assistant", "content": "Проверю файлы.", "tool_calls": [{"id": "call-1", "name": "list_dir", "arguments": "{\"target_directory\":\"/tmp/proj\"}"}, {"id": "call-2", "name": "run_terminal_command", "arguments": "{\"command\":\"ls -la\",\"description\":\"list\"}"}], "model_id": "grok-4.5", "reasoning_effort": "high"}
+{"type": "tool_result", "tool_call_id": "call-1", "content": "foo.py\nbar.py"}
+{"type": "tool_result", "tool_call_id": "call-2", "content": "total 8\n-rw-r--r-- 1 u u 0 foo.py\n-rw-r--r-- 1 u u 0 bar.py"}
+{"type": "backend_tool_call", "kind": {"tool_type": "web_search", "action": {"type": "search", "query": "grok 4.5 release"}}}
+{"type": "assistant", "content": "Done", "model_id": "grok-4.5"}

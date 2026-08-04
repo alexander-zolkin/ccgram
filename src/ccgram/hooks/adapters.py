@@ -14,7 +14,28 @@ from ccgram.providers.base import UUID_RE
 
 from .model import HookAdapter, JsonValue, NormalizedHookEvent, ProviderName
 
-_SAFE_PROVIDERS: tuple[ProviderName, ...] = ("claude", "pi", "codex", "gemini")
+_SAFE_PROVIDERS: tuple[ProviderName, ...] = ("claude", "pi", "codex", "gemini", "grok")
+
+# Grok emits snake_case ``hookEventName`` values; map them to ccgram's canonical
+# PascalCase lifecycle names (Grok also accepts Claude/Cursor PascalCase, which
+# we pass through unchanged below).
+_GROK_EVENT_MAP: dict[str, str] = {
+    "session_start": "SessionStart",
+    "user_prompt_submit": "UserPromptSubmit",
+    "pre_tool_use": "PreToolUse",
+    "post_tool_use": "PostToolUse",
+    "post_tool_use_failure": "PostToolUseFailure",
+    "permission_denied": "PermissionDenied",
+    "stop": "Stop",
+    "stop_failure": "StopFailure",
+    "notification": "Notification",
+    "subagent_start": "SubagentStart",
+    "subagent_stop": "SubagentStop",
+    "subagent_end": "SubagentStop",
+    "pre_compact": "PreCompact",
+    "post_compact": "PostCompact",
+    "session_end": "SessionEnd",
+}
 
 # Event names emitted only by Gemini — used by detect_provider_from_payload
 # to distinguish Gemini payloads when transcript path is absent. SessionStart,
@@ -280,6 +301,96 @@ class GeminiHookAdapter:
         )
 
 
+def _first_str_field(payload: dict[str, object], *keys: str) -> str:
+    """Return the first non-empty string among *keys* (camelCase/snake_case)."""
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+class GrokHookAdapter:
+    """Normalize Grok Build hook payloads.
+
+    Grok sends camelCase stdin keys (``hookEventName``, ``sessionId``,
+    ``workspaceRoot``) with snake_case event values (``session_start``,
+    ``stop`` …).  It also accepts Claude/Cursor PascalCase, so both are handled.
+    Session IDs are UUIDv7 strings, which satisfy ``UUID_RE``.  The payload omits
+    a transcript path — it is reconstructed downstream from the session id + cwd.
+    """
+
+    provider_name: ProviderName = "grok"
+    event_types: tuple[str, ...] = (
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PermissionDenied",
+        "Stop",
+        "StopFailure",
+        "Notification",
+        "SubagentStart",
+        "SubagentStop",
+        "PreCompact",
+        "PostCompact",
+        "SessionEnd",
+    )
+    # The lifecycle signals ccgram acts on and writes into ~/.grok/hooks/.
+    installable_events: tuple[str, ...] = (
+        "SessionStart",
+        "Stop",
+        "StopFailure",
+        "SessionEnd",
+        "Notification",
+        "SubagentStart",
+        "SubagentStop",
+    )
+
+    def normalize(self, payload: dict[str, object]) -> NormalizedHookEvent | None:
+        raw_event = _first_str_field(payload, "hookEventName", "hook_event_name")
+        canonical = _GROK_EVENT_MAP.get(raw_event)
+        if canonical is None:
+            canonical = raw_event if raw_event in self.event_types else ""
+        if not canonical:
+            return None
+        session_id = _first_str_field(payload, "sessionId", "session_id")
+        if not UUID_RE.match(session_id):
+            return None
+        cwd = _first_str_field(payload, "cwd", "workspaceRoot", "workspace_root")
+        data: dict[str, JsonValue] = {}
+        if canonical == "Notification":
+            data["message"] = _first_str_field(payload, "message")
+            data["notification_type"] = _first_str_field(
+                payload, "notificationType", "notification_type"
+            )
+            data["tool_name"] = _first_str_field(payload, "toolName", "tool_name")
+        elif canonical in {"Stop", "StopFailure"}:
+            data["stop_reason"] = _first_str_field(payload, "stopReason", "stop_reason")
+        elif canonical == "SessionEnd":
+            data["reason"] = _first_str_field(
+                payload, "reason", "endReason", "end_reason"
+            )
+        elif canonical in {"SubagentStart", "SubagentStop"}:
+            data["subagent_id"] = _first_str_field(payload, "subagentId", "subagent_id")
+            data["name"] = _first_str_field(payload, "name") or "Grok subagent"
+            data["description"] = _first_str_field(payload, "description")
+        elif canonical == "SessionStart":
+            data["source"] = _first_str_field(payload, "source")
+        return _event(
+            provider_name=self.provider_name,
+            native_event_name=raw_event,
+            canonical_event_name=canonical,
+            session_id=session_id,
+            cwd=cwd,
+            transcript_path=_first_str_field(
+                payload, "transcriptPath", "transcript_path"
+            ),
+            data=data,
+        )
+
+
 def _extract_claude_data(
     event_name: str, payload: dict[str, object]
 ) -> dict[str, JsonValue]:
@@ -327,6 +438,7 @@ _ADAPTERS: dict[ProviderName, HookAdapter] = {
     "pi": PiHookAdapter(),
     "codex": CodexHookAdapter(),
     "gemini": GeminiHookAdapter(),
+    "grok": GrokHookAdapter(),
 }
 
 
@@ -337,7 +449,9 @@ def get_hook_adapter(provider_name: str) -> HookAdapter | None:
     return _ADAPTERS[cast(ProviderName, provider_name)]
 
 
-def detect_provider_from_payload(payload: dict[str, object]) -> ProviderName | None:
+def detect_provider_from_payload(  # noqa: C901 — linear provider-detection chain
+    payload: dict[str, object],
+) -> ProviderName | None:
     """Best-effort provider detection when installed hook lacks --provider."""
     explicit = _str_field(payload, "provider_name")
     transcript_path = _str_field(payload, "transcript_path")
@@ -347,12 +461,18 @@ def detect_provider_from_payload(payload: dict[str, object]) -> ProviderName | N
     provider: ProviderName | None = None
     if explicit in _SAFE_PROVIDERS:
         provider = cast(ProviderName, explicit)
+    elif "/.grok/" in transcript_path:
+        provider = "grok"
     elif "/.codex/" in transcript_path:
         provider = "codex"
     elif "/.gemini/" in transcript_path:
         provider = "gemini"
     elif "/.pi/" in transcript_path:
         provider = "pi"
+    elif _str_field(payload, "hookEventName") or _str_field(payload, "workspaceRoot"):
+        # Grok is the only provider that sends camelCase hook keys; this covers a
+        # manually-started grok pane whose hook lacks an explicit --provider flag.
+        provider = "grok"
     elif "/.claude/" in transcript_path:
         # CCGRAM-HOTFIX:claude-stop-permmode — Claude Code >=2.1 puts
         # permission_mode/model into the Stop payload; the codex heuristic below

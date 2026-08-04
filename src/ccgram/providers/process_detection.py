@@ -49,6 +49,10 @@ _PROVIDER_BASENAMES: tuple[tuple[frozenset[str], str], ...] = (
     (frozenset({"codex"}), "codex"),
     (frozenset({"gemini"}), "gemini"),
     (frozenset({"pi"}), "pi"),
+    # ``grok`` is the official xAI binary; ``kara_grok`` is ccgram's launcher
+    # wrapper that execs it. The npm ``@vibe-kit/grok-cli`` is a node script,
+    # so its argv0 is ``cli.js`` (never ``grok``) and won't match here.
+    (frozenset({"grok", "kara_grok"}), "grok"),
 )
 
 # Path substrings that identify a provider when basename alone is ambiguous
@@ -58,6 +62,7 @@ _PROVIDER_PATH_MARKERS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("@openai/codex", "/codex/", "/codex-"), "codex"),
     (("gemini-cli",), "gemini"),
     (("@mariozechner/pi-coding-agent", "/pi-coding-agent/"), "pi"),
+    ((".grok/bin/grok", "grok-linux", "/grok/bin/"), "grok"),
 )
 
 

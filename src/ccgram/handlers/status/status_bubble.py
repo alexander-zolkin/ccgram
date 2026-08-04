@@ -23,6 +23,7 @@ from ...expandable_quote import format_expandable_quote
 from ...telegram_client import TelegramClient
 from ...thread_router import thread_router
 from ...window_state_ports.pane_state import PaneProjection, list_pane_projections
+from ...utils import atomic_write_json, ccgram_dir
 
 from ..callback_data import (
     CB_STATUS_ESC,
@@ -47,7 +48,78 @@ logger = structlog.get_logger()
 # ---------------------------------------------------------------------------
 
 # Status message tracking: (user_id, thread_key) -> (message_id, window_id, last_text, chat_id)
-_status_msg_info: dict[tuple[int, int], tuple[int, str, str, int]] = {}
+#
+# CCGRAM-HOTFIX:status-bubble-persist — this map used to be in-memory only, so
+# every daemon restart (upgrade or crash) orphaned the live "✓ Ready" bubble:
+# after restart the next Stop couldn't find the existing message, sent a fresh
+# one, and left the old bubble behind. In quiet forum topics those pile up and
+# look like Kara replying to the "topic created" service message. We now mirror
+# the map to ~/.ccgram/status_msg_info.json on every mutation and reload it on
+# startup, so a restart re-attaches to the existing bubble and edits in place.
+_STATUS_STORE_NAME = "status_msg_info.json"
+
+
+class _PersistentStatusMap(dict):
+    """dict that best-effort mirrors itself to disk on every mutation."""
+
+    def _save(self) -> None:
+        try:
+            atomic_write_json(
+                ccgram_dir() / _STATUS_STORE_NAME,
+                {f"{uid}:{tk}": list(v) for (uid, tk), v in self.items()},
+            )
+        except (OSError, ValueError, TypeError):
+            logger.debug("status_msg_info persist failed", exc_info=True)
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        self._save()
+
+    def __delitem__(self, key) -> None:
+        super().__delitem__(key)
+        self._save()
+
+    def pop(self, key, *default):
+        existed = key in self
+        result = super().pop(key, *default)
+        if existed:
+            self._save()
+        return result
+
+
+def _load_status_msg_info() -> _PersistentStatusMap:
+    """Reload the persisted status-bubble map on startup (best effort)."""
+    import json
+
+    m = _PersistentStatusMap()
+    try:
+        path = ccgram_dir() / _STATUS_STORE_NAME
+        if not path.is_file():
+            return m
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.debug("status_msg_info load failed", exc_info=True)
+        return m
+    if not isinstance(raw, dict):
+        return m
+    for key, val in raw.items():
+        try:
+            uid_s, tkey_s = str(key).split(":", 1)
+            msg_id, window_id, last_text, chat_id = val
+            # dict.__setitem__ to load without re-persisting each row
+            dict.__setitem__(
+                m,
+                (int(uid_s), int(tkey_s)),
+                (int(msg_id), str(window_id), str(last_text), int(chat_id)),
+            )
+        except (ValueError, TypeError):
+            continue
+    return m
+
+
+_status_msg_info: dict[tuple[int, int], tuple[int, str, str, int]] = (
+    _load_status_msg_info()
+)
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- First-class **Grok Build** provider (xAI's official `grok` CLI). Enable with
+  `CCGRAM_PROVIDER=grok`.
+  - Provider picker entry, YOLO mode (`--always-approve`), and session-start
+    **model picker** (`grok models` discovery → `--model <id>`), plus
+    `CCGRAM_GROK_COMMAND` / `CCGRAM_GROK_MODEL` env overrides.
+  - Lifecycle hooks installable via `ccgram hook --provider grok --install`
+    (writes `~/.grok/hooks/ccgram.json`); `ccgram doctor` checks them.
+  - Incremental `chat_history.jsonl` relay, session discovery under
+    `~/.grok/sessions`, `--resume`/`--continue` recovery, `/status` snapshot,
+    and manual-pane auto-detection.
+- Provider-aware model picker in the session-creation wizard (Claude and Grok),
+  gated by the new `supports_model_picker` capability.
+
 ## [4.3.11] - 2026-07-11
 
 ### Fixed

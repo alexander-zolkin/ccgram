@@ -290,3 +290,59 @@ class TestGetProviderForWindow:
             get_provider_for_window("@12", provider_name="gemini").capabilities.name
             == "gemini"
         )
+
+
+class TestProviderAvailability:
+    """is_provider_available / available_provider_names — dynamic picker source."""
+
+    def test_absolute_path_executable(self, monkeypatch, tmp_path) -> None:
+        from ccgram.providers import is_provider_available
+
+        binary = tmp_path / "grok"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        monkeypatch.setenv("CCGRAM_GROK_COMMAND", str(binary))
+        assert is_provider_available("grok") is True
+
+    def test_absolute_path_missing(self, monkeypatch) -> None:
+        from ccgram.providers import is_provider_available
+
+        monkeypatch.setenv("CCGRAM_GROK_COMMAND", "/nonexistent/bin/grok")
+        assert is_provider_available("grok") is False
+
+    def test_bare_name_via_which(self, monkeypatch) -> None:
+        from ccgram.providers import is_provider_available
+
+        monkeypatch.delenv("CCGRAM_CODEX_COMMAND", raising=False)
+        with patch("ccgram.providers.shutil.which", return_value="/usr/bin/codex"):
+            assert is_provider_available("codex") is True
+        with patch("ccgram.providers.shutil.which", return_value=None):
+            assert is_provider_available("codex") is False
+
+    def test_shell_always_available(self, monkeypatch) -> None:
+        from ccgram.providers import is_provider_available
+
+        # shell has no external launch binary → always available.
+        with patch("ccgram.providers.shutil.which", return_value=None):
+            assert is_provider_available("shell") is True
+
+    def test_unknown_provider_unavailable(self) -> None:
+        from ccgram.providers import is_provider_available
+
+        assert is_provider_available("bogus") is False
+
+    def test_available_names_filters_and_keeps_shell(self, monkeypatch) -> None:
+        from ccgram.providers import available_provider_names
+
+        def fake_which(cmd):
+            # Only claude + codex found on PATH; gemini/pi absent.
+            return "/usr/bin/x" if cmd in ("claude", "codex") else None
+
+        monkeypatch.delenv("CCGRAM_GROK_COMMAND", raising=False)
+        with patch("ccgram.providers.shutil.which", side_effect=fake_which):
+            names = available_provider_names()
+        assert "claude" in names
+        assert "codex" in names
+        assert "shell" in names  # always present
+        assert "gemini" not in names
+        assert "pi" not in names

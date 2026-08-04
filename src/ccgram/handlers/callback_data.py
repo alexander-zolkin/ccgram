@@ -83,6 +83,13 @@ CB_RESUME_CANCEL = "res:x"  # cancel resume browser
 CB_PROV_SELECT = "prov:"  # prov:<provider_name>
 CB_MODE_SELECT = "mode:"  # mode:<provider_name>:<normal|yolo>
 
+# Full-wizard model picker — CCGRAM-HOTFIX:model-picker (grok/claude)
+# Shown between provider pick and mode pick for providers with
+# supports_model_picker. "wm:<provider>:<model_id>" selects a model (empty
+# model_id = keep the provider default); "wm:back:<provider>" re-shows the
+# picker after a stale tap. Both fall through to the mode picker.
+CB_WIZ_MODEL_PICK = "wm:"  # wm:<provider>:<model_id>
+
 # Worktree picker (directory browser flow — inserted before provider pick
 # when the confirmed directory is an eligible git repo)
 CB_WT_USE_CURRENT = "wt:cur"  # keep current branch, fall through to provider pick
@@ -103,6 +110,17 @@ CB_DEFAULTS_NO = "qs:no"  # fall through to the full directory-browser wizard
 CB_DEFAULTS_MODEL = "qs:model"  # open the model picker
 CB_MODEL_PICK = "qs:m:"  # qs:m:<model_id> — launch defaults with this model
 CB_MODEL_BACK = "qs:back"  # back from the picker to the quick-start prompt
+
+# Provider picker on the quick-start prompt — lets the Yes launch use a chosen
+# provider (grok/codex/claude/…) instead of the hardcoded default. "qs:prov"
+# opens the picker; "qs:pp:<name>" selects a provider and returns to the prompt.
+CB_DEFAULTS_PROVIDER = "qs:prov"  # open the provider picker
+CB_PROVIDER_PICK = "qs:pp:"  # qs:pp:<name> — set the quick-start provider
+
+# Private-session toggle on the quick-start prompt (grok only). Runs the session
+# in an isolated private folder + GROK_HOME so it never reaches the assistant's
+# memory. Toggles PENDING_PRIVATE and re-renders the prompt.
+CB_DEFAULTS_PRIVATE = "qs:priv"  # toggle private mode
 
 # Workspace picker (directory browser flow — inserted before provider pick on
 # backends with native_agent_status=True, e.g. herdr; skipped on tmux).
