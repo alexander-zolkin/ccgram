@@ -53,6 +53,7 @@ from ..callback_data import (
 )
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
+    PENDING_MODEL_CHOICES,
     PENDING_MODEL_ID,
     PENDING_MODEL_NAME,
     PENDING_PRIVATE,
@@ -154,6 +155,7 @@ def clear_model_state(user_data: dict | None) -> None:
     if user_data is not None:
         user_data.pop(PENDING_MODEL_ID, None)
         user_data.pop(PENDING_MODEL_NAME, None)
+        user_data.pop(PENDING_MODEL_CHOICES, None)
         user_data.pop(PENDING_PROVIDER, None)
         user_data.pop(PENDING_PRIVATE, None)
 

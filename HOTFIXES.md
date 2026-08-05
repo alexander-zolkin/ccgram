@@ -281,6 +281,29 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   session-keying issue (resume by session-id, see `resume-session-collision`)
   remains a separate, larger fix.
 
+### `model-pick-no-refetch` — the model picker closes itself
+- **Files:** `handlers/user_state.py`, `handlers/topics/directory_browser.py`,
+  `handlers/topics/directory_callbacks.py`,
+  `handlers/topics/provider_mode_callbacks.py`
+  (+ `tests/…/test_quickstart_model_picker.py` (new),
+  `tests/…/test_grok_wizard_model_picker.py`)
+- **Commit:** `<this commit>` `fix(topics): don't re-list the catalog when a model is picked`
+- **What:** both model pickers (quick-start prompt and mid-wizard) resolved the
+  chosen model's *display name* by calling `list_models_for_provider` again
+  inside the pick handler — an HTTPS call to `/v1/models` (8s timeout) for
+  claude, a `grok models` subprocess (4s) for grok — and did it **before**
+  `query.answer(...)`. Telegram gives a callback query ~10s; past that the
+  answer raises, the handler dies before `safe_edit`, and the picker keyboard
+  just stays on screen. Now the picker records `{id: display_name}` for exactly
+  what it rendered (`PENDING_MODEL_CHOICES`, cleared with the rest of the model
+  state), the pick handler reads the name from there, answers, and edits. No
+  network or subprocess on the pick path at all; an unknown id degrades to the
+  id itself instead of stranding the flow.
+- **Why:** Alexander, 2026-08-05 — "после выбора модели нужно нажимать «Назад»,
+  а по-хорошему «Назад» должно нажиматься само". The auto-return was written
+  back in `9779040`; this is what was silently eating it. The quick-start picker
+  had **zero** test coverage, which is why it went unnoticed — added.
+
 ### `quiet-dead-banner` — no unsolicited "Session … ended." on hibernation
 - **Files:** `config.py`, `handlers/polling/window_tick/apply.py`
   (+ `tests/ccgram/handlers/polling/test_status_polling.py`)
@@ -465,6 +488,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `quickstart-defaults` | callback_data.py, directory_browser.py, directory_callbacks.py, text_handler.py | (see git log) |
 | `no-false-dead` | polling/window_tick/__init__.py | (see git log) |
 | `quiet-dead-banner` | config.py, polling/window_tick/apply.py | (see git log) |
+| `model-pick-no-refetch` | user_state.py, topics/directory_browser.py, topics/directory_callbacks.py, topics/provider_mode_callbacks.py | (see git log) |
 | `resume-own-session` | recovery/recovery_banner.py | (see git log) |
 | `file-first-unbound` | handlers/file_handler.py | (see git log) |
 | `fresh-launch-args` | topics/window_launch_service.py | (see git log) |

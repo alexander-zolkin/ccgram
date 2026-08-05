@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ccgram.handlers.topics import provider_mode_callbacks as pmc
-from ccgram.handlers.user_state import PENDING_MODEL_ID, PENDING_MODEL_NAME
+from ccgram.handlers.user_state import (
+    PENDING_MODEL_CHOICES,
+    PENDING_MODEL_ID,
+    PENDING_MODEL_NAME,
+)
 from ccgram.handlers.topics.topic_creation_draft import PENDING_THREAD_ID
 from ccgram.model_catalog import ModelChoice
 from ccgram.providers import _ensure_registered
@@ -32,19 +36,17 @@ def _context(user_data: dict) -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_pick_stores_model_and_shows_mode_picker(tmp_path) -> None:
-    user_data = {PENDING_THREAD_ID: 42}
+    # The picker screen recorded what it offered (CCGRAM-HOTFIX:model-pick-no-refetch).
+    user_data = {
+        PENDING_THREAD_ID: 42,
+        PENDING_MODEL_CHOICES: {"grok-4.5": "Grok 4.5"},
+    }
     ctx = _context(user_data)
     query = _query()
 
     with (
         patch.object(pmc, "safe_edit", new_callable=AsyncMock),
         patch.object(pmc, "_required_selected_path", return_value=str(tmp_path)),
-        patch(
-            "ccgram.model_catalog.list_models_for_provider",
-            new=AsyncMock(
-                return_value=[ModelChoice(id="grok-4.5", display_name="Grok 4.5")]
-            ),
-        ),
     ):
         await pmc._handle_wizard_model_pick(
             query, 100, "wm:grok:grok-4.5", MagicMock(), ctx
@@ -52,6 +54,72 @@ async def test_pick_stores_model_and_shows_mode_picker(tmp_path) -> None:
 
     assert user_data[PENDING_MODEL_ID] == "grok-4.5"
     assert user_data[PENDING_MODEL_NAME] == "Grok 4.5"
+
+
+@pytest.mark.asyncio
+async def test_pick_never_calls_the_catalog(tmp_path) -> None:
+    """CCGRAM-HOTFIX:model-pick-no-refetch — a slow catalog call before
+    ``query.answer`` could blow Telegram's callback deadline and abort the
+    handler before the edit, stranding the user on the picker."""
+    user_data = {
+        PENDING_THREAD_ID: 42,
+        PENDING_MODEL_CHOICES: {"grok-4.5": "Grok 4.5"},
+    }
+    ctx = _context(user_data)
+    query = _query()
+
+    with (
+        patch.object(pmc, "safe_edit", new_callable=AsyncMock) as mock_edit,
+        patch.object(pmc, "_required_selected_path", return_value=str(tmp_path)),
+        patch(
+            "ccgram.model_catalog.list_models_for_provider", new_callable=AsyncMock
+        ) as mock_catalog,
+    ):
+        await pmc._handle_wizard_model_pick(
+            query, 100, "wm:grok:grok-4.5", MagicMock(), ctx
+        )
+
+    mock_catalog.assert_not_awaited()
+    mock_edit.assert_awaited_once()  # advanced to the mode picker on its own
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_id_falls_back_to_the_id(tmp_path) -> None:
+    """No recorded choices (restarted daemon, stale keyboard) still advances."""
+    user_data = {PENDING_THREAD_ID: 42}
+    ctx = _context(user_data)
+    query = _query()
+
+    with (
+        patch.object(pmc, "safe_edit", new_callable=AsyncMock) as mock_edit,
+        patch.object(pmc, "_required_selected_path", return_value=str(tmp_path)),
+    ):
+        await pmc._handle_wizard_model_pick(
+            query, 100, "wm:grok:grok-4.5", MagicMock(), ctx
+        )
+
+    assert user_data[PENDING_MODEL_NAME] == "grok-4.5"
+    mock_edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_wizard_picker_records_offered_choices(tmp_path) -> None:
+    user_data = {PENDING_THREAD_ID: 42}
+    ctx = _context(user_data)
+    query = _query()
+
+    with (
+        patch.object(pmc, "safe_edit", new_callable=AsyncMock),
+        patch(
+            "ccgram.model_catalog.list_models_for_provider",
+            new=AsyncMock(
+                return_value=[ModelChoice(id="grok-4.5", display_name="Grok 4.5")]
+            ),
+        ),
+    ):
+        await pmc._show_wizard_model_picker(query, "grok", ctx)
+
+    assert user_data[PENDING_MODEL_CHOICES] == {"grok-4.5": "Grok 4.5"}
 
 
 @pytest.mark.asyncio

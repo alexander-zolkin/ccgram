@@ -18,7 +18,7 @@ from ...thread_router import thread_router
 from ..callback_data import CB_MODE_SELECT, CB_PROV_SELECT, CB_WIZ_MODEL_PICK
 from ..callback_helpers import get_thread_id
 from ..messaging_pipeline.message_sender import safe_edit
-from ..user_state import PENDING_MODEL_ID, PENDING_MODEL_NAME
+from ..user_state import PENDING_MODEL_CHOICES, PENDING_MODEL_ID, PENDING_MODEL_NAME
 from .directory_browser import (
     build_mode_picker,
     build_wizard_model_picker,
@@ -155,7 +155,7 @@ async def _handle_provider_select(
     caps = provider_registry.get(provider_name).capabilities
     if caps.supports_model_picker:
         clear_model_state(context.user_data)
-        await _show_wizard_model_picker(query, provider_name)
+        await _show_wizard_model_picker(query, provider_name, context)
         return
 
     text, keyboard = build_mode_picker(selected_path, provider_name)
@@ -163,13 +163,21 @@ async def _handle_provider_select(
 
 
 async def _show_wizard_model_picker(
-    query: CallbackQuery, provider_name: str, selected_id: str | None = None
+    query: CallbackQuery,
+    provider_name: str,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+    selected_id: str | None = None,
 ) -> None:
     """Render the provider-aware model picker (mid-wizard step)."""
     # Lazy: keep the httpx-based catalog off the handlers import path.
     from ...model_catalog import list_models_for_provider
 
     models = await list_models_for_provider(provider_name)
+    if context is not None and context.user_data is not None:
+        # CCGRAM-HOTFIX:model-pick-no-refetch — see _handle_wizard_model_pick.
+        context.user_data[PENDING_MODEL_CHOICES] = {
+            m.id: m.display_name for m in models
+        }
     text, keyboard = build_wizard_model_picker(
         provider_name, [(m.id, m.display_name) for m in models], selected_id=selected_id
     )
@@ -199,6 +207,12 @@ async def _handle_wizard_model_pick(
 
     Callback data is ``wm:<provider>:<model_id>`` where an empty ``model_id``
     means "keep the provider default" (clears any pending override).
+
+    CCGRAM-HOTFIX:model-pick-no-refetch — the display name comes from the
+    choices captured when the picker was rendered, never from a fresh catalog
+    call: a network round-trip (or the grok CLI) before ``query.answer`` can
+    outrun Telegram's ~10s callback deadline, and then the handler dies before
+    the edit and the picker stays on screen.
     """
     raw = data[len(CB_WIZ_MODEL_PICK) :]
     provider_name, sep, model_id = raw.partition(":")
@@ -217,12 +231,10 @@ async def _handle_wizard_model_pick(
         if not _WIZ_MODEL_ID_RE.fullmatch(model_id):
             await query.answer("Invalid model id", show_alert=True)
             return
-        # Resolve the display name from the (cached) catalog; fall back to the id.
-        # Lazy: keep the httpx-based catalog off the handlers import path.
-        from ...model_catalog import list_models_for_provider
-
-        models = await list_models_for_provider(provider_name)
-        name = next((m.display_name for m in models if m.id == model_id), model_id)
+        choices = (
+            context.user_data.get(PENDING_MODEL_CHOICES) if context.user_data else None
+        )
+        name = (choices or {}).get(model_id, model_id)
         if context.user_data is not None:
             context.user_data[PENDING_MODEL_ID] = model_id
             context.user_data[PENDING_MODEL_NAME] = name

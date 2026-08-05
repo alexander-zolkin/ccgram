@@ -42,6 +42,10 @@ AWAITING_WORKTREE_BRANCH_NAME = "_awaiting_worktree_branch_name"
 # the "Use default settings?" prompt, carried into the Yes launch as --model.
 PENDING_MODEL_ID = "_pending_model_id"  # str — API model id, or absent for default
 PENDING_MODEL_NAME = "_pending_model_name"  # str — display name shown on the prompt
+# {model_id: display_name} captured when the picker was rendered, so selecting a
+# model never has to hit the catalog again (network/CLI call inside a callback
+# handler = answer timeout = the picker never closes).
+PENDING_MODEL_CHOICES = "_pending_model_choices"  # dict[str, str]
 # Provider chosen on the quick-start prompt (absent → QUICKSTART_DEFAULT_PROVIDER).
 PENDING_PROVIDER = "_pending_provider"  # str — provider name for the Yes launch
 # Private-session toggle on the quick-start prompt (grok only).

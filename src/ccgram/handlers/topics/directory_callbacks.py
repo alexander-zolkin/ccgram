@@ -67,6 +67,7 @@ from ..callback_registry import register
 from ..messaging_pipeline.message_sender import safe_edit
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
+    PENDING_MODEL_CHOICES,
     PENDING_MODEL_ID,
     PENDING_MODEL_NAME,
     PENDING_PROVIDER,
@@ -952,6 +953,8 @@ async def _handle_provider_pick(
         context.user_data[PENDING_PROVIDER] = name
         context.user_data.pop(PENDING_MODEL_ID, None)
         context.user_data.pop(PENDING_MODEL_NAME, None)
+        # The recorded choices belong to the old provider's catalog.
+        context.user_data.pop(PENDING_MODEL_CHOICES, None)
     await query.answer(f"Provider: {_provider_display_label(name)}")
     await _show_quickstart_prompt(query, context)
 
@@ -987,6 +990,12 @@ async def _handle_defaults_model(
     await query.answer()
     models = await list_models_for_provider(provider)
     selected = context.user_data.get(PENDING_MODEL_ID) if context.user_data else None
+    if context.user_data is not None:
+        # CCGRAM-HOTFIX:model-pick-no-refetch — remember what this screen offers,
+        # so the pick handler can name the model without calling the catalog again.
+        context.user_data[PENDING_MODEL_CHOICES] = {
+            m.id: m.display_name for m in models
+        }
     msg_text, keyboard = build_model_picker(
         [(m.id, m.display_name) for m in models],
         selected_id=selected,
@@ -1027,6 +1036,14 @@ async def _handle_model_pick(
     re-renders the quick-start prompt (now showing the chosen model) so
     Alexander can review it before tapping Yes. The Yes launch reads
     PENDING_MODEL_ID and appends ``--model <id>``.
+
+    CCGRAM-HOTFIX:model-pick-no-refetch — the answer goes out FIRST and the
+    display name comes from the choices captured when the picker was rendered.
+    Resolving it by re-listing the catalog meant a network round-trip (claude:
+    ``/v1/models``, 8s timeout) or a subprocess (grok CLI, 4s) *before*
+    ``query.answer``; when that outran Telegram's ~10s callback deadline the
+    answer raised, the handler aborted before the edit, and the picker just sat
+    there — so the return to the prompt had to be done by hand via ⬅️ Back.
     """
     model_id = data[len(CB_MODEL_PICK) :]
     if not _MODEL_ID_RE.fullmatch(model_id):
@@ -1039,12 +1056,10 @@ async def _handle_model_pick(
         await query.answer("Stale prompt (flow reset)", show_alert=True)
         return
 
-    # Resolve the display name from the (cached) catalog; fall back to the id.
-    from ...model_catalog import list_models_for_provider
-
-    provider = _current_provider(context)
-    models = await list_models_for_provider(provider)
-    name = next((m.display_name for m in models if m.id == model_id), model_id)
+    choices = (
+        context.user_data.get(PENDING_MODEL_CHOICES) if context.user_data else None
+    )
+    name = (choices or {}).get(model_id, model_id)
     if context.user_data is not None:
         context.user_data[PENDING_MODEL_ID] = model_id
         context.user_data[PENDING_MODEL_NAME] = name
