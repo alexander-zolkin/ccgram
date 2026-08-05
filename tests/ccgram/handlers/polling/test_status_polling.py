@@ -30,6 +30,7 @@ from ccgram.handlers.polling.polling_types import (
     TickContext,
     is_shell_prompt,
 )
+from ccgram.config import config
 from ccgram.telegram_client import PTBTelegramClient
 from ccgram.multiplexer.base import ForegroundInfo, PaneInfo
 
@@ -2151,9 +2152,62 @@ class TestMaybeDiscoverTranscript:
 
 
 class TestDeadWindowNotification:
+    async def test_quiet_by_default_skips_banner(self) -> None:
+        """CCGRAM-HOTFIX:quiet-dead-banner — no unsolicited "Session … ended."."""
+        bot = AsyncMock(spec=Bot)
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_sm,
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.rate_limit_send_message",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.update_topic_emoji",
+                new_callable=AsyncMock,
+            ) as mock_emoji,
+        ):
+            mock_tr.resolve_chat_id.return_value = -100
+            mock_tr.get_display_name.return_value = "test"
+            mock_sm.view_window.return_value = MagicMock(cwd="/proj")
+            await _handle_dead_window_notification(bot, 1, 42, "@5")
+
+        mock_send.assert_not_called()
+        # the silent part of the transition still runs
+        mock_emoji.assert_awaited_once()
+        bot.unpin_all_forum_topic_messages.assert_awaited_once()
+        assert (1, 42, "@5") in _dead_notified
+
+    async def test_quiet_probe_unbinds_deleted_topic(self) -> None:
+        """The skipped send doubled as a probe; the probe still detects deletion."""
+        bot = AsyncMock(spec=Bot)
+        bot.unpin_all_forum_topic_messages.side_effect = BadRequest(
+            "Message thread not found"
+        )
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_sm,
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.update_topic_emoji",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.clear_topic_state",
+                new_callable=AsyncMock,
+            ) as mock_cleanup,
+        ):
+            mock_tr.resolve_chat_id.return_value = -100
+            mock_tr.get_display_name.return_value = "test"
+            mock_sm.view_window.return_value = MagicMock(cwd="/proj")
+            await _handle_dead_window_notification(bot, 1, 42, "@5")
+
+        mock_cleanup.assert_awaited_once()
+        mock_tr.unbind_thread.assert_called_once_with(1, 42)
+
     async def test_marks_notified_even_when_send_fails(self) -> None:
         bot = AsyncMock(spec=Bot)
         with (
+            patch.object(config, "dead_banner_notify", True),
             patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_sm,
             patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
             patch(
@@ -2185,6 +2239,7 @@ class TestDeadWindowNotification:
     async def test_no_retry_after_failed_send(self) -> None:
         bot = AsyncMock(spec=Bot)
         with (
+            patch.object(config, "dead_banner_notify", True),
             patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_sm,
             patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
             patch(

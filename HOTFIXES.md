@@ -281,6 +281,28 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   session-keying issue (resume by session-id, see `resume-session-collision`)
   remains a separate, larger fix.
 
+### `quiet-dead-banner` — no unsolicited "Session … ended." on hibernation
+- **Files:** `config.py`, `handlers/polling/window_tick/apply.py`
+  (+ `tests/ccgram/handlers/polling/test_status_polling.py`)
+- **Commit:** `<this commit>` `fix(polling): stop the unsolicited "Session ended" banner`
+- **What:** `_handle_dead_window_notification` (poll loop **and** herdr event
+  stream) posted **"⚠ Session `…` ended."** into the topic every time a bound
+  window died. New `config.dead_banner_notify` (env `CCGRAM_DEAD_BANNER`,
+  **default off**) skips that send. Everything else in the transition is kept:
+  dead-notified marking, status-cache eviction, the 💀 topic emoji, and the
+  autoclose timer. The send also doubled as a topic-existence probe (a failed
+  send triggered the unpin probe → unbind of a deleted topic), so the probe is
+  factored into `_probe_topic_after_death` and runs directly on the quiet path.
+  Set `CCGRAM_DEAD_BANNER=1` for upstream behaviour.
+- **Why:** on this host window death is *routine and intentional* —
+  `~/.ccgram/idle-hibernator.py` kills idle windows to free RAM while the topic
+  stays bound, and `autoresume` (`CCGRAM_AUTORESUME_DEAD=true`) continues the
+  session silently on the next message. With `AUTOCLOSE_DEAD_MINUTES=525600`
+  nothing else acts on the banner either, so it was pure notification spam
+  (Alexander, 2026-08-05). The *requested* banner — writing into a dead topic
+  that autoresume can't recover — is untouched; it still comes from
+  `text_handler._handle_dead_window` with the recovery keyboard.
+
 ### `resume-own-session` — zero-tap autoresume resumes the topic's OWN session
 - **Files:** `handlers/recovery/recovery_banner.py`
   (+ `tests/ccgram/handlers/recovery/test_resume_own_session.py`)
@@ -442,6 +464,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `resume-session-collision` | recovery_banner.py | (see git log) |
 | `quickstart-defaults` | callback_data.py, directory_browser.py, directory_callbacks.py, text_handler.py | (see git log) |
 | `no-false-dead` | polling/window_tick/__init__.py | (see git log) |
+| `quiet-dead-banner` | config.py, polling/window_tick/apply.py | (see git log) |
 | `resume-own-session` | recovery/recovery_banner.py | (see git log) |
 | `file-first-unbound` | handlers/file_handler.py | (see git log) |
 | `fresh-launch-args` | topics/window_launch_service.py | (see git log) |

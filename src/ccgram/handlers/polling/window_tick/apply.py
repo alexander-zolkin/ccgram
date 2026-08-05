@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from ....providers.base import AgentProvider
     from ....multiplexer.base import WindowRef as TmuxWindow
     from ..polling_runtime import PollingRuntime
+    from ..polling_state import TerminalPollState
 
 logger = structlog.get_logger()
 
@@ -333,6 +334,14 @@ async def _handle_dead_window_notification(
     )
     lc.start_autoclose_timer(user_id, thread_id, "dead", time.monotonic())
 
+    # CCGRAM-HOTFIX:quiet-dead-banner — skip the unsolicited banner but keep the
+    # whole rest of the transition (dead emoji, autoclose timer, cache eviction
+    # above). The send doubled as a topic-existence probe, so run that probe
+    # directly instead; a topic deleted while its window died is still detected.
+    if not config.dead_banner_notify:
+        await _probe_topic_after_death(bot, user_id, thread_id, wid, ps)
+        return
+
     view = window_query.view_window(wid)
     cwd = view.cwd if view else ""
     try:
@@ -361,33 +370,51 @@ async def _handle_dead_window_notification(
         reply_markup=keyboard,
     )
     if sent is None:
-        client = PTBTelegramClient(bot)
-        try:
-            await client.unpin_all_forum_topic_messages(
-                chat_id=chat_id, message_thread_id=thread_id
+        await _probe_topic_after_death(bot, user_id, thread_id, wid, ps)
+
+
+async def _probe_topic_after_death(
+    bot: "Bot",
+    user_id: int,
+    thread_id: int,
+    wid: str,
+    ps: "TerminalPollState",
+) -> None:
+    """Detect a topic deleted while its window was dying, and unbind it.
+
+    Uses the same unpin probe as ``probe_topic_existence``: it is a no-op on a
+    live topic and raises ``Topic_id_invalid`` / "thread not found" on a deleted
+    one. Called when the dead-window banner could not be delivered, and (with
+    CCGRAM-HOTFIX:quiet-dead-banner) instead of sending it at all.
+    """
+    chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+    client = PTBTelegramClient(bot)
+    try:
+        await client.unpin_all_forum_topic_messages(
+            chat_id=chat_id, message_thread_id=thread_id
+        )
+    except BadRequest as probe_err:
+        if (
+            "thread not found" in probe_err.message.lower()
+            or "topic_id_invalid" in probe_err.message.lower()
+        ):
+            ps.reset_probe_failures(wid)
+            await clear_topic_state(
+                user_id,
+                thread_id,
+                client,
+                window_id=wid,
+                window_dead=True,
             )
-        except BadRequest as probe_err:
-            if (
-                "thread not found" in probe_err.message.lower()
-                or "topic_id_invalid" in probe_err.message.lower()
-            ):
-                ps.reset_probe_failures(wid)
-                await clear_topic_state(
-                    user_id,
-                    thread_id,
-                    client,
-                    window_id=wid,
-                    window_dead=True,
-                )
-                thread_router.unbind_thread(user_id, thread_id)
-                logger.info(
-                    "Topic deleted: unbound window %s for thread %d, user %d",
-                    wid,
-                    thread_id,
-                    user_id,
-                )
-        except TelegramError:
-            pass
+            thread_router.unbind_thread(user_id, thread_id)
+            logger.info(
+                "Topic deleted: unbound window %s for thread %d, user %d",
+                wid,
+                thread_id,
+                user_id,
+            )
+    except TelegramError:
+        pass
 
 
 # ── Decision-application transitions ───────────────────────────────────

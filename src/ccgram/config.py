@@ -228,6 +228,17 @@ class Config:
         self.pane_lifecycle_notify: bool = os.getenv(
             "CCGRAM_PANE_LIFECYCLE_NOTIFY", ""
         ).lower() in ("1", "true", "yes")
+        # CCGRAM-HOTFIX:quiet-dead-banner — the unsolicited "⚠ Session … ended."
+        # banner the poll loop posts when a window dies. Alexander hibernates
+        # idle sessions on purpose (idle-hibernator.py kills the tmux window
+        # while the topic stays bound) and CCGRAM_AUTORESUME_DEAD continues them
+        # silently on the next message, so the banner is pure noise here.
+        # Default off; set CCGRAM_DEAD_BANNER=1 to get the upstream behaviour.
+        self.dead_banner_notify: bool = os.getenv("CCGRAM_DEAD_BANNER", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         self._init_miniapp()
 
     def _init_miniapp(self) -> None:
