@@ -65,6 +65,16 @@ Also eyeball after every merge: `rich-tables` still applied, claude fresh
 sessions still get `--effort xhigh`, and `fresh-launch-args` still appends fresh
 args in `window_launch_service` — that one died silently in the v4.3.5 merge.
 
+**Always run `ruff check --select F821` after a merge.** Upstream refactors move
+or drop the helpers our hotfix blocks call, and a 3-way merge keeps the call site
+while taking upstream's import list — leaving an undefined name that no test
+covers. This bit twice in the v4.4.3 merge: upstream replaced `send_to_window`
+with `send_telegram_to_window` (which tags the send as Telegram-originated so
+`consume_telegram_injection` can suppress the echo), and both `file-first-unbound`
+(`file_handler.py`) and `autoresume` (`recovery_banner.py`) were left calling the
+old name. The `autoresume` one sat inside a blanket `except Exception`, so it
+would have degraded to the recovery banner in silence.
+
 If a marker block can't be reconciled (upstream rewrote the function), re-derive
 the behaviour, keep the marker, and update this file's entry.
 
@@ -86,7 +96,7 @@ break their seams, so they belong on the post-merge checklist:
 
 ## Known test failures (pre-existing, NOT merge regressions)
 
-As of `v4.3.12` merge: **17 failures, 6418 passed**. All 17 are caused by this
+As of `v4.4.3` merge: **15 failures, 6530 passed**. All 15 are caused by this
 fork's own behaviour, and reproduce identically on the pre-merge commit:
 
 - **15 × `tests/e2e/*_lifecycle.py`** — `TimeoutError` in the shared helper
@@ -94,9 +104,10 @@ fork's own behaviour, and reproduce identically on the pre-merge commit:
   expects the old direct-bind `sendMessage`, but `quickstart-defaults` shows the
   "Use default settings?" prompt first, so the predicate never matches and the
   setup times out. Product behaviour is intentional and correct.
-- **2 × `tests/ccgram/handlers/polling/test_status_polling.py::TestMaybeDiscoverTranscript`**
-  — the tests assume a fixed provider-iteration order/count; adding `grok` to the
-  registry makes discovery try two providers instead of one.
+
+The 2 × `test_status_polling.py::TestMaybeDiscoverTranscript` failures listed
+here through the `v4.3.12` merge are **gone** — upstream stopped asserting a
+fixed provider-iteration count, so the extra `grok` provider no longer trips them.
 
 Optional cleanup: adapt the e2e helper to drive the quickstart-Yes flow, the way
 the other anti-fork tests were adapted.

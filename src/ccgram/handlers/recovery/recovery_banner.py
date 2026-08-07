@@ -579,7 +579,9 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
             logger.debug("autoresume: failed to rename topic: %s", e)
 
         if pending_text:
-            send_ok, send_msg = await send_to_window(created_wid, pending_text)
+            send_ok, send_msg = await send_telegram_to_window(
+                user_id, created_wid, thread_id, pending_text, _chat_id
+            )
             if not send_ok:
                 logger.warning("autoresume: forward pending text failed: %s", send_msg)
         logger.info(

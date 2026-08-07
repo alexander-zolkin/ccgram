@@ -130,7 +130,7 @@ class TestUnboundFileFirst:
     """CCGRAM-HOTFIX:file-first-unbound — a file dropped into a fresh topic must
     open the topic via the same wizard as text, not dead-end with an error."""
 
-    @patch(f"{_FH}.send_to_window", new_callable=AsyncMock)
+    @patch(f"{_FH}.send_telegram_to_window", new_callable=AsyncMock)
     @patch(f"{_FH}.thread_router")
     @patch("ccgram.handlers.text.text_handler._handle_unbound_topic")
     @patch(f"{_FH}._download_and_save", new_callable=AsyncMock)

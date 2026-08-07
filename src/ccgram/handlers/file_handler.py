@@ -231,9 +231,15 @@ async def _stage_and_defer(
     )
     if not handled:
         # Raced into a binding between resolve and now \u2014 deliver directly.
-        window_id = thread_router.resolve_window_for_thread(user_id, thread_id)
+        # Goes through send_telegram_to_window so the relay recognises this as
+        # Telegram-originated and doesn't echo it back as a \ud83d\udc64 bubble.
+        window_id = thread_router.resolve_window_for_thread(
+            user_id, thread_id, message.chat.id
+        )
         if window_id:
-            await send_to_window(window_id, claude_msg)
+            await send_telegram_to_window(
+                user_id, window_id, thread_id, claude_msg, message.chat.id
+            )
 
 
 async def _upload_and_notify(

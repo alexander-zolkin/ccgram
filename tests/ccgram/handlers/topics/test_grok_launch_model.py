@@ -62,7 +62,7 @@ async def _run_launch(
             new_callable=AsyncMock,
         ),
         patch(
-            "ccgram.handlers.topics.window_launch_service.send_to_window",
+            "ccgram.handlers.topics.window_launch_service.send_telegram_to_window",
             new_callable=AsyncMock,
         ) as mock_send,
         patch(
