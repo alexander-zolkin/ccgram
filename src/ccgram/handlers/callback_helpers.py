@@ -11,19 +11,25 @@ from ..thread_router import thread_router
 from .callback_data import CB_PANE_DELIMITER
 
 
-def user_owns_window(user_id: int, window_id: str) -> bool:
-    """Check if a user has any thread binding to the given window."""
+def user_owns_window(user_id: int, window_id: str, chat_id: int | None = None) -> bool:
+    """Check ownership in the callback's chat when available."""
+    if chat_id is not None:
+        return any(
+            uid == user_id and bound_chat == chat_id and wid == window_id
+            for uid, bound_chat, _tid, wid in thread_router.iter_thread_bindings_with_chat()
+        )
     return window_id in thread_router.get_all_thread_windows(user_id).values()
 
 
 def parse_target(target: str) -> tuple[str, str | None]:
     """Parse window_id and optional pane_id from callback target string.
 
-    Target format: ``@0`` (window only) or ``@0|%3`` (tmux window + pane)
-    or ``w2:t1|w2:p1`` (herdr tab + pane).
+    Target format: ``@0`` (window only) or ``@0|%3`` (tmux window + pane),
+    with guarded opaque Herdr session targets in the window position.
+    Raw Herdr tab/pane locators are not valid callback identities.
 
-    The delimiter is ``CB_PANE_DELIMITER`` (``|``), not a colon, so herdr
-    ids (which contain colons) round-trip without ambiguity.
+    The delimiter is ``CB_PANE_DELIMITER`` (``|``), not a colon, so opaque
+    target data and tmux pane IDs round-trip without ambiguity.
     """
     if CB_PANE_DELIMITER in target:
         idx = target.index(CB_PANE_DELIMITER)

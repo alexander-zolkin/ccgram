@@ -73,7 +73,7 @@ def default_model_label() -> str:
     try:
         settings = json.loads(Path(_SETTINGS_PATH).expanduser().read_text())
         model = settings.get("model")
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return _DEFAULT_MODEL_FALLBACK
     if isinstance(model, str) and model.strip():
         return model.strip()
@@ -88,7 +88,7 @@ def _resolve_auth_headers() -> dict[str, str] | None:
     try:
         creds = json.loads(Path(_CREDENTIALS_PATH).expanduser().read_text())
         token = creds.get("claudeAiOauth", {}).get("accessToken", "")
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return None
     if not token:
         return None

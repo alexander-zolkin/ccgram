@@ -15,6 +15,8 @@ import structlog
 from telegram import CallbackQuery, Update
 from ...multiplexer import multiplexer as tmux_manager
 from ..callback_data import CB_HISTORY_NEXT, CB_HISTORY_PREV
+from ..callback_helpers import user_owns_window
+from ..callback_tokens import resolve_callback_data
 from ..callback_registry import register
 from ..messaging_pipeline.message_sender import safe_edit
 from .history import send_history
@@ -23,9 +25,6 @@ if TYPE_CHECKING:
     from telegram.ext import ContextTypes
 
 logger = structlog.get_logger()
-
-# Minimum parts in history callback data: page:window_id:start:end
-_HISTORY_CB_PARTS_MIN = 4
 
 
 async def handle_history_callback(
@@ -44,20 +43,27 @@ async def handle_history_callback(
     prefix_len = len(CB_HISTORY_PREV)  # same length for both
     rest = data[prefix_len:]
     try:
-        parts = rest.split(":")
-        if len(parts) < _HISTORY_CB_PARTS_MIN:
-            # Old format without byte range: page:window_id
-            offset_str, window_id = rest.split(":", 1)
-            start_byte, end_byte = 0, 0
-        else:
-            # New format: page:window_id:start:end (window_id may contain colons)
-            offset_str = parts[0]
-            start_byte = int(parts[-2])
-            end_byte = int(parts[-1])
-            window_id = ":".join(parts[1:-2])
+        offset_str, window_payload = rest.split(":", 1)
         offset = int(offset_str)
-    except (ValueError, IndexError):  # fmt: skip
+        # A colon-containing legacy ID is still legacy unless its *final two*
+        # fields are integer offsets. Do not infer the new format from field
+        # count alone.
+        try:
+            window_id, start_raw, end_raw = window_payload.rsplit(":", 2)
+            start_byte, end_byte = int(start_raw), int(end_raw)
+            if not window_id:
+                raise ValueError
+        except ValueError:
+            window_id = window_payload
+            start_byte, end_byte = 0, 0
+    except ValueError:  # fmt: skip
         await query.answer("Invalid data")
+        return
+
+    # Raw callbacks and compact token callbacks both reach this public seam;
+    # enforce ownership here before any multiplexer lookup or history output.
+    if not user_owns_window(_user_id, window_id):
+        await query.answer("Not your session", show_alert=True)
         return
 
     w = await tmux_manager.find_window_by_id(window_id)
@@ -85,4 +91,8 @@ async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
     assert query is not None and query.data is not None and user is not None
-    await handle_history_callback(query, user.id, query.data, update, context)
+    data = resolve_callback_data(query.data, user.id, user_owns_window)
+    if data is None:
+        await query.answer("This button has expired", show_alert=True)
+        return
+    await handle_history_callback(query, user.id, data, update, context)

@@ -446,7 +446,7 @@ def _subdir_within_repo(selected_path: str, repo_path: Path) -> str:
     """
     try:
         rel = Path(selected_path).resolve().relative_to(repo_path.resolve())
-    except ValueError, OSError:
+    except (ValueError, OSError):
         return ""
     return str(rel) if rel.parts else ""
 

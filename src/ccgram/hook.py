@@ -31,6 +31,7 @@ from ccgram.hooks.adapters import (
     get_hook_adapter,
 )
 from ccgram.hooks.model import NormalizedHookEvent, ProviderName
+from ccgram.multiplexer import get_multiplexer
 from ccgram.multiplexer.self_identify import resolve_self_identity
 
 logger = structlog.get_logger()
@@ -56,6 +57,7 @@ _PATH_HOOK_MARKER = "ccgram hook"
 # optional so older test mocks keep working with a 3-part stdout.
 _TMUX_FORMAT_PARTS = 3
 _TMUX_FORMAT_PARTS_WITH_TTY = 4
+_TMUX_FORMAT_PARTS_WITH_LINKS = 5
 
 # ps -A output is split into 5 fields: pid, ppid, pgid, stat, command.
 _PS_SNAPSHOT_FIELDS = 5
@@ -683,55 +685,47 @@ def _hook_status(provider_name: str = "claude") -> int:  # noqa: PLR0911
     return 1
 
 
-def _resolve_herdr_tab_id(pane_id: str) -> str | None:
-    """Resolve a herdr pane id to its containing tab id.
+def _resolve_herdr_target_id(workspace_id: str, pane_id: str) -> str | None:
+    """Resolve one exact Herdr locator to a guarded opaque session target.
 
-    Runs ``herdr pane get <pane_id>`` and extracts ``result["pane"]["tab_id"]``.
-    The socket path is picked up from ``$HERDR_SOCKET_PATH`` by the herdr CLI
-    automatically (same as the multiplexer backend's subprocess runner).
-
-    Returns None on any failure (herdr not installed, socket down, pane gone)
-    so the caller degrades gracefully to the pane id.
+    A hook must not bind a tab or raw pane locator: a fresh ``agent list``
+    snapshot must contain exactly one complete session record for this
+    ``(workspace_id, pane_id)`` pair.
     """
     try:
         result = subprocess.run(
-            ["herdr", "pane", "get", pane_id],
-            capture_output=True,
-            text=True,
-            timeout=5,
+            ["herdr", "agent", "list"], capture_output=True, text=True, timeout=5
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.warning("herdr pane get failed for pane %s: %s", pane_id, exc)
+        logger.warning("herdr agent list failed for pane %s: %s", pane_id, exc)
         return None
     if result.returncode != 0:
-        logger.warning(
-            "herdr pane get returned non-zero for pane %s (rc=%d): %s",
-            pane_id,
-            result.returncode,
-            result.stderr.strip(),
-        )
         return None
     try:
-        payload = json.loads(result.stdout)
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning(
-            "herdr pane get returned unparseable JSON for pane %s: %s", pane_id, exc
-        )
+        agents = json.loads(result.stdout).get("result", {}).get("agents", [])
+    except (json.JSONDecodeError, AttributeError):
         return None
-    if not isinstance(payload, dict):
-        logger.warning(
-            "herdr pane get returned unexpected type %s for pane %s",
-            type(payload).__name__,
-            pane_id,
-        )
+    matches: list[dict[str, object]] = []
+    for record in agents if isinstance(agents, list) else []:
+        if not isinstance(record, dict):
+            continue
+        if (
+            record.get("workspace_id") == workspace_id
+            and record.get("pane_id") == pane_id
+        ):
+            matches.append(record)
+    if len(matches) != 1:
         return None
-    tab_id = payload.get("result", {}).get("pane", {}).get("tab_id")
-    if not isinstance(tab_id, str) or not tab_id:
-        logger.warning(
-            "herdr pane get missing tab_id for pane %s (payload=%r)", pane_id, payload
-        )
+
+    # Keep record parsing and canonical target construction in the adapter;
+    # this hook only establishes the unique live locator match.
+    target_for_record = getattr(
+        get_multiplexer("herdr"), "target_id_for_live_record", None
+    )
+    if not callable(target_for_record):
         return None
-    return tab_id
+    target_id = target_for_record(matches[0])
+    return target_id if isinstance(target_id, str) else None
 
 
 def _resolve_window_id(pane_id: str) -> tuple[str, str, str, str] | None:
@@ -748,7 +742,8 @@ def _resolve_window_id(pane_id: str) -> tuple[str, str, str, str] | None:
                 "-t",
                 pane_id,
                 "-p",
-                "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_tty}",
+                "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_tty}"
+                "\t#{window_linked_sessions}",
             ],
             capture_output=True,
             text=True,
@@ -758,7 +753,7 @@ def _resolve_window_id(pane_id: str) -> tuple[str, str, str, str] | None:
         logger.warning("tmux display-message timed out for pane %s", pane_id)
         return None
     raw_output = result.stdout.strip()
-    parts = raw_output.split("\t", 3)
+    parts = raw_output.split("\t", 4)
     if len(parts) < _TMUX_FORMAT_PARTS:
         logger.warning(
             "Failed to parse session:window_id:window_name from tmux "
@@ -770,8 +765,46 @@ def _resolve_window_id(pane_id: str) -> tuple[str, str, str, str] | None:
 
     tmux_session_name, window_id, window_name = parts[0], parts[1], parts[2]
     pane_tty = parts[3] if len(parts) >= _TMUX_FORMAT_PARTS_WITH_TTY else ""
-    session_window_key = f"{tmux_session_name}:{window_id}"
+    linked = parts[4] if len(parts) >= _TMUX_FORMAT_PARTS_WITH_LINKS else ""
+    key_session = tmux_session_name
+    if linked not in ("", "0", "1"):
+        key_session = _session_map_session_for(window_id, tmux_session_name)
+    session_window_key = f"{key_session}:{window_id}"
     return session_window_key, window_id, window_name, pane_tty
+
+
+def _session_map_session_for(window_id: str, pane_session: str) -> str:
+    """Return the tmux session ``session_map`` should be keyed under.
+
+    Window ids are server-global and a linked window belongs to more than one
+    session, so the session tmux reports for the firing pane is not necessarily
+    the one ccgram lists windows from. Readers resolve entries by
+    ``<ccgram session>:<window_id>`` (``session_map_prefix_for``), so a hook
+    keyed under the session that happens to own the pane is invisible to every
+    reader and the binding silently never takes effect.
+
+    Falls back to the pane's own session whenever the window is not linked into
+    ccgram's session, which is the single-session case and today's behaviour.
+    """
+    # Lazy: config reads the environment at import time; the hook path should
+    # not pay that cost, nor fail, when the window cannot be resolved at all.
+    from .config import config
+
+    target = getattr(config, "tmux_session_name", "")
+    if not target or target == pane_session:
+        return pane_session
+    try:
+        result = subprocess.run(
+            ["tmux", "list-windows", "-t", target, "-F", "#{window_id}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return pane_session
+    if result.returncode != 0:
+        return pane_session
+    return target if window_id in result.stdout.split() else pane_session
 
 
 def _ps_snapshot() -> dict[int, tuple[int, int, str, str]]:
@@ -787,7 +820,7 @@ def _ps_snapshot() -> dict[int, tuple[int, int, str, str]]:
             text=True,
             timeout=5,
         )
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return {}
     snapshot: dict[int, tuple[int, int, str, str]] = {}
     for line in result.stdout.splitlines():
@@ -823,7 +856,7 @@ def _foreground_pgid_on_tty(
             text=True,
             timeout=5,
         )
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return None
     for line in result.stdout.splitlines():
         try:
@@ -859,11 +892,17 @@ def _closest_claude_ancestor(
 def _is_nested_session(pane_tty: str) -> bool:
     """Return True if the hook was fired by a nested (non-foreground) claude.
 
-    The "primary" claude in a tmux pane is launched by the user's shell, so
-    its PID equals the foreground process group id on the pane's tty. Any
-    claude spawned beneath that primary (e.g. an MCP-server-launched observer
-    such as claude-mem) is a *descendant* — its PID differs from the
-    foreground PGID even though it shares the pgid via inheritance.
+    A claude whose PID equals the foreground process group id on the pane's
+    tty is the primary by definition. It is not the only primary shape: a
+    launcher that starts the agent as ``bash -lc "... && claude ..."`` leaves
+    the shell leading the group, so the primary claude is a child of the
+    foreground process and its PID never equals the foreground PGID.
+
+    What actually distinguishes a nested claude (e.g. an MCP-server-launched
+    observer such as claude-mem) is that another claude sits above it in the
+    process tree. Testing ancestry rather than group leadership covers both
+    primary shapes, and is what the pgid comparison was approximating anyway,
+    since a nested claude inherits the same pgid.
 
     Fails open: returns False on any subprocess error or missing data so
     hook delivery is never made *more* fragile than the status quo.
@@ -879,7 +918,12 @@ def _is_nested_session(pane_tty: str) -> bool:
     owner = _closest_claude_ancestor(snapshot, os.getpid())
     if owner is None:
         return False
-    return owner != fg_pgid
+    if owner == fg_pgid:
+        return False
+    owner_info = snapshot.get(owner)
+    if owner_info is None:
+        return False
+    return _closest_claude_ancestor(snapshot, owner_info[0]) is not None
 
 
 def _write_event(
@@ -1105,7 +1149,7 @@ def _read_session_map_entry(session_window_key: str) -> dict[str, str]:
         return {}
     try:
         raw = json.loads(map_file.read_text())
-    except OSError, json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return {}
     if not isinstance(raw, dict):
         return {}
@@ -1151,7 +1195,7 @@ def _refresh_session_map_if_stale(
     ):
         return
     # Backend prefix token: split on the FIRST colon so herdr keys
-    # ("herdr:w2:t1") yield "herdr", not "herdr:w2" (the tab id has a colon).
+    # Split only the backend prefix; Herdr target IDs may contain colons.
     tmux_session_name = session_window_key.split(":", 1)[0]
     _update_session_map(
         session_window_key,
@@ -1191,7 +1235,7 @@ def _provider_from_pane_tty(pane_tty: str) -> ProviderName | None:
             text=True,
             timeout=5,
         )
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return None
     text = result.stdout.lower()
     if "grok" in text:
@@ -1219,13 +1263,13 @@ def _locate_primary_window(
 
     Identity resolution is backend-neutral via ``resolve_self_identity``: tmux
     panes resolve through ``_resolve_window_id`` (``display-message``), herdr
-    panes resolve pane→tab via ``_resolve_herdr_tab_id`` so the session_map key
-    becomes ``herdr:<tab_id>`` (matching ``list_windows``).
+    panes resolve their exact workspace/pane locator to a session target, so
+    the session_map key becomes ``herdr:<opaque-target-id>``.
     """
     identity = resolve_self_identity(
         os.environ,
         tmux_query=_resolve_window_id,
-        herdr_query=_resolve_herdr_tab_id,
+        herdr_query=_resolve_herdr_target_id,
     )
     if identity is None:
         if not os.environ.get("TMUX_PANE") and not os.environ.get("HERDR_PANE_ID"):
@@ -1234,8 +1278,8 @@ def _locate_primary_window(
             )
         elif os.environ.get("HERDR_PANE_ID"):
             logger.warning(
-                "HERDR_PANE_ID=%s set but tab resolution failed "
-                "(herdr not installed, socket down, or pane gone); "
+                "HERDR_PANE_ID=%s set but guarded session resolution failed "
+                "(missing workspace, socket down, zero, or duplicate match); "
                 "hook event dropped",
                 os.environ.get("HERDR_PANE_ID"),
             )
@@ -1315,7 +1359,7 @@ def _process_hook_stdin(
 
     if event == "SessionStart":
         # Backend prefix token (see _refresh_session_map_if_stale): split on the
-        # first colon so herdr keys ("herdr:w2:t1") yield "herdr".
+        # first colon so the full opaque Herdr target remains intact.
         tmux_session_name = session_window_key.split(":", 1)[0]
         transcript_path = _resolve_transcript_path(
             detected_provider,

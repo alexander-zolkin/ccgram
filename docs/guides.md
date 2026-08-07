@@ -72,6 +72,14 @@ ccgram doctor         # Check configuration, hooks, multiplexer, agent CLIs
 ccgram doctor --fix   # Auto-fix common issues (install hooks, kill orphans, etc.)
 ```
 
+## Herdr guarded-session migration
+
+Herdr topics use `agent.list` as their sole identity source. CCGram stores only an opaque `herdr-session-v1-…` target; tabs, panes, terminal IDs, names, directories, and focus are live locators, not topic identity. Each action takes a fresh snapshot and fails closed when its target is missing, duplicate, malformed, or sessionless.
+
+Existing Herdr tab/pane bindings are marked `legacy_herdr` and blocked. Use `/unbind` to archive the CCGram binding without closing the Herdr session; rollback can restore that record but it remains blocked. Send a message in the topic and explicitly choose a listed session target to rebind. CCGram never guesses a migration target.
+
+A session can change after the fresh guard and before Herdr receives an action. CCGram records that post-guard dispatch race and does not claim atomic delivery. Run live Herdr tests only against a disposable server and redact target/session evidence.
+
 ## Local Dev in tmux
 
 Recommended local development model:
@@ -299,7 +307,7 @@ ccgram talks to the terminal multiplexer through a backend-neutral seam. tmux is
 1. **Install herdr** and make sure the `herdr` binary is in `PATH`. Start its server so the control socket exists.
 2. **Select the backend:** set `CCGRAM_MULTIPLEXER=herdr` (env var or `.env`). The default is `tmux`.
 3. **Socket path (optional):** ccgram reads `$HERDR_SOCKET_PATH` to find the server. Leave it unset to use herdr's default socket; set it to target a specific server.
-4. **Install the ccgram hook as usual:** `ccgram hook --install`. The same Claude Code hook works on both backends — it resolves which window fired from `$HERDR_PANE_ID` (tmux uses `$TMUX_PANE`), so no herdr-specific hook step is required.
+4. **Install integrations and the ccgram hook:** for Pi, run `herdr integration install pi`, then start new Pi agents or restart existing ones so they load the integration and publish `agent_session`. Install the ccgram hook as usual with `ccgram hook --install`. The same Claude Code hook works on both backends — it resolves which window fired from `$HERDR_PANE_ID` (tmux uses `$TMUX_PANE`), so no herdr-specific hook step is required.
 5. **Verify:** `ccgram doctor`. When `CCGRAM_MULTIPLEXER=herdr`, doctor checks the `herdr` binary, socket reachability, the pinned protocol version, and that ccgram's and herdr's own Claude hooks coexist in `settings.json` (instead of the tmux checks).
 
 ```bash
@@ -310,7 +318,7 @@ CCGRAM_MULTIPLEXER=herdr
 
 ### Protocol version pinning
 
-ccgram accepts herdr socket protocols 14, 15, and 16 without warnings. On the first call it reads `herdr status`; an older, newer, missing, or otherwise unknown protocol emits a warning and ccgram continues in best-effort mode, so CLI-backed operations can still work after a herdr upgrade or downgrade. A stopped server, failed status command, or malformed status response still prevents startup. Run the live herdr contract suite before relying on an untested protocol.
+ccgram accepts herdr socket protocols 14, 15, 16, and 17 without warnings. On the first call it reads `herdr status`; an older, newer, missing, or otherwise unknown protocol emits a warning and ccgram continues in best-effort mode, so CLI-backed operations can still work after a herdr upgrade or downgrade. A stopped server, failed status command, or malformed status response still prevents startup. Run the live herdr contract suite before relying on an untested protocol.
 
 ### Differences from tmux
 
@@ -322,12 +330,12 @@ herdr advertises its own capabilities through the seam; the behavioral consequen
 | Foreground detection      | `ps -t <tty>`                   | `pane process-info` (no tty)                                               |
 | Scrollback capture        | unbounded                       | clamped to **1000 lines**; longer output is flagged as truncated           |
 | Agent status              | inferred from terminal scraping | native (herdr reports agent status directly)                               |
-| Window IDs across restart | stable                          | re-minted on a herdr **server** restart — ccgram re-resolves by session id |
+| Window IDs across restart | stable                          | guarded session target is revalidated from fresh `agent.list`; ccgram never re-resolves a tab/pane ID |
 | Topic labels              | window name                     | adaptive `"<workspace> ▸ <tab>"` (tab name is primary)                     |
 
 Creating sessions from the terminal on herdr is covered in [Creating Sessions from the Terminal](#creating-sessions-from-the-terminal).
 
-> **Workspace picker:** On herdr, `/new` shows an extra step after directory selection — a workspace picker that lets you pin the new tab inside an existing herdr workspace. If no workspaces exist yet (or none matches the selected directory), the picker is skipped and ccgram creates a new workspace automatically.
+> **Workspace picker:** On herdr, `/new` shows an extra step after directory selection. Choose a workspace to pin the new tab there, or skip it: ccgram then explicitly creates a workspace from the requested directory and uses only its returned ID. It never infers the active or a matching workspace.
 >
 > **Self-hosting escape hatch:** Workspaces or tabs whose label matches `__*__` (e.g. `__main__`) are invisible to ccgram. Use this naming convention to run ccgram itself inside herdr without it auto-adopting its own terminal as a topic.
 
@@ -598,6 +606,11 @@ WantedBy=default.target
 systemctl --user enable ccgram
 systemctl --user start ccgram
 ```
+
+ccgram retries brief Telegram polling conflicts for up to 90 seconds, which can
+occur after a network reconnect. Persistent conflicts stop with a non-zero exit
+so `Restart=on-failure` restarts the service. Check for another bot process that
+uses the same token if the conflict returns.
 
 On macOS, you can use a launchd plist or simply run in a detached tmux session:
 

@@ -1,14 +1,15 @@
 """Backend-aware session_map key scheme regression tests.
 
-The hook writes herdr keys as ``herdr:<wN:pM>`` (the backend name) while tmux
+The hook writes Herdr keys as ``herdr:<opaque-session-target>`` while tmux
 keys are ``<tmux_session_name>:<@id>``. Readers must mirror the active backend's
-prefix and id form, else herdr session entries are silently skipped (no
-transcript monitoring / message delivery) or purged as "old format".
+prefix and preserve the opaque target, else Herdr session entries are silently
+skipped (no transcript monitoring / message delivery) or purged as old format.
 """
 
 import pytest
 
 from ccgram.config import config
+from ccgram.session_monitor import SessionMonitor
 from ccgram.session_map import (
     is_backend_window_id,
     parse_session_map,
@@ -52,19 +53,39 @@ def test_is_backend_window_id_tmux(tmux_backend) -> None:
 
 
 def test_is_backend_window_id_herdr(herdr_backend) -> None:
-    assert is_backend_window_id("w2:p1")
+    target = "herdr-session-v1-" + "a" * 64
+    assert is_backend_window_id(target)
+    assert not is_backend_window_id("herdr-session-v1-target")
+    assert not is_backend_window_id("herdr-session-v1-" + "A" * 64)
+    assert not is_backend_window_id("herdr-session-v1-" + "a" * 63)
+    assert not is_backend_window_id("w2:p1")
     assert not is_backend_window_id("")
 
 
 def test_parse_session_map_surfaces_herdr_entry(herdr_backend) -> None:
-    """The monitor's read path must see hook-written herdr keys."""
-    raw = {"herdr:w2:p1": _entry("S1")}
+    """The monitor's read path must see hook-written Herdr keys."""
+    target = "herdr-session-v1-" + "a" * 64
+    raw = {f"herdr:{target}": _entry("S1")}
     parsed = parse_session_map(raw, session_map_prefix())
-    assert "w2:p1" in parsed
-    assert parsed["w2:p1"]["session_id"] == "S1"
+    assert target in parsed
+    assert parsed[target]["session_id"] == "S1"
+
+
+def test_parse_session_map_herdr_rejects_raw_and_legacy_ids(herdr_backend) -> None:
+    raw = {
+        "herdr:w2:t1": _entry("raw-tab"),
+        "herdr:w2:p1": _entry("raw-pane"),
+        "herdr:herdr-session-v1-" + "A" * 64: _entry("bad-digest"),
+    }
+    assert parse_session_map(raw, session_map_prefix()) == {}
+
+
+async def test_session_monitor_rejects_raw_herdr_ids(herdr_backend) -> None:
+    raw = {"herdr:w2:t1": _entry("raw-tab")}
+    assert await SessionMonitor()._load_current_session_map(raw) == {}
 
 
 def test_parse_session_map_tmux_skips_other_backend(tmux_backend) -> None:
-    """A tmux run ignores stale herdr-prefixed entries (no cross-backend leak)."""
-    raw = {"herdr:w2:p1": _entry("S1")}
+    """A tmux run ignores stale Herdr-prefixed entries (no cross-backend leak)."""
+    raw = {"herdr:herdr-session-v1-" + "a" * 64: _entry("S1")}
     assert parse_session_map(raw, session_map_prefix()) == {}

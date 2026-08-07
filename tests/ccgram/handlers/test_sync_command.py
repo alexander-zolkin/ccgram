@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,6 +10,7 @@ from ccgram.handlers.sync_command import (
     _format_report,
     _probe_dead_topics,
     _recreate_dead_topics,
+    _dispatch,
     handle_sync_dismiss,
     handle_sync_fix,
     sync_command,
@@ -131,6 +133,23 @@ class TestBuildReport:
         text, _keyboard = _format_report(audit)
         assert "No orphaned entries" in text
 
+    def test_legacy_herdr_report_explains_archive_and_explicit_rebind(self) -> None:
+        audit = AuditResult(
+            issues=[
+                AuditIssue(
+                    "legacy_herdr",
+                    "w2:t1 is blocked; archive or explicitly rebind to a listed session target",
+                    fixable=False,
+                )
+            ],
+            total_bindings=1,
+            live_binding_count=0,
+        )
+        text, keyboard = _format_report(audit)
+        assert "legacy Herdr binding" in text
+        assert "explicitly rebind" in text
+        assert keyboard is None
+
 
 class TestSyncDismiss:
     async def test_dismiss_deletes_message(self, _patch_deps) -> None:
@@ -171,6 +190,26 @@ class TestSyncCommand:
             await sync_command(update, MagicMock())
             mock_reply.assert_called_once()
             assert "not authorized" in mock_reply.call_args[0][1]
+
+    async def test_unauthorized_fix_callback_cannot_start_destructive_cleanup(
+        self, _patch_deps
+    ) -> None:
+        *_, mock_cfg = _patch_deps
+        mock_cfg.is_user_allowed.return_value = False
+        update = MagicMock()
+        update.effective_user = MagicMock(id=100)
+        update.callback_query = AsyncMock()
+        update.callback_query.data = CB_SYNC_FIX
+
+        with patch(
+            "ccgram.handlers.sync_command.handle_sync_fix", new_callable=AsyncMock
+        ) as fix:
+            await _dispatch(update, MagicMock())
+
+        fix.assert_not_awaited()
+        update.callback_query.answer.assert_awaited_once_with(
+            "You are not authorized", show_alert=True
+        )
 
     async def test_no_user_returns_early(self, _patch_deps) -> None:
         update = MagicMock()
@@ -505,7 +544,15 @@ class TestDeadTopicDetection:
         mock_bot.send_message.return_value = MagicMock(message_id=999)
 
         issues = await _probe_dead_topics(mock_bot)
+
         assert issues == []
+        mock_bot.send_message.assert_awaited_once_with(
+            -999,
+            ".",
+            message_thread_id=42,
+            disable_notification=True,
+        )
+        mock_bot.delete_message.assert_awaited_once_with(-999, 999)
 
     async def test_probe_skips_network_errors(self, _patch_deps) -> None:
         _, _, _, mock_tr, _, _ = _patch_deps
@@ -585,6 +632,7 @@ class TestDeadTopicRecreation:
         with patch(
             "ccgram.handlers.topics.topic_orchestration.handle_new_window",
             new_callable=AsyncMock,
+            return_value=True,
         ) as mock_handle:
             count = await _recreate_dead_topics(mock_bot, issues)
             assert count == 1
@@ -593,6 +641,70 @@ class TestDeadTopicRecreation:
             event = mock_handle.call_args[0][0]
             assert event.window_id == "w2:t2"
             assert event.window_name == "qmd-go"
+            assert mock_handle.call_args.kwargs == {
+                "target_user_id": 100,
+                "target_chat_id": mock_tr.resolve_chat_id.return_value,
+            }
+
+    async def test_recreate_restores_binding_when_creation_returns_false(
+        self, _patch_deps
+    ) -> None:
+        _, _, mock_wq, mock_tr, _, _ = _patch_deps
+        mock_wq.view_window.return_value = MagicMock(
+            session_id="s1", cwd="/tmp", window_name="proj"
+        )
+        mock_tr.get_window_for_thread.return_value = "@2"
+        mock_tr.resolve_chat_id.return_value = -999
+        issues = [
+            AuditIssue(
+                "dead_topic",
+                "user:100 thread:42 window:@2 (proj)",
+                fixable=True,
+            ),
+        ]
+
+        with patch(
+            "ccgram.handlers.topics.topic_orchestration.handle_new_window",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
+            count = await _recreate_dead_topics(AsyncMock(), issues)
+
+        assert count == 0
+        mock_tr.bind_thread.assert_called_once_with(
+            100, 42, "@2", window_name="proj", chat_id=-999
+        )
+        mock_tr.set_group_chat_id.assert_called_once_with(100, 42, -999)
+
+    async def test_recreate_restores_binding_when_cancelled(self, _patch_deps) -> None:
+        _, _, mock_wq, mock_tr, _, _ = _patch_deps
+        mock_wq.view_window.return_value = MagicMock(
+            session_id="s1", cwd="/tmp", window_name="proj"
+        )
+        mock_tr.get_window_for_thread.return_value = "@2"
+        mock_tr.resolve_chat_id.return_value = -999
+        issues = [
+            AuditIssue(
+                "dead_topic",
+                "user:100 thread:42 window:@2 (proj)",
+                fixable=True,
+            ),
+        ]
+
+        with (
+            patch(
+                "ccgram.handlers.topics.topic_orchestration.handle_new_window",
+                new_callable=AsyncMock,
+                side_effect=asyncio.CancelledError,
+            ),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await _recreate_dead_topics(AsyncMock(), issues)
+
+        mock_tr.bind_thread.assert_called_once_with(
+            100, 42, "@2", window_name="proj", chat_id=-999
+        )
+        mock_tr.set_group_chat_id.assert_called_once_with(100, 42, -999)
 
     async def test_recreate_skips_non_dead_topic_issues(self, _patch_deps) -> None:
         issues = [
@@ -614,6 +726,7 @@ class TestDeadTopicRecreation:
             session_id="s1", cwd="/tmp", window_name="proj"
         )
         mock_tr.get_window_for_thread.return_value = "@2"
+        mock_tr.resolve_chat_id.return_value = -999
 
         issues = [
             AuditIssue(
@@ -634,7 +747,7 @@ class TestDeadTopicRecreation:
             assert count == 0
             mock_tr.unbind_thread.assert_called_once_with(100, 42)
             mock_tr.bind_thread.assert_called_once_with(
-                100, 42, "@2", window_name="proj"
+                100, 42, "@2", window_name="proj", chat_id=-999
             )
 
 

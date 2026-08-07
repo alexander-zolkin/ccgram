@@ -119,6 +119,23 @@ class TestResolveChatId:
     def test_without_group_id_fallback(self, router: ThreadRouter) -> None:
         assert router.resolve_chat_id(100, 1) == 100
 
+    def test_with_default_group_id(self) -> None:
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _wid: False,
+            default_group_id=-999,
+        )
+        assert router.resolve_chat_id(100, 1) == -999
+
+    def test_stored_group_id_precedes_default_group_id(self) -> None:
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _wid: False,
+            default_group_id=-999,
+        )
+        router.set_group_chat_id(100, 1, -888)
+        assert router.resolve_chat_id(100, 1) == -888
+
     def test_none_thread_id_fallback(self, router: ThreadRouter) -> None:
         router.set_group_chat_id(100, 1, -999)
         assert router.resolve_chat_id(100) == 100
@@ -194,6 +211,42 @@ class TestToDictRoundtrip:
         router.from_dict(data)
         assert router.get_window_for_thread(100, 2) == "@1"
         assert router.get_window_for_thread(100, 1) is None
+
+
+class TestChatScopedBindings:
+    def test_same_user_can_bind_same_thread_id_in_two_chats(
+        self, router: ThreadRouter
+    ) -> None:
+        router.bind_thread(100, 7, "@a", window_name="a", chat_id=-1001)
+        router.bind_thread(100, 7, "@b", window_name="b", chat_id=-1002)
+
+        assert router.get_window_for_chat_thread(-1001, 7) == "@a"
+        assert router.get_window_for_chat_thread(-1002, 7) == "@b"
+        assert router.resolve_window_for_thread(100, 7, -1001) == "@a"
+        assert router.resolve_window_for_thread(100, 7, -1002) == "@b"
+        assert {binding[2] for binding in router.iter_thread_bindings()} == {"@a", "@b"}
+
+    def test_chatless_lookup_refuses_legacy_scoped_collision(
+        self, router: ThreadRouter
+    ) -> None:
+        router.bind_thread(100, 7, "@legacy")
+        router.bind_thread(100, 7, "@scoped", chat_id=-1001)
+
+        assert router.get_window_for_thread(100, 7) is None
+        assert router.get_window_for_thread(100, 7, -1001) == "@scoped"
+
+    def test_chat_scoped_bindings_survive_round_trip(
+        self, router: ThreadRouter
+    ) -> None:
+        router.bind_thread(100, 7, "@a", chat_id=-1001)
+        restored = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _wid: False,
+        )
+        restored.from_dict(router.to_dict())
+
+        assert restored.get_window_for_chat_thread(-1001, 7) == "@a"
+        assert list(restored.iter_thread_bindings()) == [(100, 7, "@a")]
 
 
 class TestReset:

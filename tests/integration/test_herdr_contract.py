@@ -1,122 +1,50 @@
-"""F2 herdr leg — the Multiplexer contract against a live herdr server.
+"""Live Herdr contract for guarded opaque session targets.
 
-Marked ``herdr`` (and ``integration``); auto-skips when ``$HERDR_SOCKET_PATH``
-is unset or the server is unreachable, so it never runs in ``make test``. Run
-locally with a herdr server up::
-
-    uv run pytest tests/integration/ -m "herdr" -v
-
-Tab identity (Task 1): ``window_id`` is a **tab id** (``"wN:tM"``), not a pane
-id.  ``create_window`` returns the tab id; ``list_panes(tab_id)`` returns panes
-whose ``pane_id`` values are ``"wN:pK"`` — distinct from the tab id.
-
-Tests cover:
-- create → send → capture_pane → kill round-trip
-- tab identity: ``list_windows`` returns one ``WindowRef`` per tab; the
-  ``window_id`` field is a tab id (not a pane id), and ``window_name`` is
-  formatted as ``"<workspace> ▸ <tab>"``
-- ``__*__`` workspace/tab labels are not surfaced in ``list_windows``
-- ``create_window`` returns a tab id (``window_id``)
-- ``kill_window`` closes the tab and ``find_window_by_id`` returns None afterwards
-- ``rename_window`` changes the tab label visible in the next ``find_window_by_id``
-- restart re-resolution: ``_resolve_by_session_id`` maps an old tab id to a
-  new tab id via shared session id (simulated — no live server restart needed)
-- scrollback: requesting >1000 lines sets ``CaptureResult.truncated``
+These checks require a disposable Herdr server with official integrations that
+report ``agent_session``.  They deliberately do not infer identity from tabs,
+panes, labels, focus, or layout.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import json
 import os
-import subprocess
-from pathlib import Path
 
 import pytest
 
 from ccgram.multiplexer.herdr import HerdrError, HerdrManager
-from ccgram.multiplexer.topic_mapping import TOPIC_PREFIX_SEPARATOR
 
 pytestmark = [pytest.mark.integration, pytest.mark.herdr]
 
 
-def _socket_or_skip() -> str:
+@pytest.fixture
+async def herdr() -> HerdrManager:
     socket = os.environ.get("HERDR_SOCKET_PATH", "")
     if not socket or not os.path.exists(socket):
         pytest.skip("herdr socket not available ($HERDR_SOCKET_PATH unset/missing)")
-    return socket
-
-
-@pytest.fixture
-async def herdr() -> HerdrManager:
-    socket = _socket_or_skip()
-    mgr = HerdrManager(socket_path=socket)
+    manager = HerdrManager(socket_path=socket)
     try:
-        await mgr.ensure_session()
+        await manager.ensure_session()
     except HerdrError as exc:
         pytest.skip(f"herdr server unavailable: {exc}")
-    return mgr
+    return manager
 
 
-async def _capture_until(
-    mgr: HerdrManager, window_id: str, needle: str, *, timeout: float = 8.0
-) -> str:
-    """Poll ``capture_pane`` until *needle* appears, or fail after *timeout*."""
-    deadline = asyncio.get_event_loop().time() + timeout
-    last = ""
-    while asyncio.get_event_loop().time() < deadline:
-        result = await mgr.capture_pane(window_id)
-        last = result or ""
-        if needle in last:
-            return last
-        await asyncio.sleep(0.3)
-    raise AssertionError(f"never saw {needle!r}; last capture:\n{last}")
-
-
-# ── Tab identity + lifecycle ────────────────────────────────────────────────
-
-
-async def test_create_send_capture_kill_roundtrip(
-    herdr: HerdrManager, tmp_path
+async def test_agent_list_exposes_only_guarded_session_targets(
+    herdr: HerdrManager,
 ) -> None:
-    """Tab identity: create_window returns a tab id; pane ops resolve through it."""
-    ok, _msg, _name, window_id = await herdr.create_window(
-        str(tmp_path), window_name="ccgram-itest", start_agent=False
-    )
-    assert ok is True
-    # window_id is a tab id (wN:tM shape), not a pane id (wN:pM).
-    assert window_id
+    """Discovery exposes only opaque session targets from the sole identity source."""
+    targets = await herdr.list_windows()
+    if not targets:
+        pytest.skip("no sessionful agent.list record available")
+    assert all(target.window_id.startswith("herdr-session-v1-") for target in targets)
+    for target in targets:
+        assert await herdr.find_window_by_id(target.window_id) is not None
 
-    try:
-        # send → capture round-trips text through the real pane.
-        marker = "ccgram_herdr_marker_42"
-        assert await herdr.send(window_id, f"echo {marker}") is True
-        text = await _capture_until(herdr, window_id, marker)
-        assert marker in text
 
-        # list_panes: tab has at least one pane; pane_id is distinct from tab id.
-        panes = await herdr.list_panes(window_id)
-        assert len(panes) >= 1
-        # Pane ids are "wN:pM" — they are NOT equal to the tab id "wN:tM".
-        assert all(p.pane_id != window_id for p in panes)
-
-        # pane_dims: positive cols/rows.
-        dims = await herdr.pane_dims(window_id)
-        assert dims is not None and dims.width > 0 and dims.height > 0
-
-        # foreground: a real pid and argv, no tty (capability says so).
-        fg = await herdr.foreground(window_id)
-        assert fg is not None
-        assert fg.pid > 0
-        assert fg.argv
-        assert fg.tty == ""
-    finally:
-        assert await herdr.kill_window(window_id) is True
-
-    # Window is gone after kill (tab closed).
-    await asyncio.sleep(0.3)
-    assert await herdr.find_window_by_id(window_id) is None
+async def test_non_target_identifier_fails_closed(herdr: HerdrManager) -> None:
+    """A location-like identifier cannot authorize an action."""
+    assert await herdr.find_window_by_id("not-a-herdr-session-target") is None
+    assert await herdr.send("not-a-herdr-session-target", "ccgram guard probe") is False
 
 
 def _source_workspace_id(repo: str) -> str:

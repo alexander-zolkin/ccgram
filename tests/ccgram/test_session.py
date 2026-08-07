@@ -21,6 +21,33 @@ def mgr(monkeypatch) -> SessionManager:
     return SessionManager()
 
 
+class TestLegacyHerdrMigration:
+    def test_load_marks_every_legacy_id_without_short_circuit(
+        self, monkeypatch
+    ) -> None:
+        state = {
+            "window_states": {"w2:t1": {}, "w2:p2": {}},
+            "thread_bindings": {"1": {"10": "w2:p3"}},
+        }
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "herdr")
+        monkeypatch.setattr("ccgram.session.StatePersistence.load", lambda _self: state)
+        monkeypatch.setattr(SessionManager, "_save_state", lambda _self: None)
+        manager = SessionManager()
+        assert all(
+            window_store.is_legacy_herdr(window_id)
+            for window_id in ("w2:t1", "w2:p2", "w2:p3")
+        )
+        _ = manager
+
+    def test_stale_pruning_preserves_archived_legacy_herdr_state(
+        self, mgr: SessionManager
+    ) -> None:
+        window_store.mark_legacy_herdr("w2:t1")
+        assert window_store.archive_legacy_herdr("w2:t1", 1, 10)
+        assert mgr.prune_stale_window_states(set()) is False
+        assert "w2:t1" in window_store.window_states
+
+
 class TestThreadBindings:
     def test_bind_and_get(self, mgr: SessionManager) -> None:
         thread_router.bind_thread(100, 1, "@1")
@@ -136,7 +163,7 @@ class TestFindUsersForSession:
         thread_router.bind_thread(100, 1, "@1")
         mgr.window_states["@1"] = self._ws("sid-1")
         result = session_resolver.find_users_for_session("sid-1")
-        assert result == [(100, "@1", 1)]
+        assert result == [(100, "@1", 1, None)]
 
     def test_no_match_returns_empty(self, mgr: SessionManager) -> None:
         thread_router.bind_thread(100, 1, "@1")
@@ -335,6 +362,26 @@ class TestPruneSessionMap:
         monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
 
         session_map_sync.prune_session_map(live_window_ids={"@1"})
+
+    def test_pruning_rereads_only_after_hook_lock_is_held(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(json.dumps({"ccgram:@5": {"session_id": "sid-5"}}))
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.tmux_session_name", "ccgram")
+
+        from ccgram import session_map
+
+        original_read = session_map._read_session_map_for_pruning
+
+        def locked_read():
+            assert session_map_file.with_suffix(".lock").exists()
+            return original_read()
+
+        monkeypatch.setattr(session_map, "_read_session_map_for_pruning", locked_read)
+        session_map_sync.prune_session_map(live_window_ids=set())
+        assert json.loads(session_map_file.read_text()) == {}
 
     def test_prunes_entry_without_window_state(
         self, mgr: SessionManager, tmp_path, monkeypatch
@@ -1107,8 +1154,7 @@ class _FakeMux:
 
 
 class TestResolveStaleIdsHerdrRestart:
-    """Session-level glue for non-stable-id backends: read the hook-written
-    session_map, join live pane id -> session id, re-resolve by session id."""
+    """Session-level recovery preserves opaque Herdr target bindings."""
 
     @pytest.fixture(autouse=True)
     def _session_map(self, tmp_path, monkeypatch):
@@ -1116,29 +1162,35 @@ class TestResolveStaleIdsHerdrRestart:
         monkeypatch.setattr("ccgram.session.config.session_map_file", self.map_file)
         monkeypatch.setattr("ccgram.session.config.tmux_session_name", "ccgram")
 
-    async def test_herdr_restart_reattaches_bound_topic(
+    async def test_herdr_missing_target_does_not_reattach_bound_topic(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
-        # Persisted state from before the restart: pane w2:p1 ran session S1.
-        thread_router.bind_thread(100, 7, "w2:p1", window_name="ccgram")
-        mgr.window_states["w2:p1"] = WindowState(
+        target = "herdr-session-v1-old"
+        thread_router.bind_thread(100, 7, target, window_name="ccgram")
+        mgr.window_states[target] = WindowState(
             session_id="S1", cwd="/repo", provider_name="claude"
         )
-        # After a herdr server restart the agent is back as w3:p1; the hook
-        # re-wrote session_map with the new pane id and the same session id.
+        # A live target with the same session ID is not evidence that it is the
+        # same opaque target. Recovery must retain the unresolved binding.
         self.map_file.write_text(
-            json.dumps({"herdr:w3:p1": {"session_id": "S1", "cwd": "/repo"}})
+            json.dumps(
+                {
+                    "herdr:herdr-session-v1-new": {
+                        "session_id": "S1",
+                        "cwd": "/repo",
+                    }
+                }
+            )
         )
-        live = [SimpleNamespace(window_id="w3:p1", window_name="ccgram")]
+        live = [SimpleNamespace(window_id="herdr-session-v1-new", window_name="ccgram")]
         monkeypatch.setattr(
             "ccgram.session.tmux_manager",
             _FakeMux(ids_stable=False, windows=live),
         )
         await mgr.resolve_stale_ids()
 
-        assert "w3:p1" in mgr.window_states
-        assert "w2:p1" not in mgr.window_states
-        assert thread_router.get_window_for_thread(100, 7) == "w3:p1"
+        assert target in mgr.window_states
+        assert thread_router.get_window_for_thread(100, 7) == target
 
     async def test_tmux_path_is_noop_for_stable_ids(
         self, mgr: SessionManager, monkeypatch

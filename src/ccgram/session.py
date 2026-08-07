@@ -26,8 +26,6 @@ from .session_map import (
     SessionMapSync,
     install_session_map_sync,
     is_backend_window_id,
-    live_window_session_ids,
-    read_session_map_raw,
     session_map_prefix,
     session_map_sync,
 )
@@ -127,6 +125,7 @@ class SessionManager:
         self._thread_router = ThreadRouter(
             schedule_save=self._save_state,
             has_window_state=self._window_store.has_window,
+            default_group_id=config.group_id,
         )
         install_thread_router(self._thread_router)
         self._user_preferences = UserPreferences(schedule_save=self._save_state)
@@ -153,9 +152,11 @@ class SessionManager:
     def _is_window_id(self, key: str) -> bool:
         """Check if a key looks like a window ID for the active backend.
 
-        Backend-aware: tmux ``@N`` ids, herdr ``wN:pM`` ids (see
-        ``session_map.is_backend_window_id``). Old-format (window-name) keys
-        return False on tmux so startup re-resolution migrates them.
+        Backend-aware: tmux ``@N`` ids and guarded opaque Herdr session
+        targets (see ``session_map.is_backend_window_id``). Raw Herdr tab/pane
+        locators are legacy migration records, never valid identities.
+        Old-format (window-name) keys return False on tmux so startup
+        re-resolution migrates them.
         """
         return is_backend_window_id(key)
 
@@ -170,6 +171,30 @@ class SessionManager:
             return
 
         window_store.from_dict(state.get("window_states", {}))
+        migrated = False
+
+        # Herdr topics created before guarded session targets were tab/pane
+        # bindings. Preserve them for an explicit archive/rollback migration,
+        # but make them incapable of authorizing any action.
+        if config.multiplexer_name == "herdr":
+            legacy_ids = set(window_store.window_states)
+            legacy_ids.update(
+                window_id
+                for bindings in state.get("thread_bindings", {}).values()
+                if isinstance(bindings, dict)
+                for window_id in bindings.values()
+                if isinstance(window_id, str)
+            )
+            migrated = False
+            for window_id in legacy_ids:
+                # Do not use any(generator): it short-circuits after the first
+                # mutation and leaves later legacy IDs accidentally actionable.
+                migrated = (
+                    window_store.mark_legacy_herdr(window_id, schedule_save=False)
+                    or migrated
+                )
+            if migrated:
+                logger.info("Marked legacy Herdr bindings for explicit rebind")
 
         # Load user preferences (starred dirs, MRU, read offsets)
         user_preferences.from_dict(state)
@@ -197,6 +222,8 @@ class SessionManager:
                 "Detected old-format state (window_name keys), "
                 "will re-resolve on startup"
             )
+        if migrated:
+            self._save_state()
 
     async def resolve_stale_ids(self) -> None:
         """Re-resolve persisted window IDs against live tmux windows.
@@ -221,17 +248,10 @@ class SessionManager:
             for w in windows
         ]
 
-        # Backends whose ids are not stable across a server restart (herdr)
-        # re-resolve by durable agent session id instead of display name. The
-        # live id -> session_id map comes from the hook-written session_map.
+        # Durable session targets are retained exactly as persisted. Their
+        # current availability is decided by a fresh guarded action, never by
+        # session-map, display-name, tab, pane, or focus recovery.
         caps = tmux_manager.capabilities
-        live_session_ids: dict[str, str] | None = None
-        if not caps.ids_stable_across_restart:
-            raw = await read_session_map_raw() or {}
-            live_session_ids = live_window_session_ids(
-                raw, {w.window_id for w in windows}
-            )
-
         changed = _resolve(
             live,
             self.window_states,
@@ -239,7 +259,6 @@ class SessionManager:
             user_preferences.user_window_offsets,
             thread_router.window_display_names,
             ids_stable=caps.ids_stable_across_restart,
-            live_session_ids=live_session_ids,
         )
 
         if changed:
@@ -297,8 +316,7 @@ class SessionManager:
         """
         # Collect window_ids that are "in use" (bound or have window_states)
         in_use = set(self.window_states.keys())
-        for bindings in thread_router.thread_bindings.values():
-            in_use.update(bindings.values())
+        in_use.update(thread_router.all_bound_window_ids())
 
         # Prune window_display_names for dead windows not in use and not live
         stale_display = [
@@ -308,10 +326,10 @@ class SessionManager:
         ]
 
         # Collect all bound thread keys "user_id:thread_id"
-        bound_keys: set[str] = set()
-        for user_id, bindings in thread_router.thread_bindings.items():
-            for thread_id in bindings:
-                bound_keys.add(f"{user_id}:{thread_id}")
+        bound_keys: set[str] = {
+            f"{user_id}:{thread_id}"
+            for user_id, thread_id, _ in thread_router.iter_thread_bindings()
+        }
 
         # Prune group_chat_ids for unbound threads (unless skipped)
         stale_chat = (
@@ -353,13 +371,24 @@ class SessionManager:
             raw = json.loads(config.session_map_file.read_text())
         except (json.JSONDecodeError, OSError):  # fmt: skip
             return set()
+        if not isinstance(raw, dict):
+            return set()
+        # Lazy: state-file schema stays isolated from the SessionManager.
+        from .hooks.state_files import StateFileValidationError, parse_session_map_entry
+
         prefix = session_map_prefix()
         result: set[str] = set()
-        for key in raw:
-            if key.startswith(prefix):
-                wid = key[len(prefix) :]
-                if self._is_window_id(wid):
-                    result.add(wid)
+        for key, info in raw.items():
+            if not isinstance(key, str) or not key.startswith(prefix):
+                continue
+            wid = key[len(prefix) :]
+            if not self._is_window_id(wid) or not isinstance(info, dict):
+                continue
+            try:
+                parse_session_map_entry(info)
+            except StateFileValidationError:
+                continue
+            result.add(wid)
         return result
 
     def audit_state(
@@ -382,29 +411,44 @@ class SessionManager:
         bound_window_ids: set[str] = set()
         total_bindings = 0
         live_binding_count = 0
-        for _uid, bindings in thread_router.thread_bindings.items():
-            for _tid, wid in bindings.items():
-                total_bindings += 1
-                bound_window_ids.add(wid)
-                if wid in live_window_ids:
-                    live_binding_count += 1
+        for _uid, _tid, wid in thread_router.iter_thread_bindings():
+            total_bindings += 1
+            bound_window_ids.add(wid)
+            if wid in live_window_ids:
+                live_binding_count += 1
 
         session_map_wids = self._get_session_map_window_ids()
 
-        # 1. Ghost bindings (thread → dead window) — fixable (close topic)
-        for uid, bindings in thread_router.thread_bindings.items():
-            for tid, wid in bindings.items():
-                if wid not in live_window_ids:
-                    display = thread_router.get_display_name(wid)
-                    issues.append(
-                        AuditIssue(
-                            category="ghost_binding",
-                            detail=f"user:{uid} thread:{tid} window:{wid} ({display})",
-                            fixable=True,
-                        )
-                    )
+        # 1. Legacy Herdr bindings are retained for archive/rollback but never
+        # actioned or implicitly remapped. Report their explicit rebind path
+        # instead of classifying the old tab/pane locator as a ghost.
+        legacy_bindings = {
+            wid
+            for _uid, _tid, wid in thread_router.iter_thread_bindings()
+            if window_store.is_legacy_herdr(wid)
+        }
+        for wid in sorted(legacy_bindings):
+            issues.append(
+                AuditIssue(
+                    category="legacy_herdr",
+                    detail=f"{wid} is blocked; archive or explicitly rebind to a listed session target",
+                    fixable=False,
+                )
+            )
 
-        # 2. Orphaned display names
+        # 2. Ghost bindings (thread → dead window) — fixable (close topic)
+        for uid, tid, wid in thread_router.iter_thread_bindings():
+            if wid not in live_window_ids and wid not in legacy_bindings:
+                display = thread_router.get_display_name(wid)
+                issues.append(
+                    AuditIssue(
+                        category="ghost_binding",
+                        detail=f"user:{uid} thread:{tid} window:{wid} ({display})",
+                        fixable=True,
+                    )
+                )
+
+        # 3. Orphaned display names
         in_use = set(self.window_states.keys()) | bound_window_ids
         for wid in thread_router.window_display_names:
             if wid not in live_window_ids and wid not in in_use:
@@ -418,10 +462,10 @@ class SessionManager:
                 )
 
         # 3. Orphaned group_chat_ids
-        bound_keys: set[str] = set()
-        for user_id, bindings in thread_router.thread_bindings.items():
-            for thread_id in bindings:
-                bound_keys.add(f"{user_id}:{thread_id}")
+        bound_keys: set[str] = {
+            f"{user_id}:{thread_id}"
+            for user_id, thread_id, _ in thread_router.iter_thread_bindings()
+        }
         for key in thread_router.group_chat_ids:
             if key not in bound_keys:
                 issues.append(
@@ -498,9 +542,7 @@ class SessionManager:
         Returns True if any changes were made.
         """
         session_map_wids = self._get_session_map_window_ids()
-        bound_window_ids: set[str] = set()
-        for bindings in thread_router.thread_bindings.values():
-            bound_window_ids.update(bindings.values())
+        bound_window_ids = thread_router.all_bound_window_ids()
 
         stale = [
             wid
@@ -509,6 +551,7 @@ class SessionManager:
                 wid not in session_map_wids
                 and wid not in bound_window_ids
                 and wid not in live_window_ids
+                and not window_store.is_archived_legacy_herdr(wid)
             )
         ]
         if not stale:

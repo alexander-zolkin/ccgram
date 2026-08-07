@@ -1,20 +1,38 @@
-# Architecture design: herdr as an alternative multiplexer
+# Historical architecture design: herdr as an alternative multiplexer
 
-Plain Markdown. Target architecture for adding [herdr](https://github.com/ogulcancelik/herdr) as a second terminal multiplexer alongside tmux, behind one contract seam. Design only; production source changes belong in a follow-up implementation plan. tmux stays the default; herdr is additive.
+> **Historical record — not current design.** This 2026-06-21 proposal is
+> retained to explain the original multiplexer seam and its decisions. The
+> archived proposal below must not be used as implementation guidance.
 
-## Design Revision (2026-06-22)
+## Current implementation (supersedes this proposal)
 
-The original scoping decision 1 ("Identity keying — thin: treat herdr's `pane_id` as the opaque `window_id`") and the Telegram topic mapping section ("topic = pane = agent") were **superseded** during implementation (plan `docs/plans/20260622-herdr-tab-topics.md`).
+Herdr uses `agent.list` as its sole identity source. CCGram persists only an
+opaque `herdr-session-v1-…` target derived from a complete session composite.
+Before every action, the adapter takes a fresh `agent.list` snapshot and guards
+that target to exactly one live record; absent, malformed, sessionless, or
+ambiguous targets fail closed.
 
-**Actual implemented identity:** `window_id = tab_id` (`"wN:tM"`), not pane id. One ccgram topic = one herdr tab, mirroring the tmux-window analog. A split tab (agent team) is one topic with N panes — handled by ccgram's existing multi-pane awareness (`/panes`, `list_panes`), not N separate topics.
+- Tab, pane, terminal, workspace, display, directory, and focus values are
+  short-lived adapter locators. They are never a topic binding or a remapping
+  source. Legacy tab/pane bindings are action-blocked and retained only for
+  explicit archive/rollback.
+- `$HERDR_PANE_ID` is process-local hook input, not identity. The hook uses it
+  only to locate a live record and writes the resulting guarded target.
+- A Herdr restart never triggers tab/pane re-resolution. The persisted target
+  is guarded again against fresh `agent.list`.
+- Event notifications may prompt refresh work, but they are not an identity or
+  authority stream. Polling, reconciliation, and actions use `agent.list`.
+- `"<workspace> ▸ <tab>"` is display-only. One Telegram topic binds to one
+  guarded agent session target.
 
-**Topic label:** `"<workspace> ▸ <tab>"` (tab name primary, not agent name). This fixes the `"ccgram ▸ claude"` collision when a workspace runs two sessions of the same agent.
+See `docs/guides.md` and `docs/architecture.md` for active documentation.
 
-**Session-map key:** `herdr:<tab_id>` (hook resolves pane→tab via injected probe before writing).
+## Archived proposal (superseded)
 
-**Restart re-resolution:** `_resolve_by_session_id` in `window_resolver.py` maps a stale `herdr:<tab_id>` key to the new tab id via the shared Claude session uuid — same anchor as original, different key shape.
-
-The rest of the design (Multiplexer Protocol, capability flags, anti-corruption layer, polling-first, hook identity from `$HERDR_PANE_ID`, additive scope) remains as written.
+Everything from **Overview** through **Handoff** is preserved historical
+context from the original proposal. In particular, its direct pane identity,
+pane remapping, and deferred-event-stream statements describe rejected design
+options, not current behavior.
 
 ## Overview
 
@@ -168,8 +186,8 @@ This consumes the seam; it is not part of the `Multiplexer` contract (which stop
 - **group = herdr session.** Forced, not chosen: bots cannot create Telegram groups via the Bot API, so the group must be a stable, pre-existing container; a herdr session is exactly that. (Named herdr sessions → separate groups when needed.)
 - **topic = pane = agent.** Each herdr agent pane is one Telegram topic. Preserves ccgram's `1 topic = 1 session` invariant with no "primary pane" fudge; a tab with splits (an agent team) becomes N topics — one independent chat thread per agent, which suits an agent-native multiplexer. Rejected alternative: topic = tab (the tmux-window analog) keeps a team as one topic via the existing multi-pane code, but multiplexes two agents' message streams into one thread; choose it only if teams are predominantly used as a single unit.
 - **Binding key = agent session id** (durable across herdr restart); `pane_id` is the live handle; `workspace_id`/`tab_id` are label sources only. Renaming a workspace re-labels the topic, never rebinds.
-- **Adaptive topic title.** `"[status-emoji] <workspace> ▸ <agent label>"`; add `"/<tab>"` only when the tab holds more than one pane. Sources: status-emoji from herdr `agent_status` (existing topic-emoji machinery); `<workspace>` from `workspace list` label; `<agent label>` from herdr `display_agent`/`title`. The title is derived state, recomputed from `pane get` + `workspace.renamed`/`tab.renamed`/`pane.agent_status_changed` events — never a binding key.
-- **cwd → workspace.** New-topic creation reuses the herdr workspace whose cwd matches the chosen directory (creating one only if absent), then adds a tab+pane inside it. This makes the workspace prefix the repo automatically and keeps herdr's per-workspace state rollup meaningful. So `create_window(spec)` on herdr resolves cwd→workspace, then `tab create` + `pane run <launch>`; `window_id` is the resulting pane.
+- **Adaptive topic title.** `"[status-emoji] <workspace> ▸ <tab>"`; the tab label is primary so two same-agent sessions remain distinct. Sources: status-emoji from herdr `agent_status`; labels from `workspace list` and `tab list`. The title is derived state and never a binding key.
+- **cwd → workspace.** A picker-selected workspace is used exactly. When no workspace was selected, new-topic creation explicitly creates a workspace at the chosen directory and uses the returned ID; it never infers an active or matching workspace. It then adds a tab+pane inside that workspace; the persisted binding is the resulting guarded session target, never a pane or tab ID.
 
 ## Module test specifications
 

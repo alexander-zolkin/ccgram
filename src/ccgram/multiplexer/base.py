@@ -44,7 +44,7 @@ class PaneInfo:
     Field names match the existing ``PaneInfo`` in ``tmux_manager.py``.
     """
 
-    pane_id: str  # e.g. "%3" for tmux, "w2:p1" for herdr
+    pane_id: str  # A backend-specific actionable pane handle; opaque for Herdr
     index: int
     active: bool
     command: str  # Foreground process name
@@ -100,6 +100,21 @@ class WorkspaceRef:
     workspace_id: str  # Opaque ID — pass to create_window to pin the workspace
     label: str  # Human-readable name
     cwd: str  # Root directory of the workspace
+
+
+@dataclass(frozen=True)
+class TopicTargetResult:
+    """Result of creating a target for a new Telegram topic.
+
+    ``target_id`` is the durable opaque binding.  The locator fields describe
+    only the newly-created backend object and must never be persisted as the
+    topic identity.
+    """
+
+    target_id: str
+    label: str
+    window_id: str
+    pane_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -309,6 +324,23 @@ class Multiplexer(Protocol):
         """
         ...
 
+    async def create_topic_target(
+        self,
+        work_dir: str,
+        *,
+        launch_command: str | None,
+        workspace_id: str | None,
+        window_name: str | None = None,
+        agent_args: str = "",
+    ) -> TopicTargetResult:
+        """Create a topic target, pinned to an opaque selected workspace.
+
+        The returned ``target_id`` is the only value callers may bind to a
+        Telegram topic.  ``workspace_id`` is opaque and may be required by a
+        backend with workspace support.
+        """
+        ...
+
     async def create_worktree_window(
         self,
         repo_path: str,
@@ -352,11 +384,11 @@ class Multiplexer(Protocol):
     async def split_window(self, window_id: str) -> str | None:
         """Split the window's active pane; return the new pane id, or None.
 
-        Adds a sibling pane to the window/tab (the multi-pane "agent team"
-        shape): herdr ``pane split``, tmux ``window.split()``. The returned id
-        is a real pane id (``%N`` for tmux, ``wN:pK`` for herdr) and is
-        discoverable via ``list_panes`` / the ``/panes`` command. None on
-        failure (window gone, backend error).
+        Adds a sibling pane to the window/tab where the backend can safely
+        expose its handle (tmux ``window.split()``). Backends whose sibling
+        locators cannot satisfy their public identity boundary return None;
+        callers must report that split is unsupported rather than use a raw
+        locator. None also covers a gone window or backend error.
         """
         ...
 

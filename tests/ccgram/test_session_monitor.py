@@ -17,6 +17,19 @@ from ccgram.thread_router import thread_router
 from ccgram.window_state_store import window_store
 
 
+HERDR_TARGETS = {
+    name: "herdr-session-v1-" + digest * 64
+    for name, digest in {
+        "a": "a",
+        "b": "b",
+        "shell": "c",
+        "bound": "d",
+        "known": "e",
+        "new": "f",
+    }.items()
+}
+
+
 @pytest.fixture
 def monitor(tmp_path) -> SessionMonitor:
     return SessionMonitor(
@@ -57,6 +70,21 @@ class TestMonitorLoop:
             await monitor._monitor_loop()
 
         mock_sync.prune_session_map.assert_not_called()
+
+
+class TestSessionMapReadFailures:
+    async def test_unreadable_map_does_not_reconcile_as_empty(
+        self, monitor: SessionMonitor
+    ) -> None:
+        with (
+            patch(
+                "ccgram.session_monitor.read_session_map_raw",
+                AsyncMock(return_value=None),
+            ),
+            patch("ccgram.session_monitor.session_lifecycle") as lifecycle,
+        ):
+            await monitor._detect_and_cleanup_changes()
+        lifecycle.reconcile.assert_not_called()
 
 
 class TestPendingToolsCleanup:
@@ -226,7 +254,7 @@ class TestEmitUnboundWindowEvents:
         surfaced = {c.args[0].window_id for c in cb.call_args_list}
         assert surfaced == {"@1", "@2"}
 
-    async def test_herdr_surfaces_only_agent_panes(
+    async def test_herdr_surfaces_only_agent_sessions(
         self, monitor: SessionMonitor, wired, monkeypatch
     ) -> None:
         cb = AsyncMock(spec=lambda event: None)
@@ -236,21 +264,21 @@ class TestEmitUnboundWindowEvents:
             SimpleNamespace(capabilities=_HERDR_CAPS),
         )
 
-        # w2:p1 + w2:p2 are agent panes (a tab split); w3:p1 is a bare shell.
+        # Each sessionful agent target gets a topic; a bare shell does not.
         windows = [
-            _winref("w2:p1", "claude"),
-            _winref("w2:p2", "claude"),
-            _winref("w3:p1", ""),
+            _winref(HERDR_TARGETS["a"], "claude"),
+            _winref(HERDR_TARGETS["b"], "claude"),
+            _winref(HERDR_TARGETS["shell"], ""),
         ]
         await monitor._emit_unbound_window_events(windows, known_window_ids=set())
 
         surfaced = {c.args[0].window_id for c in cb.call_args_list}
-        assert surfaced == {"w2:p1", "w2:p2"}
+        assert surfaced == {HERDR_TARGETS["a"], HERDR_TARGETS["b"]}
 
     async def test_skips_known_and_bound_windows(
         self, monitor: SessionMonitor, wired, monkeypatch
     ) -> None:
-        thread_router.bind_thread(100, 1, "w2:p2")
+        thread_router.bind_thread(100, 1, HERDR_TARGETS["bound"])
         cb = AsyncMock(spec=lambda event: None)
         monitor.set_new_window_callback(cb)
         monkeypatch.setattr(
@@ -259,14 +287,16 @@ class TestEmitUnboundWindowEvents:
         )
 
         windows = [
-            _winref("w2:p1", "claude"),  # already in session_map (known)
-            _winref("w2:p2", "claude"),  # already bound to a topic
-            _winref("w2:p3", "claude"),  # genuinely new → surfaces
+            _winref(HERDR_TARGETS["known"], "claude"),  # in session_map
+            _winref(HERDR_TARGETS["bound"], "claude"),  # bound to a topic
+            _winref(HERDR_TARGETS["new"], "claude"),  # genuinely new
         ]
-        await monitor._emit_unbound_window_events(windows, known_window_ids={"w2:p1"})
+        await monitor._emit_unbound_window_events(
+            windows, known_window_ids={HERDR_TARGETS["known"]}
+        )
 
         surfaced = {c.args[0].window_id for c in cb.call_args_list}
-        assert surfaced == {"w2:p3"}
+        assert surfaced == {HERDR_TARGETS["new"]}
 
 
 class TestEmitKnownUnboundWindowEvents:
@@ -401,11 +431,11 @@ class TestEmitKnownUnboundWindowEvents:
 class TestLoadCurrentSessionMapBackend:
     """The monitor's session_map reader must honor the active backend prefix.
 
-    Regression: under herdr the hook writes ``herdr:<wN:pM>`` keys; a tmux-only
-    ``ccgram:`` prefix silently dropped every herdr session so none was tracked.
+    Regression: under herdr the hook writes ``herdr:<opaque-session-target>``
+    keys; a tmux-only ``ccgram:`` prefix silently dropped every herdr session.
     """
 
-    async def test_herdr_keys_surface(
+    async def test_herdr_rejects_raw_locator_keys(
         self, monitor: SessionMonitor, monkeypatch
     ) -> None:
         from ccgram.config import config
@@ -420,8 +450,18 @@ class TestLoadCurrentSessionMapBackend:
                 "provider_name": "claude",
             }
         }
+        assert await monitor._load_current_session_map(raw) == {}
+
+    async def test_herdr_guarded_target_key_surfaces(
+        self, monitor: SessionMonitor, monkeypatch
+    ) -> None:
+        from ccgram.config import config
+
+        monkeypatch.setattr(config, "multiplexer_name", "herdr")
+        target = "herdr-session-v1-" + "a" * 64
+        raw = {"herdr:" + target: {"session_id": "S1", "cwd": "/repo"}}
         result = await monitor._load_current_session_map(raw)
-        assert result.get("w2:p1", {}).get("session_id") == "S1"
+        assert result[target]["session_id"] == "S1"
 
     async def test_tmux_skips_herdr_keys(
         self, monitor: SessionMonitor, monkeypatch

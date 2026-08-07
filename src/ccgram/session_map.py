@@ -34,6 +34,7 @@ from typing import Any, cast
 import aiofiles
 
 from .config import config
+from .herdr_targets import is_herdr_session_target
 from .hooks.state_files import StateFileValidationError, parse_session_map_entry
 from .utils import atomic_write_json, log_throttle_reset, log_throttled
 from .window_resolver import is_window_id, session_map_prefix_for
@@ -71,35 +72,11 @@ async def read_session_map_raw() -> dict[str, Any] | None:
     try:
         async with aiofiles.open(config.session_map_file, "r") as f:
             content = await f.read()
-        return cast(dict[str, Any], json.loads(content))
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, dict) else None
+    # py3-parenthesize-except — legal bare on 3.14 (PEP 758), SyntaxError on <=3.13.
     except (json.JSONDecodeError, OSError):
         return None
-
-
-def live_window_session_ids(
-    raw: dict[str, Any], live_window_ids: set[str]
-) -> dict[str, str]:
-    """Map each live window id to its session_id from a raw session_map.
-
-    Backend-neutral: a session_map key is ``<prefix>:<window_id>`` (e.g.
-    ``ccgram:@12`` for tmux, ``herdr:w2:t1`` for herdr, whose id itself contains
-    a colon), so this matches the key to a live window id by suffix rather than
-    splitting on ``:``. Only ids in ``live_window_ids`` are returned, so stale
-    pre-restart entries are ignored. Used by herdr restart re-resolution to join
-    persisted ``session_id`` -> current tab id (``window_resolver``).
-    """
-    result: dict[str, str] = {}
-    for key, info in raw.items():
-        if not isinstance(info, dict):
-            continue
-        sid = info.get("session_id", "")
-        if not sid:
-            continue
-        for wid in live_window_ids:
-            if key == wid or key.endswith(f":{wid}"):
-                result[wid] = sid
-                break
-    return result
 
 
 def session_map_prefix() -> str:
@@ -107,7 +84,9 @@ def session_map_prefix() -> str:
 
     The hook encodes the backend into each key's prefix: tmux keys are
     ``<tmux_session_name>:<@id>`` (the live tmux session name), herdr keys are
-    ``herdr:<wN:tM>`` (the backend name — see ``multiplexer.self_identify``).
+    ``herdr:<opaque-session-target>`` (the backend name plus a durable opaque
+    target — see ``multiplexer.self_identify``). Raw Herdr pane/tab locators
+    are never valid persisted identities.
     Readers mirror that here so they match the writer regardless of the active
     backend; the tmux branch is byte-identical to the previous hard-coded
     ``f"{config.tmux_session_name}:"``.
@@ -119,13 +98,14 @@ def is_backend_window_id(window_id: str) -> bool:
     """Validate a prefix-stripped session_map window id for the active backend.
 
     tmux requires the ``@N`` form so legacy window-name-keyed entries are still
-    detected and purged as old format; non-stable-id backends (herdr) use
-    ``wN:tM`` tab ids that ``is_window_id`` rejects, so any non-empty token after
-    the prefix is valid there (mirrors ``window_resolver._resolve_by_session_id``,
-    which likewise does not apply ``is_window_id`` to herdr ids).
+    detected and purged as old format. Herdr persists only opaque durable
+    ``herdr-session-v1-<digest>`` targets; a pane or tab locator is never a
+    valid session-map identity.
     """
     if config.multiplexer_name == "tmux":
         return is_window_id(window_id)
+    if config.multiplexer_name == "herdr":
+        return is_herdr_session_target(window_id)
     return bool(window_id)
 
 
@@ -214,7 +194,7 @@ def parse_session_map(raw: dict[str, Any], prefix: str) -> dict[str, dict[str, s
 
     Returns {window_id: {"session_id": ..., "cwd": ...}} for matching entries,
     where window_id is the bare id after stripping the prefix — e.g. ``"@12"``
-    for tmux (``"ccgram:@12"``) or ``"w2:t1"`` for herdr (``"herdr:w2:t1"``).
+    for tmux (``"ccgram:@12"``) or a guarded opaque target for herdr.
 
     Safe to call from a clean interpreter (no SessionManager wired): the
     nested-session preference logic in ``_prefer_existing_primary`` short-
@@ -222,12 +202,19 @@ def parse_session_map(raw: dict[str, Any], prefix: str) -> dict[str, dict[str, s
     reflects the raw session_map rather than a wiring crash. When wired,
     the result also incorporates the in-memory primary-session preference.
     """
+    if not isinstance(raw, dict):
+        return {}
     result: dict[str, dict[str, str]] = {}
     for key, info in raw.items():
-        if not key.startswith(prefix):
+        if not isinstance(key, str) or not key.startswith(prefix):
             continue
         window_name = key[len(prefix) :]
-        if not isinstance(info, dict):
+        # A Herdr prefix alone is not authority: only an exact versioned
+        # guarded-session target is accepted. Raw tab/pane IDs are legacy
+        # migration records and must not reach monitor lifecycle processing.
+        if (
+            prefix == "herdr:" and not is_herdr_session_target(window_name)
+        ) or not isinstance(info, dict):
             continue
         try:
             # parse_session_map_entry is used as a validation gate: it raises
@@ -246,6 +233,43 @@ def parse_session_map(raw: dict[str, Any], prefix: str) -> dict[str, dict[str, s
         if effective["session_id"]:
             result[window_name] = effective
     return result
+
+
+def _read_session_map_for_pruning() -> dict[str, Any] | None:
+    if not config.session_map_file.exists():
+        return None
+    try:
+        raw = json.loads(config.session_map_file.read_text())
+    except (json.JSONDecodeError, OSError):  # fmt: skip
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _dead_session_map_entries(
+    raw: dict[str, Any], live_window_ids: set[str]
+) -> list[tuple[str, str]]:
+    prefix = session_map_prefix()
+    return [
+        (key, window_id)
+        for key in raw
+        if key.startswith(prefix)
+        and is_backend_window_id(window_id := key[len(prefix) :])
+        and window_id not in live_window_ids
+    ]
+
+
+def _remove_dead_session_map_entries(
+    raw: dict[str, Any], dead_entries: list[tuple[str, str]], window_store: Any
+) -> bool:
+    changed_state = False
+    for key, window_id in dead_entries:
+        logger.info("Pruning dead session_map entry: %s (window %s)", key, window_id)
+        del raw[key]
+        log_throttle_reset(f"preserve-primary:{window_id}")
+        if window_store.has_window(window_id):
+            window_store.remove_window(window_id)
+            changed_state = True
+    return changed_state
 
 
 class SessionMapSync:
@@ -270,7 +294,7 @@ class SessionMapSync:
         """Read session_map.json and update window_states with new session associations.
 
         Keys in session_map are formatted as "tmux_session:window_id" for tmux
-        (e.g. "ccgram:@12") or "herdr:tab_id" for herdr (e.g. "herdr:w2:t1").
+        (e.g. "ccgram:@12") or "herdr:<opaque-session-target>" for herdr.
         Only native entries (matching our tmux_session_name or the "herdr:" prefix) are processed.
         Also cleans up window_states entries not in current session_map.
         Updates window_display_names from the "window_name" field in values.
@@ -280,6 +304,8 @@ class SessionMapSync:
         """
         if raw is None:
             raw = await read_session_map_raw()
+        if raw is None or not isinstance(raw, dict):
+            return
         if not raw:
             return
         session_map = raw
@@ -369,6 +395,7 @@ class SessionMapSync:
                 and w not in valid_wids
                 and w not in bound_wids
                 and window_store.get_session_id_for_window(w) not in old_format_sids
+                and not window_store.is_archived_legacy_herdr(w)
             )
         ]
         for wid in stale_wids:
@@ -410,14 +437,17 @@ class SessionMapSync:
                     async with aiofiles.open(config.session_map_file, "r") as f:
                         content = await f.read()
                     session_map = json.loads(content)
-                    info = session_map.get(key, {})
-                    if info.get("session_id"):
+                    if not isinstance(session_map, dict):
+                        raise ValueError("session_map root is not an object")
+                    info = session_map.get(key)
+                    if isinstance(info, dict):
+                        parse_session_map_entry(info)
                         logger.debug(
                             "session_map entry found for window_id %s", window_id
                         )
-                        await self.load_session_map()
+                        await self.load_session_map(session_map)
                         return True
-            except (json.JSONDecodeError, OSError):  # fmt: skip
+            except (StateFileValidationError, json.JSONDecodeError, OSError, ValueError):
                 pass
             await asyncio.sleep(interval)
         logger.warning(
@@ -430,48 +460,43 @@ class SessionMapSync:
     # ------------------------------------------------------------------
 
     def prune_session_map(self, live_window_ids: set[str]) -> None:
-        """Remove session_map.json entries for windows that no longer exist.
-
-        Reads session_map.json, drops entries whose window_id is not in
-        live_window_ids, and writes back only if changes were made.
-        Also removes corresponding window_states.
-        """
-        # Lazy: same cycle + wiring contract as _prefer_existing_primary.
-        from .window_state_store import window_store
-
-        if not config.session_map_file.exists():
+        """Remove stale tmux session-map entries, preserving Herdr targets."""
+        # A Herdr target is a durable session digest, not a current locator.
+        # Its absence from one ``agent.list`` snapshot can be a move, restart,
+        # reconnect, or event-loss gap; only a guarded action may classify it
+        # unresolved/ambiguous. Never prune it from hook persistence.
+        if config.multiplexer_name == "herdr":
             return
+
+        map_file = config.session_map_file
+        if not map_file.exists():
+            return
+        lock_path = map_file.with_suffix(".lock")
         try:
-            raw = json.loads(config.session_map_file.read_text())
-        except (json.JSONDecodeError, OSError):  # fmt: skip
-            return
+            with open(lock_path, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                try:
+                    # Re-read only after the hook-compatible lock is held so a
+                    # concurrent hook write cannot be lost between prune/read/write.
+                    raw = _read_session_map_for_pruning()
+                    if raw is None:
+                        return
+                    dead_entries = _dead_session_map_entries(raw, live_window_ids)
+                    if not dead_entries:
+                        return
+                    # Lazy: same cycle + wiring contract as _prefer_existing_primary.
+                    from .window_state_store import window_store
 
-        prefix = session_map_prefix()
-        dead_entries: list[tuple[str, str]] = []  # (map_key, window_id)
-        for key in raw:
-            if not key.startswith(prefix):
-                continue
-            window_id = key[len(prefix) :]
-            if is_backend_window_id(window_id) and window_id not in live_window_ids:
-                dead_entries.append((key, window_id))
-
-        if not dead_entries:
-            return
-
-        changed_state = False
-        for key, window_id in dead_entries:
-            logger.info(
-                "Pruning dead session_map entry: %s (window %s)", key, window_id
-            )
-            del raw[key]
-            log_throttle_reset(f"preserve-primary:{window_id}")
-            if window_store.has_window(window_id):
-                window_store.remove_window(window_id)
-                changed_state = True
-
-        atomic_write_json(config.session_map_file, raw)
-        if changed_state:
-            self._schedule_save()
+                    changed_state = _remove_dead_session_map_entries(
+                        raw, dead_entries, window_store
+                    )
+                    atomic_write_json(map_file, raw)
+                    if changed_state:
+                        self._schedule_save()
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+        except OSError as exc:
+            logger.warning("Failed to lock session_map for pruning: %s", exc)
 
     def register_hookless_session(
         self,

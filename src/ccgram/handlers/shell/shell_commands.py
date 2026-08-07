@@ -34,14 +34,15 @@ from ...llm import get_completer
 from ...llm import CommandResult
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
-from ...multiplexer.window_ops import send_to_window
+from ..telegram_origin import send_telegram_to_window as send_to_window
 from ..callback_data import (
     CB_SHELL_CANCEL,
     CB_SHELL_CONFIRM_DANGER,
     CB_SHELL_EDIT,
     CB_SHELL_RUN,
 )
-from ..callback_helpers import get_thread_id
+from ..callback_helpers import get_thread_id, user_owns_window
+from ..callback_tokens import compact_callback_data, resolve_callback_data
 from ..callback_registry import register
 from ..messaging_pipeline.message_sender import (
     REACT_RUNNING,
@@ -206,12 +207,20 @@ async def handle_shell_message(
     window_id: str,
     text: str,
     message: Message | None = None,
+    chat_id: int | None = None,
 ) -> None:
     """Route shell provider messages: ``!`` prefix = raw, else = NL via LLM."""
     await enqueue_status_update(client, user_id, window_id, None, thread_id)
     lifecycle_strategy.clear_probe_failures(window_id)
 
-    chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+    message_chat_id = message.chat.id if message is not None else None
+    chat_id = (
+        message_chat_id
+        if isinstance(message_chat_id, int)
+        else chat_id
+        if isinstance(chat_id, int)
+        else thread_router.resolve_chat_id(user_id, thread_id)
+    )
     clear_shell_pending(chat_id, thread_id)
     await _ensure_prompt_marker(window_id)
 
@@ -232,7 +241,13 @@ async def handle_shell_message(
         if not raw:
             return
         await _execute_raw_command(
-            client, user_id, thread_id, window_id, raw, message_id=msg_id
+            client,
+            user_id,
+            thread_id,
+            window_id,
+            raw,
+            message_id=msg_id,
+            chat_id=chat_id,
         )
         return
 
@@ -251,7 +266,13 @@ async def handle_shell_message(
     if not completer:
         # No LLM configured — raw mode is intentional
         await _execute_raw_command(
-            client, user_id, thread_id, window_id, text, message_id=msg_id
+            client,
+            user_id,
+            thread_id,
+            window_id,
+            text,
+            message_id=msg_id,
+            chat_id=chat_id,
         )
         return
 
@@ -321,6 +342,7 @@ async def _execute_raw_command(
     window_id: str,
     command: str,
     message_id: int = 0,
+    chat_id: int | None = None,
 ) -> None:
     """Send a raw command to the shell and start output capture.
 
@@ -330,7 +352,9 @@ async def _execute_raw_command(
     """
     await _cancel_stuck_input(window_id)
 
-    success, err_message = await send_to_window(window_id, command, raw=True)
+    success, err_message = await send_to_window(
+        user_id, window_id, thread_id, command, chat_id, raw=True
+    )
     if not success:
         chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         await safe_send(
@@ -408,11 +432,19 @@ def _build_approval_keyboard(
                 [
                     InlineKeyboardButton(
                         "⚠ Confirm Run",
-                        callback_data=f"{CB_SHELL_CONFIRM_DANGER}{window_id}",
+                        callback_data=compact_callback_data(
+                            CB_SHELL_CONFIRM_DANGER,
+                            f"{CB_SHELL_CONFIRM_DANGER}{window_id}",
+                            window_id,
+                        ),
                     ),
                     InlineKeyboardButton(
                         "✕ Cancel",
-                        callback_data=f"{CB_SHELL_CANCEL}{window_id}",
+                        callback_data=compact_callback_data(
+                            CB_SHELL_CANCEL,
+                            f"{CB_SHELL_CANCEL}{window_id}",
+                            window_id,
+                        ),
                     ),
                 ],
             ]
@@ -422,15 +454,21 @@ def _build_approval_keyboard(
             [
                 InlineKeyboardButton(
                     "▶ Run",
-                    callback_data=f"{CB_SHELL_RUN}{window_id}",
+                    callback_data=compact_callback_data(
+                        CB_SHELL_RUN, f"{CB_SHELL_RUN}{window_id}", window_id
+                    ),
                 ),
                 InlineKeyboardButton(
                     "✏ Edit",
-                    callback_data=f"{CB_SHELL_EDIT}{window_id}",
+                    callback_data=compact_callback_data(
+                        CB_SHELL_EDIT, f"{CB_SHELL_EDIT}{window_id}", window_id
+                    ),
                 ),
                 InlineKeyboardButton(
                     "✕ Cancel",
-                    callback_data=f"{CB_SHELL_CANCEL}{window_id}",
+                    callback_data=compact_callback_data(
+                        CB_SHELL_CANCEL, f"{CB_SHELL_CANCEL}{window_id}", window_id
+                    ),
                 ),
             ],
         ]
@@ -449,7 +487,12 @@ async def handle_shell_callback(
         await query.answer("No topic context")
         return
 
-    chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+    callback_chat_id = query.message.chat.id if query.message is not None else None
+    chat_id = (
+        callback_chat_id
+        if isinstance(callback_chat_id, int)
+        else thread_router.resolve_chat_id(user_id, thread_id)
+    )
     pending = _shell_pending.get((chat_id, thread_id))
 
     if data.startswith(CB_SHELL_RUN) or data.startswith(CB_SHELL_CONFIRM_DANGER):
@@ -480,7 +523,7 @@ async def _cb_run(
         return
 
     # Use window from thread binding (authoritative), not callback data
-    window_id = thread_router.get_window_for_thread(user_id, thread_id)
+    window_id = thread_router.get_window_for_thread(user_id, thread_id, chat_id)
     if not window_id:
         clear_shell_pending(chat_id, thread_id)
         await safe_edit(query, "❌ No session bound")
@@ -489,7 +532,13 @@ async def _cb_run(
     clear_shell_pending(chat_id, thread_id)
     await safe_edit(query, f"▶ `{command}`")
     await _execute_raw_command(
-        client, user_id, thread_id, window_id, command, message_id=msg_id
+        client,
+        user_id,
+        thread_id,
+        window_id,
+        command,
+        message_id=msg_id,
+        chat_id=chat_id,
     )
 
 
@@ -539,7 +588,11 @@ async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
     assert query is not None and query.data is not None and user is not None
+    data = resolve_callback_data(query.data, user.id, user_owns_window)
+    if data is None:
+        await query.answer("This button has expired", show_alert=True)
+        return
     thread_id = get_thread_id(update)
     await handle_shell_callback(
-        query, user.id, query.data, PTBTelegramClient(context.bot), thread_id
+        query, user.id, data, PTBTelegramClient(context.bot), thread_id
     )

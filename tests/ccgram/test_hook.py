@@ -15,10 +15,13 @@ from ccgram.hook import (
     _install_hook,
     _is_nested_session,
     _provider_from_pane_tty,
+    _resolve_window_id,
+    _session_map_session_for,
     _uninstall_hook,
     get_installed_events,
     hook_main,
 )
+from ccgram.config import config
 from ccgram.providers.base import UUID_RE
 
 
@@ -684,6 +687,84 @@ class TestClaudeSettingsFile:
         assert _claude_settings_file() == tmp_path / "custom" / "settings.json"
 
 
+class TestSessionMapKeyForLinkedWindow:
+    """A window linked into ccgram's session belongs to more than one tmux
+    session. The hook must key session_map under the session readers resolve
+    against (config.tmux_session_name), not whichever session tmux happens to
+    report for the firing pane, or the binding is written and never found.
+    """
+
+    @staticmethod
+    def _run(stdout: str, returncode: int = 0):
+        def _fake(*_args, **_kwargs):
+            return subprocess.CompletedProcess(
+                args=[], returncode=returncode, stdout=stdout, stderr=""
+            )
+
+        return _fake
+
+    def test_linked_window_keys_under_ccgram_session(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setattr(subprocess, "run", self._run("@12\n@34\n"))
+        assert _session_map_session_for("@34", "agentdeck_foo_1234") == "ccgram"
+
+    def test_resolve_window_id_uses_ccgram_session_for_linked_window(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+
+        def _fake_run(args, **_kwargs):
+            if args[1] == "display-message":
+                return subprocess.CompletedProcess(
+                    args, 0, "agentdeck\t@34\tcode\t/dev/ttys001\t2\n", ""
+                )
+            if args[1] == "list-windows":
+                return subprocess.CompletedProcess(args, 0, "@34\n", "")
+            pytest.fail(f"unexpected command: {args}")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        assert _resolve_window_id("%1") == (
+            "ccgram:@34",
+            "@34",
+            "code",
+            "/dev/ttys001",
+        )
+
+    def test_unlinked_window_keeps_pane_session(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setattr(subprocess, "run", self._run("@12\n"))
+        assert (
+            _session_map_session_for("@99", "agentdeck_foo_1234")
+            == "agentdeck_foo_1234"
+        )
+
+    def test_pane_already_in_ccgram_session_is_unchanged(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: pytest.fail("no tmux probe needed")
+        )
+        assert _session_map_session_for("@12", "ccgram") == "ccgram"
+
+    def test_tmux_failure_falls_back_to_pane_session(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setattr(subprocess, "run", self._run("", returncode=1))
+        assert (
+            _session_map_session_for("@34", "agentdeck_foo_1234")
+            == "agentdeck_foo_1234"
+        )
+
+    def test_tmux_timeout_falls_back_to_pane_session(self, monkeypatch) -> None:
+        def _boom(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd="tmux", timeout=5)
+
+        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setattr(subprocess, "run", _boom)
+        assert (
+            _session_map_session_for("@34", "agentdeck_foo_1234")
+            == "agentdeck_foo_1234"
+        )
+
+
 class TestNestedSessionDetection:
     """Hook fired by a nested claude (e.g. claude-mem observer) must not
     overwrite session_map.json or write events for the bound topic.
@@ -724,6 +805,35 @@ class TestNestedSessionDetection:
         monkeypatch.setattr("ccgram.hook._foreground_pgid_on_tty", lambda *_: 72211)
         monkeypatch.setattr("os.getpid", lambda: 99999)
         assert _is_nested_session("/dev/ttys005") is True
+
+    def test_shell_wrapped_primary_claude_is_not_nested(self, monkeypatch) -> None:
+        """A launcher running `bash -lc "... && claude ..."` keeps the shell as
+        group leader, so the primary claude's PID never equals the foreground
+        PGID. No claude sits above it, so it is still the primary."""
+        snapshot = {
+            14053: (1, 14053, "Ss+", "bash"),
+            14058: (14053, 14053, "S+", "claude"),
+            99999: (14058, 14053, "S+", "python"),
+        }
+        monkeypatch.setattr("ccgram.hook._ps_snapshot", lambda: snapshot)
+        monkeypatch.setattr("ccgram.hook._foreground_pgid_on_tty", lambda *_: 14053)
+        monkeypatch.setattr("os.getpid", lambda: 99999)
+        assert _is_nested_session("/dev/ttys002") is False
+
+    def test_observer_under_shell_wrapped_primary_is_nested(self, monkeypatch) -> None:
+        """The nested case must still be caught when the primary is itself a
+        child of the foreground shell rather than the group leader."""
+        snapshot = {
+            14053: (1, 14053, "Ss+", "bash"),
+            14058: (14053, 14053, "S+", "claude"),
+            14100: (14058, 14053, "S+", "bun"),
+            14200: (14100, 14053, "S+", "claude"),
+            99999: (14200, 14053, "S+", "python"),
+        }
+        monkeypatch.setattr("ccgram.hook._ps_snapshot", lambda: snapshot)
+        monkeypatch.setattr("ccgram.hook._foreground_pgid_on_tty", lambda *_: 14053)
+        monkeypatch.setattr("os.getpid", lambda: 99999)
+        assert _is_nested_session("/dev/ttys002") is True
 
     def test_empty_pane_tty_fails_open(self, monkeypatch) -> None:
         monkeypatch.setattr(

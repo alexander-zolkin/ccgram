@@ -164,7 +164,7 @@ def _tool_call_summary(raw_name: str, arguments: Any) -> str:
     if isinstance(args, str):
         try:
             args = json.loads(args)
-        except json.JSONDecodeError, TypeError:
+        except (json.JSONDecodeError, TypeError):
             args = {}
     if not isinstance(args, dict):
         return format_tool_line(display, "")

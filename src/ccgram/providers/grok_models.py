@@ -146,7 +146,7 @@ def _from_cache_file() -> tuple[str, list[tuple[str, str]]]:
     path = grok_home() / "models_cache.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return "", []
     if not isinstance(data, dict):
         return "", []
