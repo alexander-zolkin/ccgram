@@ -476,6 +476,37 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 - **Why:** one malformed byte in a transcript took down the whole relay for
   that window.
 
+### `resume-summary-dialog` — waking a topic must not compact it
+- **Files:** `handlers/recovery/resume_dialog.py` (new),
+  `handlers/recovery/recovery_banner.py`, `multiplexer/tmux.py`
+- **What:** the launch path exports a sky-high
+  `CLAUDE_CODE_RESUME_TOKEN_THRESHOLD` / `CLAUDE_CODE_RESUME_THRESHOLD_MINUTES`
+  (`:-` keeps an operator-set value authoritative) so Claude Code's resume-size
+  menu never renders; autoresume additionally answers the menu — picking
+  **"Resume full session as-is"** — before forwarding the pending message, and
+  refuses to forward at all while it is still up.
+- **Why:** Claude Code ≥ 2.1.216 blocks any `--resume` of a session older than
+  70 min *and* heavier than 100k tokens with a TUI menu:
+
+  ```
+  This session is 3d 22h old and 124.1k tokens.
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is
+    3. Don't ask me again
+  ```
+
+  Every hibernated ccgram topic clears both thresholds (the idle hibernator
+  only fires after 48h). The menu is not a text field, so autoresume's
+  "type the message, wait 500 ms, press Enter" fed it to a menu that discarded
+  the text and read the Enter as its highlighted default — "Resume from
+  summary", i.e. a **compaction**. Symptoms Alexander reported 2026-08-11: one
+  unrequested compact per wake (transcript shows a bare `/compact` prompt with
+  `trigger: "manual"`), and the message itself never delivered — it had to be
+  sent a second time. Confirmed across 13 of 15 such prompts in
+  `~/.claude/projects/*/*.jsonl`, each one directly after a `SessionStart:resume`
+  hook. Option 2 (not 1) is deliberate: a wake is supposed to *preserve* the
+  topic's context.
+
 ---
 
 ## Marker → files quick map
@@ -510,6 +541,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `private-session` | topics/window_launch_service.py, topics/directory_callbacks.py | 2bcea89 |
 | `status-bubble-persist` | status/status_bubble.py | 2bcea89 |
 | `transcript-decode-guard` | transcript_reader.py | 2bcea89 |
+| `resume-summary-dialog` | recovery/resume_dialog.py (new), recovery/recovery_banner.py, multiplexer/tmux.py | (see git log) |
 
 Verify all present in an install:
 ```bash

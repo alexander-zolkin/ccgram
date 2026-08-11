@@ -58,6 +58,7 @@ from ..user_state import (
     RECOVERY_WINDOW_ID,
 )
 from .recovery_callbacks import _clear_recovery_state
+from .resume_dialog import dismiss_resume_dialog, is_resume_dialog
 from .resume_picker import (
     _build_empty_resume_keyboard,
     _build_resume_picker_keyboard,
@@ -446,6 +447,40 @@ def decide_launch_args(  # CCGRAM-HOTFIX:resume-own-session
     return provider.make_launch_args(use_continue=True), True
 
 
+async def _forward_pending_text(  # CCGRAM-HOTFIX:resume-summary-dialog
+    user_id: int,
+    window_id: str,
+    thread_id: int,
+    pending_text: str,
+    chat_id: int | None,
+) -> bool:
+    """Forward the message that woke the topic, once the pane can accept it.
+
+    A resumed session can come up behind Claude Code's resume-size menu, which
+    is not a text field: it discards typed text and reads the trailing Enter as
+    its highlighted default, "Resume from summary" — an unrequested compaction.
+    Answering it first is what makes ``pending_text`` reach the prompt instead
+    of vanishing (and what stops the wake from compacting the topic).
+
+    Returns False when the menu is still up, so the caller can fall back to the
+    recovery banner rather than feed the message to a menu that will eat it.
+    """
+    await dismiss_resume_dialog(window_id)
+    if is_resume_dialog(await tmux_manager.capture_pane(window_id)):
+        logger.error(
+            "autoresume: resume-size dialog still open; NOT forwarding pending"
+            " text to window %s (it would be swallowed)",
+            window_id,
+        )
+        return False
+    send_ok, send_msg = await send_telegram_to_window(
+        user_id, window_id, thread_id, pending_text, chat_id
+    )
+    if not send_ok:
+        logger.warning("autoresume: forward pending text failed: %s", send_msg)
+    return True
+
+
 async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
     message,
     bot,
@@ -578,12 +613,10 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
         except TelegramError as e:
             logger.debug("autoresume: failed to rename topic: %s", e)
 
-        if pending_text:
-            send_ok, send_msg = await send_telegram_to_window(
-                user_id, created_wid, thread_id, pending_text, _chat_id
-            )
-            if not send_ok:
-                logger.warning("autoresume: forward pending text failed: %s", send_msg)
+        if pending_text and not await _forward_pending_text(
+            user_id, created_wid, thread_id, pending_text, _chat_id
+        ):
+            return False
         logger.info(
             "autoresume: woke thread %d in %s -> window %s",
             thread_id,

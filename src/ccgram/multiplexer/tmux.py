@@ -971,11 +971,26 @@ class TmuxManager:
                 pane = window.active_pane
 
                 # Disable interactive editors — Telegram users can't see
-                # tmux popups or terminal overlays opened by plugins
+                # tmux popups or terminal overlays opened by plugins.
+                #
+                # CCGRAM-HOTFIX:resume-summary-dialog — also defuse Claude
+                # Code's resume-size menu ("Resume from summary / full session
+                # as-is / Don't ask me again"). It renders on any --resume of a
+                # session older than CLAUDE_CODE_RESUME_THRESHOLD_MINUTES (70)
+                # and heavier than CLAUDE_CODE_RESUME_TOKEN_THRESHOLD (100k) —
+                # which every hibernated ccgram topic is. A Telegram user can't
+                # see or answer a TUI menu, and the forwarded message would be
+                # swallowed by it, so raise both thresholds out of reach. `:-`
+                # keeps an operator-set value authoritative.
                 if pane and new_window_id:
                     pane.send_keys(
-                        "export EDITOR=true VISUAL=true",
+                        "export EDITOR=true VISUAL=true"
+                        ' CLAUDE_CODE_RESUME_TOKEN_THRESHOLD="'
+                        '${CLAUDE_CODE_RESUME_TOKEN_THRESHOLD:-999999999}"'
+                        ' CLAUDE_CODE_RESUME_THRESHOLD_MINUTES="'
+                        '${CLAUDE_CODE_RESUME_THRESHOLD_MINUTES:-5256000}"',
                         enter=True,
+                        literal=True,
                     )
 
                 if not (start_agent and launch_command):
