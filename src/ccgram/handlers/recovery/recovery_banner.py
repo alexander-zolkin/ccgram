@@ -570,6 +570,17 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
             logger.warning("autoresume: create_window failed: %s", msg)
             return False
 
+        # CCGRAM-HOTFIX:no-dup-topic-on-autoresume — claim the window BEFORE the
+        # awaits below (rename, wait_for_session_map_entry) so the window watcher
+        # cannot treat it as an orphan and auto-create a duplicate forum topic in
+        # the gap between tmux creation and bind_thread. Without this the race is
+        # real and silent: the new topic gets a HIGHER thread_id, and the
+        # 1-window=1-thread dedup (keep=max(tids)) then evicts the topic the user
+        # actually typed in — their reply surfaces in the fresh junk topic.
+        from ..topics import topic_orchestration
+
+        topic_orchestration.register_pending_creation(created_wid)
+
         # CCGRAM-HOTFIX:skip-synthetic-continue — only --continue makes the harness
         # run a "Continue from where you left off." placeholder round; arm
         # suppression on that branch only (decide_launch_args sets arm_synthetic).
@@ -595,6 +606,8 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
         thread_router.bind_thread(
             user_id, thread_id, created_wid, window_name=keep_name
         )
+        # CCGRAM-HOTFIX:no-dup-topic-on-autoresume — bind is durable, release guard
+        topic_orchestration.clear_pending_creation(created_wid)
         chat = getattr(message, "chat", None)
         if chat is not None and chat.type in ("group", "supergroup"):
             thread_router.set_group_chat_id(user_id, thread_id, chat.id)
