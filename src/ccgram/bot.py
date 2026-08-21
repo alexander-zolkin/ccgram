@@ -214,7 +214,22 @@ def create_bot() -> Application:
         Application.builder()
         .token(config.telegram_bot_token)
         .rate_limiter(AIORateLimiter(max_retries=5))
-        .request(ResilientPollingHTTPXRequest())
+        # CCGRAM-HOTFIX:file-dl-timeouts — PTB's defaults on the main request
+        # object are read/write/connect=5s, pool=1s. All bot traffic on the N100
+        # goes through the local xray proxy (HTTPS_PROXY=127.0.0.1:20171), where
+        # a cold connection through the VPN exit occasionally needs 5-6s. That
+        # blew the 5s read_timeout on getFile/download_to_drive and surfaced as
+        # "Failed to save file." on every photo/document. Text survived because
+        # AIORateLimiter retries Bot API calls; retrieve() has no such retry.
+        .request(
+            ResilientPollingHTTPXRequest(
+                connect_timeout=20.0,
+                read_timeout=60.0,
+                write_timeout=60.0,
+                media_write_timeout=120.0,
+                pool_timeout=5.0,
+            )
+        )
         .get_updates_request(
             ResilientPollingHTTPXRequest(
                 connection_pool_size=1,

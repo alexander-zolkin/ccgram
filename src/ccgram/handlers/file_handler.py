@@ -12,6 +12,7 @@ Key handlers:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+import asyncio
 import os
 import structlog
 import re
@@ -20,7 +21,7 @@ from pathlib import Path
 
 from telegram import Message, Update
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError, TimedOut
 from ..config import config
 from ..telegram_client import PTBTelegramClient
 from ..window_query import view_window
@@ -161,8 +162,7 @@ async def _download_and_save(
             return None
         dest = _unique_dest(dest)
         filename = dest.name
-        file = await message.get_bot().get_file(file_id)
-        await file.download_to_drive(str(dest))
+        await _fetch_to_dest(message, file_id, dest)
         # Post-download size check (file_size can be None from Telegram API)
         actual_size = dest.stat().st_size
         if actual_size > _MAX_FILE_SIZE:
@@ -179,6 +179,42 @@ async def _download_and_save(
         return None
 
     return filename
+
+
+# CCGRAM-HOTFIX:file-dl-timeouts — retry the transport half of an upload.
+# A TimedOut on the shared request object makes ResilientPollingHTTPXRequest
+# rebuild the whole httpx client, so the next attempt starts on a cold pool and
+# is itself likely to stall through the VPN proxy. Without a retry that turns a
+# single slow connect into a run of "Failed to save file." replies.
+_DL_ATTEMPTS = 3
+_DL_BACKOFF_S = (1.0, 3.0)
+
+
+async def _fetch_to_dest(message: Message, file_id: str, dest: Path) -> None:
+    """get_file + download to `dest`, retrying transient transport failures.
+
+    Re-raises the last error once the attempts are spent; the caller's
+    ``except (OSError, TelegramError)`` turns that into the user-facing reply.
+    """
+    for attempt in range(1, _DL_ATTEMPTS + 1):
+        try:
+            file = await message.get_bot().get_file(file_id)
+            await file.download_to_drive(str(dest))
+            return
+        except (TimedOut, NetworkError) as e:
+            # Drop whatever partial bytes landed before retrying into the same path.
+            dest.unlink(missing_ok=True)
+            if attempt == _DL_ATTEMPTS:
+                raise
+            delay = _DL_BACKOFF_S[attempt - 1]
+            logger.warning(
+                "Upload transport failed (attempt %d/%d), retrying in %.0fs: %s",
+                attempt,
+                _DL_ATTEMPTS,
+                delay,
+                e,
+            )
+            await asyncio.sleep(delay)
 
 
 def _pending_uploads_dir(thread_id: int) -> Path:

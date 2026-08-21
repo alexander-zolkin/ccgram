@@ -6,7 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from telegram.error import TimedOut
+
 from ccgram.handlers.file_handler import (
+    _fetch_to_dest,
     _generate_photo_filename,
     _sanitize_caption,
     _sanitize_filename,
@@ -210,3 +213,73 @@ class TestUnboundFileFirst:
         mock_download.assert_not_called()
         mock_reply.assert_awaited_once()
         assert "No session bound" in mock_reply.await_args.args[1]
+
+
+class TestFetchToDest:
+    """CCGRAM-HOTFIX:file-dl-timeouts — a stalled connection through the VPN
+    proxy used to fail the upload outright; the transport half now retries."""
+
+    @staticmethod
+    def _bot(get_file: AsyncMock) -> MagicMock:
+        message = MagicMock()
+        message.get_bot.return_value.get_file = get_file
+        return message
+
+    @patch(f"{_FH}.asyncio.sleep", new_callable=AsyncMock)
+    async def test_retries_then_succeeds(
+        self, mock_sleep: AsyncMock, tmp_path: Path
+    ) -> None:
+        download = AsyncMock(side_effect=[TimedOut(), None])
+        get_file = AsyncMock(return_value=MagicMock(download_to_drive=download))
+
+        await _fetch_to_dest(self._bot(get_file), "fid", tmp_path / "f.jpg")
+
+        assert get_file.await_count == 2
+        assert download.await_count == 2
+        mock_sleep.assert_awaited_once_with(1.0)
+
+    @patch(f"{_FH}.asyncio.sleep", new_callable=AsyncMock)
+    async def test_reraises_after_last_attempt(
+        self, mock_sleep: AsyncMock, tmp_path: Path
+    ) -> None:
+        download = AsyncMock(side_effect=TimedOut())
+        get_file = AsyncMock(return_value=MagicMock(download_to_drive=download))
+
+        with pytest.raises(TimedOut):
+            await _fetch_to_dest(self._bot(get_file), "fid", tmp_path / "f.jpg")
+
+        assert download.await_count == 3
+        assert [c.args[0] for c in mock_sleep.await_args_list] == [1.0, 3.0]
+
+    @patch(f"{_FH}.asyncio.sleep", new_callable=AsyncMock)
+    async def test_discards_partial_file_between_attempts(
+        self, _mock_sleep: AsyncMock, tmp_path: Path
+    ) -> None:
+        dest = tmp_path / "f.jpg"
+        attempts = 0
+
+        async def download_to_drive(path: str) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                # First attempt writes a partial body, then the connection stalls.
+                Path(path).write_bytes(b"partial")
+                raise TimedOut()
+
+        get_file = AsyncMock(
+            return_value=MagicMock(download_to_drive=AsyncMock(wraps=download_to_drive))
+        )
+
+        await _fetch_to_dest(self._bot(get_file), "fid", dest)
+
+        assert attempts == 2
+        # The partial body from the failed attempt must not survive.
+        assert not dest.exists()
+
+    async def test_no_retry_on_success(self, tmp_path: Path) -> None:
+        download = AsyncMock(return_value=None)
+        get_file = AsyncMock(return_value=MagicMock(download_to_drive=download))
+
+        await _fetch_to_dest(self._bot(get_file), "fid", tmp_path / "f.jpg")
+
+        assert get_file.await_count == 1

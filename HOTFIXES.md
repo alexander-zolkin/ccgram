@@ -507,6 +507,49 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   hook. Option 2 (not 1) is deliberate: a wake is supposed to *preserve* the
   topic's context.
 
+
+### `CCGRAM-HOTFIX:file-dl-timeouts`
+
+**Files:** `bot.py`, `handlers/file_handler.py`
+
+Every photo/document upload answered **"❌ Failed to save file."** (Alexander,
+2026-08-21). Not a permissions or disk problem — `daemon.log` shows
+`Failed to save photo: Timed out`, each one paired with a
+`Reset Telegram polling HTTP client after TimedOut` on the same second (one
+event: `ResilientPollingHTTPXRequest.do_request` logs the reset, then re-raises
+into `_download_and_save`'s `except (OSError, TelegramError)`).
+
+Two causes, both fixed here:
+
+1. **5-second timeouts on the main request object.** `create_bot()` built
+   `.request(ResilientPollingHTTPXRequest())` with no arguments, so PTB 22.8's
+   defaults applied — `read`/`write`/`connect = 5.0s`, `pool = 1.0s`
+   (`telegram/request/_httpxrequest.py`). `getFile` and
+   `File.download_to_drive()` ride that same object and pass no override, so a
+   file upload had a 5s budget. All N100 bot traffic goes through the local
+   xray proxy (`HTTPS_PROXY=http://127.0.0.1:20171`, v2rayA/xray pid 1628) out
+   through the VPN exit, where a cold connection intermittently takes 5-6s —
+   measured 5.78s on 1 of 35 sampled `api.telegram.org` calls, the rest
+   0.28-0.40s. Text kept working because `AIORateLimiter(max_retries=5)` retries
+   Bot API calls; `BaseRequest.retrieve()` (the download path) has no such retry.
+   Now: `connect=20s, read=60s, write=60s, media_write=120s, pool=5s`.
+   httpx read timeouts are per-chunk, so a large slow file still streams fine —
+   only a genuine 60s stall trips it.
+
+2. **The reset amplified it into a run of failures.** On `TimedOut`,
+   `_reset_client()` rebuilds the whole httpx client and drops the pool, so the
+   next attempt reconnects cold through the proxy and is itself likely to stall.
+   That is why Alexander saw four consecutive failures (15:16, 15:18, 15:21,
+   15:22 UTC), not one. `_fetch_to_dest()` now wraps `get_file` +
+   `download_to_drive` in 3 attempts with a 1s/3s backoff, unlinking any partial
+   body between tries so a retry can't be poisoned by a half-written file. The
+   final failure still re-raises, so the user-facing error path is unchanged.
+
+> Upstream deliberately routed **all** bot traffic through
+> `ResilientPollingHTTPXRequest` (`b85f25a`, upstream #49) — keep that. Only the
+> timeout arguments are ours. If a merge drops them, uploads silently go back to
+> a 5s budget.
+
 ---
 
 ## Marker → files quick map
@@ -542,6 +585,7 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 | `status-bubble-persist` | status/status_bubble.py | 2bcea89 |
 | `transcript-decode-guard` | transcript_reader.py | 2bcea89 |
 | `resume-summary-dialog` | recovery/resume_dialog.py (new), recovery/recovery_banner.py, multiplexer/tmux.py | (see git log) |
+| `file-dl-timeouts` | bot.py, handlers/file_handler.py | (see git log) |
 
 Verify all present in an install:
 ```bash
