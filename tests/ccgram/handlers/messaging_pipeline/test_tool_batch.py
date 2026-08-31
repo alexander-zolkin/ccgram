@@ -3,6 +3,7 @@ import inspect
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telegram.error import TelegramError
 
 from ccgram.handlers.messaging_pipeline.message_task import ContentTask
 from ccgram.handlers.messaging_pipeline.tool_batch import (
@@ -14,12 +15,16 @@ from ccgram.handlers.messaging_pipeline.tool_batch import (
     _format_mixed_batch_lines,
     _send_or_edit_batch,
     flush_batch,
-    flush_if_active,
     has_active_batch,
     has_ephemeral_active_batch,
     process_tool_event,
+    ToolEventOutcome,
 )
-from ccgram.telegram_draft import mark_draft_unavailable, reset_draft_state
+from ccgram.telegram_draft import (
+    DRAFT_LEGACY,
+    mark_draft_unavailable,
+    reset_draft_state,
+)
 
 
 class TestHasEphemeralActiveBatch:
@@ -63,21 +68,6 @@ class TestHasEphemeralActiveBatch:
         _active_batches[(1, 10)] = ToolBatch(window_id="@0", thread_id=10)
         assert has_active_batch(1, 10) is True
         assert has_ephemeral_active_batch(1, 10) is False
-
-
-class TestProcessToolEventSignature:
-    def test_accepts_content_task_and_returns_optional(self) -> None:
-        sig = inspect.signature(process_tool_event)
-        params = list(sig.parameters.values())
-        assert params[2].name == "task"
-        assert params[2].annotation == "ContentTask"
-        assert sig.return_annotation == "ContentTask | None"
-
-    def test_flush_if_active_exists_and_accepts_content_task(self) -> None:
-        sig = inspect.signature(flush_if_active)
-        params = list(sig.parameters.values())
-        assert params[2].name == "task"
-        assert params[2].annotation == "ContentTask"
 
 
 class TestNoImportFromMessageQueue:
@@ -159,7 +149,29 @@ class TestDraftStreamIntegration:
 
         bot.send_message.assert_awaited_once()
         assert batch.draft is not None
+        assert batch.draft.mode == DRAFT_LEGACY
         assert batch.telegram_msg_id == 77
+
+    async def test_failed_initial_draft_is_not_acknowledged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "ccgram.handlers.status.status_bubble.clear_status_message",
+            AsyncMock(return_value=None),
+        )
+        bot = self._make_bot()
+        bot.send_message.side_effect = TelegramError("temporary")
+        task = ContentTask(
+            window_id="@0",
+            parts=("Read foo.py",),
+            content_type="tool_use",
+            tool_use_id="t1",
+            thread_id=10,
+        )
+
+        result = await process_tool_event(bot, user_id=1, task=task)
+
+        assert result.outcome is ToolEventOutcome.FAILED
 
     async def test_noop_re_render_does_not_re_edit(
         self, monkeypatch: pytest.MonkeyPatch
@@ -212,6 +224,28 @@ class TestDraftStreamIntegration:
         bot.send_message.assert_awaited_once()
         bot.edit_message_text.assert_awaited_once()
 
+    async def test_failed_legacy_edit_is_not_acknowledged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "ccgram.handlers.status.status_bubble.clear_status_message",
+            AsyncMock(return_value=None),
+        )
+        bot = self._make_bot(send_id=77)
+        batch = ToolBatch(window_id="@0", thread_id=10)
+        batch.entries.append(
+            ToolBatchEntry(tool_use_id="t1", tool_use_text="Read foo.py")
+        )
+        assert await _send_or_edit_batch(bot, 1, batch, 42, 10, 10) is True
+        previous_text = batch.last_sent_text
+        batch.entries.append(ToolBatchEntry(tool_use_id="t2", tool_use_text="Bash ls"))
+        bot.edit_message_text.side_effect = TelegramError("edit failed")
+
+        with pytest.raises(TelegramError, match="edit failed"):
+            await _send_or_edit_batch(bot, 1, batch, 42, 10, 10)
+
+        assert batch.last_sent_text == previous_text
+
     async def test_flush_batch_finalizes_active_draft(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -240,6 +274,94 @@ class TestDraftStreamIntegration:
         await flush_batch(bot, user_id=1, thread_id_or_0=10)
         bot.send_message.assert_not_called()
         bot.edit_message_text.assert_not_called()
+
+
+class TestNativeDraftIntegration:
+    async def test_tool_batch_forces_persistent_message_when_drafts_available(
+        self, monkeypatch
+    ) -> None:
+        from ccgram.telegram_draft import reset_draft_state
+
+        reset_draft_state()
+        monkeypatch.setattr(
+            "ccgram.handlers.status.status_bubble.clear_status_message",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "ccgram.handlers.messaging_pipeline.tool_batch._rate_limit_chat",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "ccgram.handlers.messaging_pipeline.tool_batch.get_batch_mode",
+            lambda _wid: "batched",
+        )
+        monkeypatch.setattr(
+            "ccgram.handlers.messaging_pipeline.tool_batch.is_ephemeral_tools",
+            lambda _wid: False,
+        )
+        monkeypatch.setattr(
+            "ccgram.handlers.messaging_pipeline.tool_batch.thread_router",
+            MagicMock(resolve_chat_id=MagicMock(return_value=42)),
+        )
+
+        bot = AsyncMock()
+        bot.send_message_draft = AsyncMock(return_value=True)
+        sent = MagicMock(message_id=77)
+        bot.send_message.return_value = sent
+        batch = ToolBatch(window_id="@0", thread_id=10)
+        batch.entries.append(
+            ToolBatchEntry(tool_use_id="t1", tool_use_text="Read foo.py")
+        )
+        _active_batches[(1, 10)] = batch
+
+        delivered = await _send_or_edit_batch(bot, 1, batch, 42, 10, 10)
+
+        assert delivered is True
+        assert batch.draft is not None
+        assert batch.draft.mode == DRAFT_LEGACY
+        assert batch.telegram_msg_id == 77
+        assert batch.last_sent_text == "Read foo.py"
+        bot.send_message_draft.assert_not_awaited()
+        bot.send_message.assert_awaited_once_with(
+            chat_id=42, text="Read foo.py", message_thread_id=10
+        )
+
+    async def test_failed_persistent_send_can_be_retried(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "ccgram.handlers.messaging_pipeline.tool_batch._rate_limit_chat",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "ccgram.handlers.messaging_pipeline.tool_batch.thread_router",
+            MagicMock(resolve_chat_id=MagicMock(return_value=42)),
+        )
+        monkeypatch.setattr(
+            "ccgram.handlers.messaging_pipeline.tool_batch.get_batch_mode",
+            lambda _wid: "batched",
+        )
+        monkeypatch.setattr(
+            "ccgram.handlers.messaging_pipeline.tool_batch.is_ephemeral_tools",
+            lambda _wid: False,
+        )
+        bot = AsyncMock()
+        bot.send_message_draft = AsyncMock(return_value=True)
+        bot.send_message.side_effect = [
+            TelegramError("temporary"),
+            MagicMock(message_id=9),
+        ]
+        batch = ToolBatch(window_id="@0", thread_id=10)
+        batch.entries.append(
+            ToolBatchEntry(tool_use_id="t1", tool_use_text="Read foo.py")
+        )
+        _active_batches[(1, 10)] = batch
+
+        first = await _send_or_edit_batch(bot, 1, batch, 42, 10, 10)
+        second = await _send_or_edit_batch(bot, 1, batch, 42, 10, 10)
+
+        assert first is False
+        assert second is True
+        assert batch.telegram_msg_id == 9
+        assert _active_batches[(1, 10)] is batch
 
 
 class TestDedupConsecutiveEntries:

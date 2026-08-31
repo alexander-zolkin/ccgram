@@ -271,19 +271,6 @@ class TestBatchDataStructures:
         assert batch.telegram_msg_id is None
         assert batch.total_length == 0
 
-    def test_batch_entry_accumulation(self) -> None:
-        batch = ToolBatch(window_id="@0", thread_id=0)
-        for i in range(5):
-            entry = ToolBatchEntry(f"t{i}", f"Read file{i}.py")
-            batch.entries.append(entry)
-            batch.total_length += len(entry.tool_use_text)
-        assert len(batch.entries) == 5
-        assert batch.total_length == sum(len(f"Read file{i}.py") for i in range(5))
-
-    def test_constants(self) -> None:
-        assert BATCH_MAX_ENTRIES == 9
-        assert BATCH_MAX_LENGTH == 2800
-
 
 class TestWindowStateBatchMode:
     def test_default_batch_mode(self) -> None:
@@ -501,7 +488,7 @@ class TestProcessBatchTask:
                 bot, 1, _make_tool_result(tool_use_id="tu_unknown")
             )
         mock_flush.assert_awaited_once()
-        assert followup is not None
+        assert followup.followup is not None
 
     async def test_different_window_flushes_old_batch(self, batch_env) -> None:
         bot, _, _ = batch_env
@@ -618,45 +605,6 @@ class TestHandleContentTask:
         mock_flush.assert_awaited_once_with(bot, 1, task)
         mock_process.assert_awaited_once()
 
-    @patch(
-        "ccgram.handlers.messaging_pipeline.message_queue.flush_if_active",
-        new_callable=AsyncMock,
-    )
-    @patch(
-        "ccgram.handlers.messaging_pipeline.message_queue._process_content_task",
-        new_callable=AsyncMock,
-    )
-    async def test_thinking_flushes_active_batch(
-        self, mock_process, mock_flush
-    ) -> None:
-        bot = AsyncMock()
-        queue: asyncio.Queue[MessageTask] = asyncio.Queue()
-        lock = asyncio.Lock()
-        task = ContentTask(
-            content_type="text",
-            window_id="@0",
-            parts=("Thinking...",),
-            thread_id=5,
-        )
-        await _handle_content_task(bot, 1, task, queue, lock)
-        mock_flush.assert_awaited_once_with(bot, 1, task)
-
-    @patch(
-        "ccgram.handlers.messaging_pipeline.message_queue._process_content_task",
-        new_callable=AsyncMock,
-    )
-    async def test_no_batch_no_flush(self, mock_process) -> None:
-        bot = AsyncMock()
-        queue: asyncio.Queue[MessageTask] = asyncio.Queue()
-        lock = asyncio.Lock()
-        task = ContentTask(
-            content_type="text",
-            window_id="@0",
-            parts=("Hello",),
-        )
-        await _handle_content_task(bot, 1, task, queue, lock)
-        mock_process.assert_awaited_once()
-
 
 class TestFlushBatch:
     @pytest.fixture(autouse=True)
@@ -760,6 +708,20 @@ class TestFlushBatch:
 
 
 class TestBatchIsolation:
+    async def test_different_users_same_thread_separate_batches(
+        self, batch_env
+    ) -> None:
+        bot, _, _ = batch_env
+        await process_tool_event(
+            bot, 1, _make_tool_use(thread_id=10, tool_use_id="tu1")
+        )
+        await process_tool_event(
+            bot, 2, _make_tool_use(thread_id=10, tool_use_id="tu2")
+        )
+
+        assert _active_batches[(1, 10)].entries[0].tool_use_id == "tu1"
+        assert _active_batches[(2, 10)].entries[0].tool_use_id == "tu2"
+
     async def test_different_threads_separate_batches(self, batch_env) -> None:
         bot, _, _ = batch_env
         await process_tool_event(
@@ -821,14 +783,14 @@ class TestToolResultNotDropped:
         bot, _, _ = batch_env
         task = _make_tool_result(tool_use_id="tu1", text="result text")
         result = await process_tool_event(bot, 1, task)
-        assert result == task
+        assert result.followup == task
 
     async def test_tool_result_none_tool_use_id_falls_through(self, batch_env) -> None:
         bot, _, _ = batch_env
         await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
         task = _make_tool_result(tool_use_id=None, text="result text")
         result = await process_tool_event(bot, 1, task)
-        assert result == task
+        assert result.followup == task
         assert (1, 10) in _active_batches
         assert len(_active_batches[(1, 10)].entries) == 1
 
@@ -913,38 +875,7 @@ class TestDefensiveElseBranch:
             thread_id=10,
         )
         result = await process_tool_event(bot, 1, task)
-        assert result == task
-
-
-class TestDifferentUsersIsolation:
-    async def test_different_users_same_thread_separate_batches(
-        self, batch_env
-    ) -> None:
-        bot, _, _ = batch_env
-        await process_tool_event(
-            bot, 1, _make_tool_use(thread_id=10, tool_use_id="tu1")
-        )
-        await process_tool_event(
-            bot, 2, _make_tool_use(thread_id=10, tool_use_id="tu2")
-        )
-
-        assert (1, 10) in _active_batches
-        assert (2, 10) in _active_batches
-        assert _active_batches[(1, 10)].entries[0].tool_use_id == "tu1"
-        assert _active_batches[(2, 10)].entries[0].tool_use_id == "tu2"
-
-
-class TestBatchResultTruncation:
-    def test_result_truncated_to_200_chars(self):
-        long_text = "x" * 300
-        entry = ToolBatchEntry("t1", "Bash cmd")
-        entry.tool_result_text = long_text.split("\n", 1)[0][:200]
-        assert len(entry.tool_result_text) == 200
-
-    def test_multiline_result_uses_first_line(self):
-        result_text = "line one\nline two\nline three"
-        first_line = result_text.split("\n", 1)[0][:200]
-        assert first_line == "line one"
+        assert result.followup == task
 
 
 class TestDispatcherSuppressesStatusOnEphemeralBatch:

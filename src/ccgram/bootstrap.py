@@ -32,17 +32,24 @@ from .handlers.hook_events import dispatch_hook_event
 from .handlers.messaging_pipeline.message_queue import shutdown_workers
 from .handlers.messaging_pipeline.message_routing import handle_new_message
 from .handlers.polling.polling_coordinator import status_poll_loop
+from .handlers.polling.polling_state import terminal_poll_state
 from .handlers.shell import register_approval_callback, show_command_approval
+from .handlers.status.topic_emoji import mark_awaiting_first_paint
 from .handlers.topics.topic_orchestration import (
     adopt_unbound_windows as _adopt_unbound_windows,
 )
 from .handlers.topics.topic_orchestration import (
     handle_new_window as _handle_new_window,
 )
+from .handlers.topics.topic_orchestration import (
+    is_pending_creation as _is_pending_creation,
+)
+from .session_map import register_in_flight_window_predicate
 from .multiplexer import get_multiplexer, install_multiplexer, multiplexer
 from .providers import get_provider
 from .session import session_manager
 from .telegram_client import PTBTelegramClient
+from .thread_router import thread_router
 from .session_monitor import (
     NewMessage,
     NewWindowEvent,
@@ -159,9 +166,9 @@ def wire_multiplexer() -> None:
 async def ensure_multiplexer_session() -> None:
     """Ensure the active backend's session/server is reachable before polling.
 
-    tmux creates/finds the session; herdr verifies the socket is alive and the
-    pinned protocol version matches (raising on mismatch). Runs once at startup
-    via the seam so a misconfigured backend fails loudly here rather than later
+    tmux creates/finds the session; herdr verifies the socket is alive and
+    warns on protocol uncertainty without gating startup. Runs once at startup
+    via the seam so an unreachable backend fails loudly here rather than later
     as silent ``None`` returns in the polling loop.
 
     An unreachable backend is fatal but not a bug: log one actionable line and
@@ -194,6 +201,7 @@ def wire_runtime_callbacks() -> None:
         return
 
     register_approval_callback(show_command_approval)
+    register_in_flight_window_predicate(_is_pending_creation)
     _callbacks_wired = True
 
 
@@ -223,6 +231,41 @@ async def start_session_monitor(application: Application) -> SessionMonitor:
 
     monitor.set_message_callback(message_callback)
 
+    # Keep queue ownership at the bootstrap boundary: the monitor owns durable
+    # watermarks while the queue owns source-scoped task retirement and notice I/O.
+    # Lazy: messaging pipeline imports status handlers during queue dispatch.
+    from .handlers.messaging_pipeline.message_queue import purge_source_tasks
+
+    # Lazy: message routing imports monitor NewMessage for transcript dispatch.
+    from .handlers.messaging_pipeline.message_routing import enqueue_backlog_skip_notice
+
+    async def purge_backlog(intent) -> int | None:
+        return await purge_source_tasks(
+            intent.user_id,
+            intent.window_id,
+            intent.thread_id,
+            intent.session_id,
+            intent.snapshot_offset,
+            intent.chat_id,
+        )
+
+    async def send_skip_notice(intent) -> None:
+        await enqueue_backlog_skip_notice(client, intent)
+
+    def validate_skip(intent) -> bool:
+        return (
+            thread_router.resolve_window_for_thread(
+                intent.user_id, intent.thread_id, intent.chat_id
+            )
+            == intent.window_id
+        )
+
+    monitor.set_skip_callbacks(
+        purge=purge_backlog,
+        notice=send_skip_notice,
+        validate=validate_skip,
+    )
+
     async def new_window_callback(event: NewWindowEvent) -> None:
         await _handle_new_window(event, client)
 
@@ -239,10 +282,31 @@ async def start_session_monitor(application: Application) -> SessionMonitor:
     return monitor
 
 
+def _settle_preexisting_windows() -> None:
+    """Seed already-bound windows for an immediate, settled first poll."""
+    for (
+        user_id,
+        chat_id,
+        thread_id,
+        window_id,
+    ) in thread_router.iter_thread_bindings_with_chat():
+        if not window_id:
+            continue
+        terminal_poll_state.mark_seen_status(window_id)
+        resolved_chat_id = (
+            chat_id
+            if chat_id is not None
+            else thread_router.resolve_chat_id(user_id, thread_id)
+        )
+        if resolved_chat_id:
+            mark_awaiting_first_paint(resolved_chat_id, thread_id)
+
+
 def start_status_polling(application: Application) -> asyncio.Task[None]:
     """Spawn the status-polling background task."""
     global _status_poll_task
 
+    _settle_preexisting_windows()
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     _status_poll_task.add_done_callback(task_done_callback)
     logger.info("Status polling task started")
@@ -296,8 +360,14 @@ async def bootstrap_application(application: Application) -> None:
     await start_miniapp_if_enabled()
 
 
-async def shutdown_runtime() -> None:
-    """Run the post_shutdown teardown sequence."""
+async def stop_delivery_runtime() -> None:
+    """Phase 1 (post_stop): stop producers and drain pending deliveries.
+
+    Runs while PTB's HTTP transport is still alive (post_stop precedes
+    Application.shutdown, which tears down HTTPXRequest), so the queue drain
+    can actually deliver parsed-but-unsent messages (TASK-5/6). Must run
+    before any consumer that could enqueue new work is gone.
+    """
     global _status_poll_task, session_monitor
 
     if _status_poll_task is not None:
@@ -307,8 +377,9 @@ async def shutdown_runtime() -> None:
         _status_poll_task = None
         logger.info("Status polling stopped")
 
-    if session_monitor is not None:
-        session_monitor.stop()
+    monitor_to_commit = session_monitor
+    if monitor_to_commit is not None:
+        await monitor_to_commit.stop_and_wait()
         logger.info("Session monitor stopped")
         session_monitor = None
     clear_active_monitor()
@@ -318,17 +389,24 @@ async def shutdown_runtime() -> None:
 
     event_stream = get_active_event_stream()
     if event_stream is not None:
-        event_stream.stop()
+        await event_stream.stop_and_wait()
         set_active_event_stream(None)
         logger.info("Event-stream consumer stopped")
 
     await shutdown_workers()
+    if monitor_to_commit is not None:
+        # A successful bounded drain can now advance receipts; cancellation or
+        # terminal delivery failures leave them unacknowledged for replay.
+        monitor_to_commit.commit_delivered_watermarks()
 
     # Lazy: tracker is only needed to discard ephemeral input correlations at shutdown.
     from .handlers.telegram_origin import clear_pending_telegram_injections
 
     clear_pending_telegram_injections()
 
+
+async def shutdown_runtime() -> None:
+    """Phase 2 (post_shutdown): teardown that needs no HTTP transport."""
     # Lazy: main → bot → bootstrap cycle (same as start path).
     from .main import stop_miniapp_if_enabled
 
@@ -352,6 +430,17 @@ def reset_for_testing() -> None:
     from .handlers.shell import shell_capture
 
     shell_capture._reset_approval_callback_for_testing()
+
+    # Lazy: same test-only reset hook, kept out of the production import path.
+    from .session_map import _reset_in_flight_window_predicate_for_testing
+
+    _reset_in_flight_window_predicate_for_testing()
+
+    # Lazy: window-id supersessions are per-run state; a redirect recorded by
+    # one test must not answer a lookup in the next.
+    from .window_resolver import reset_alias_redirects
+
+    reset_alias_redirects()
 
     _callbacks_wired = False
     session_monitor = None

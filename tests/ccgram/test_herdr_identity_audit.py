@@ -8,16 +8,34 @@ ROOT = Path(__file__).resolve().parents[2]
 HERDR = ROOT / "src/ccgram/multiplexer/herdr.py"
 
 
+# Layout/volatile record fields must never feed a session composite.
+FORBIDDEN = ("focused", "title", "cwd", "directory", "screen", "layout")
+
+
 def test_one_canonical_digest_owner_and_no_layout_identity() -> None:
     source = HERDR.read_text()
     assert source.count("def herdr_session_target_id(") == 1
     assert "def canonical_session_bytes(" in source
     # Identity comes from the complete agent_session composite, not layout data.
+    # The region stops at ``_parse_live_record``: that is the record assembler,
+    # which legitimately carries locators and cwd alongside the identity it
+    # derives. Its identity derivation is guarded by the next test instead.
     identity_section = source[
-        source.index("def _session_composite") : source.index("class HerdrManager")
+        source.index("def _session_composite") : source.index("def _parse_live_record")
     ]
-    for forbidden in ("focused", "title", "cwd", "directory", "screen", "layout"):
+    for forbidden in FORBIDDEN:
         assert forbidden not in identity_section
+
+
+def test_record_assembler_rejects_sessionless_identity() -> None:
+    """``_parse_live_record`` never hashes a volatile locator as identity."""
+    source = HERDR.read_text()
+    section = source[
+        source.index("def _parse_live_record") : source.index("class HerdrManager")
+    ]
+    assert "if composite is None:" in section
+    assert "return None" in section
+    assert "HerdrSessionComposite(" not in section
 
 
 def test_persisted_target_predicate_uses_the_shared_exact_validator() -> None:

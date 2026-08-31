@@ -15,13 +15,15 @@ Key components:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 
 import structlog
 
 from ...telegram_client import TelegramClient, unwrap_bot
-from ...telegram_draft import DraftStream
+from ...telegram_draft import DRAFT_UNSET, DraftStream
 from ...thread_router import thread_router
 from ...topic_state_registry import topic_state
 from ...window_state_ports.tool_state import get_batch_mode, is_ephemeral_tools
@@ -54,6 +56,22 @@ class ToolBatch:
     total_length: int = 0
     draft: DraftStream | None = None
     last_sent_text: str | None = None
+
+
+class ToolEventOutcome(Enum):
+    """Terminal delivery outcome reported by the batching boundary."""
+
+    DELIVERED = "delivered"
+    INTENTIONALLY_DROPPED = "intentionally_dropped"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolEventResult:
+    """Batch routing result with an explicit delivery acknowledgement."""
+
+    followup: ContentTask | None = None
+    outcome: ToolEventOutcome = ToolEventOutcome.DELIVERED
 
 
 # Active tool batches: (user_id, thread_id_or_0) -> ToolBatch
@@ -320,8 +338,8 @@ async def _send_or_edit_batch(
     chat_id: int,
     raw_thread_id: int | None,
     thread_id_or_0: int,
-) -> None:
-    """Send a new batch message or replace the existing draft text."""
+) -> bool:
+    """Send or edit a batch and report whether Telegram accepted its content."""
     # Lazy: status_bubble is registered as a callback target via the
     # registry; importing it at top forms tool_batch ↔ status_bubble
     # through the messaging_pipeline subpackage's __init__ chain.
@@ -338,8 +356,10 @@ async def _send_or_edit_batch(
     # screen. A re-edit with the same text would trigger Telegram's "Message
     # is not modified" error, and the legacy fallback path used to strip
     # entities to "succeed", destroying the formatting.
-    if batch.telegram_msg_id is not None and batch.last_sent_text == batch_text:
-        return
+    if batch.last_sent_text == batch_text and (
+        batch.telegram_msg_id is not None or batch.draft is not None
+    ):
+        return True
 
     if is_ephemeral_tools(batch.window_id):
         # Lazy: message_sender ↔ tool_batch cycle through messaging_pipeline/__init__
@@ -351,34 +371,43 @@ async def _send_or_edit_batch(
             msg = await safe_send(
                 client, chat_id, batch_text, message_thread_id=raw_thread_id
             )
-            if msg is not None:
-                batch.telegram_msg_id = msg.message_id
-                batch.last_sent_text = batch_text
-        else:
-            success = await edit_with_fallback(
-                client, chat_id, batch.telegram_msg_id, batch_text
-            )
-            if success:
-                batch.last_sent_text = batch_text
-        return
+            if msg is None:
+                return False
+            batch.telegram_msg_id = msg.message_id
+            batch.last_sent_text = batch_text
+            return True
+        success = await edit_with_fallback(
+            client, chat_id, batch.telegram_msg_id, batch_text
+        )
+        if success:
+            batch.last_sent_text = batch_text
+        return success
 
     if batch.draft is None:
         await clear_status_message(client, user_id, thread_id_or_0)
         await _rate_limit_chat(chat_id)
+        # Tool-batch transcript work may advance a delivered watermark. A
+        # streaming draft is ephemeral until finalization, so it cannot
+        # acknowledge this task safely. Keep tool batches on persistent
+        # messages; other message paths may still use streaming drafts.
         batch.draft = DraftStream(
             unwrap_bot(client),
             chat_id,
             message_thread_id=raw_thread_id,
+            force_legacy=True,
         )
         msg_id = await batch.draft.start(batch_text)
         if msg_id is not None:
             batch.telegram_msg_id = msg_id
             batch.last_sent_text = batch_text
-        else:
-            batch.draft = None
-    else:
-        await batch.draft.replace(batch_text)
+            return True
+        batch.draft = None
+        return False
+
+    delivered = await batch.draft.replace_confirmed(batch_text)
+    if delivered:
         batch.last_sent_text = batch_text
+    return delivered
 
 
 async def _rate_limit_chat(chat_id: int) -> None:
@@ -466,11 +495,12 @@ async def process_tool_event(
     client: TelegramClient,
     user_id: int,
     task: ContentTask,
-) -> ContentTask | None:
-    """Add a tool_use or tool_result to the active batch, send/edit the batch message.
+) -> ToolEventResult:
+    """Route a tool event and explicitly acknowledge its Telegram delivery.
 
-    Returns None if absorbed into the batch; returns a ContentTask if the queue
-    worker should deliver it as regular content (overflow, unmatched result, etc).
+    ``followup`` is set when the queue must deliver the event as regular content.
+    Otherwise ``outcome`` states whether batching delivered, intentionally dropped,
+    or failed to deliver the event.
     """
     window_id = task.window_id
     thread_id_or_0 = thread_key(task.thread_id)
@@ -483,23 +513,30 @@ async def process_tool_event(
             client, user_id, task, batch, thread_id_or_0
         )
         if batch is None:
-            return followup
+            outcome = (
+                ToolEventOutcome.INTENTIONALLY_DROPPED
+                if followup is None
+                else ToolEventOutcome.DELIVERED
+            )
+            return ToolEventResult(followup=followup, outcome=outcome)
     elif task.content_type == "tool_use":
         result = await _handle_tool_use_event(
             client, user_id, task, batch, window_id, thread_id_or_0, bkey
         )
         if isinstance(result, ContentTask):
-            return result
+            return ToolEventResult(followup=result)
         if result is None:
-            return None
+            return ToolEventResult(outcome=ToolEventOutcome.FAILED)
         batch = result
     else:
-        return task
+        return ToolEventResult(followup=task)
 
-    await _send_or_edit_batch(
+    delivered = await _send_or_edit_batch(
         client, user_id, batch, chat_id, task.thread_id, thread_id_or_0
     )
-    return None
+    return ToolEventResult(
+        outcome=(ToolEventOutcome.DELIVERED if delivered else ToolEventOutcome.FAILED)
+    )
 
 
 async def _handle_tool_use_event(
@@ -547,7 +584,7 @@ async def flush_if_active(
         await flush_batch(client, user_id, thread_id_or_0)
 
 
-async def flush_batch(
+async def flush_batch(  # noqa: C901, PLR0911
     client: TelegramClient, user_id: int, thread_id_or_0: int
 ) -> None:
     """Finalize the active batch: do a final edit and clear state.
@@ -558,8 +595,11 @@ async def flush_batch(
     from telegram.error import TelegramError
 
     bkey = (user_id, thread_id_or_0)
-    batch = _active_batches.pop(bkey, None)
-    if not batch or not batch.entries:
+    batch = _active_batches.get(bkey)
+    if not batch:
+        return
+    if not batch.entries:
+        _active_batches.pop(bkey, None)
         return
 
     thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
@@ -573,6 +613,7 @@ async def flush_batch(
                 )
             except TelegramError as exc:
                 logger.warning("flush_batch ephemeral delete failed: %s", exc)
+        _active_batches.pop(bkey, None)
         return
 
     # Lazy: claude_task_state imports session readers; deferring keeps
@@ -585,9 +626,17 @@ async def flush_batch(
 
     if batch.draft is not None and not batch.draft.closed:
         try:
+            if batch.draft.mode == DRAFT_UNSET:
+                await _rate_limit_chat(chat_id)
+                await batch.draft.start(batch_text)
+                if batch.draft.mode == DRAFT_UNSET:
+                    logger.warning("flush_batch could not open a Telegram draft")
+                    return
             await batch.draft.finalize(batch_text)
         except TelegramError as exc:
             logger.warning("flush_batch finalize failed: %s", exc)
+            return
+        _active_batches.pop(bkey, None)
         return
 
     if batch.telegram_msg_id is not None:
@@ -601,16 +650,23 @@ async def flush_batch(
             )
         except TelegramError as exc:
             logger.warning("flush_batch edit failed: %s", exc)
+        _active_batches.pop(bkey, None)
         return
 
     # No prior message at all — open a fresh draft and finalize immediately.
     await _rate_limit_chat(chat_id)
     draft = DraftStream(unwrap_bot(client), chat_id, message_thread_id=thread_id)
+    batch.draft = draft
     try:
         await draft.start(batch_text)
+        if draft.mode == DRAFT_UNSET:
+            logger.warning("flush_batch could not open a Telegram draft")
+            return
         await draft.finalize()
-    except TelegramError as exc:
+    except (RuntimeError, TelegramError) as exc:
         logger.warning("flush_batch start+finalize failed: %s", exc)
+        return
+    _active_batches.pop(bkey, None)
 
 
 def has_active_batch(user_id: int, thread_id_or_0: int) -> bool:
@@ -632,12 +688,27 @@ def has_ephemeral_active_batch(user_id: int, thread_id_or_0: int) -> bool:
     return batch is not None and is_ephemeral_tools(batch.window_id)
 
 
+def _schedule_batch_abort(batch: ToolBatch) -> None:
+    if batch.draft is None or batch.draft.closed:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(batch.draft.abort())
+
+
 @topic_state.register("topic")
 def clear_batch_for_topic(user_id: int, thread_id: int | None = None) -> None:
     """Clear active batch for a specific topic (called on topic cleanup)."""
-    _active_batches.pop((user_id, thread_key(thread_id)), None)
+    batch = _active_batches.pop((user_id, thread_key(thread_id)), None)
+    if batch:
+        _schedule_batch_abort(batch)
 
 
 def clear_all_batches() -> None:
     """Clear all active batches (called on shutdown)."""
+    batches = list(_active_batches.values())
     _active_batches.clear()
+    for batch in batches:
+        _schedule_batch_abort(batch)

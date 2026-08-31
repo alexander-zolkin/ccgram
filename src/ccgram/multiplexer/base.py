@@ -35,6 +35,16 @@ class WindowRef:
     pane_tty: str = ""
     pane_width: int = 0
     pane_height: int = 0
+    alias_window_ids: tuple[str, ...] = ()
+    """Superseded canonical identities this same window may be persisted under."""
+    legacy_alias_window_ids: tuple[str, ...] = ()
+    """Migration-only legacy identities explicitly attested by this backend.
+
+    These values are never actionable window IDs.  They exist only to let the
+    existing alias-convergence owner fold a uniquely attested old persistence
+    key onto this canonical window.  A repeated value in one listing is
+    ambiguous and must not be migrated.
+    """
 
 
 @dataclass
@@ -73,7 +83,7 @@ class ForegroundInfo:
     """
 
     pid: int
-    pgid: int
+    pgid: int  # Zero when the backend cannot provide a process-group ID.
     argv: list[str]
     cwd: str
     tty: str = ""  # Empty when not available (herdr on macOS)
@@ -196,6 +206,15 @@ class MultiplexerCapabilities:
     the checkout and groups it under the parent repo in its workspace UI. tmux
     (False) keeps ccgram's own ``git worktree add`` + ``create_window`` path.
     """
+
+    supports_display_name_rebind: bool = True
+    """True when a stale topic may be recovered by matching its display name."""
+
+    supports_workspace_selection: bool = False
+    """True when callers can select the workspace for a new target."""
+
+    native_topic_targets: bool = False
+    """True when creation must use the backend's guarded topic-target flow."""
 
 
 # ── Protocol ───────────────────────────────────────────────────────────

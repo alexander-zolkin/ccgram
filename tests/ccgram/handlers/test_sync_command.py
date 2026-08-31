@@ -6,16 +6,19 @@ from telegram.error import BadRequest, TelegramError
 
 from ccgram.handlers.callback_data import CB_SYNC_DISMISS, CB_SYNC_FIX
 from ccgram.handlers.sync_command import (
+    _cleanup_retired_topics,
     _close_ghost_topics,
     _format_report,
     _probe_dead_topics,
     _recreate_dead_topics,
+    _sync_live_topic_names,
     _dispatch,
     handle_sync_dismiss,
     handle_sync_fix,
     sync_command,
 )
 from ccgram.session import AuditIssue, AuditResult
+from ccgram.thread_router import RetiredTopic
 
 
 @pytest.fixture(autouse=True)
@@ -43,112 +46,271 @@ def _patch_deps():
         yield mock_sm, mock_sms, mock_wq, mock_tr, mock_tm, mock_cfg
 
 
-class TestBuildReport:
+def _audit(*issues: AuditIssue, total: int = 3, live: int = 3) -> AuditResult:
+    return AuditResult(
+        issues=list(issues), total_bindings=total, live_binding_count=live
+    )
+
+
+class TestFormatReport:
     @pytest.mark.parametrize(
         ("audit", "expected_text"),
         [
+            pytest.param(_audit(), "3 topics bound, all windows alive", id="all-alive"),
+            pytest.param(_audit(), "No orphaned entries", id="all-clear"),
             pytest.param(
-                AuditResult(issues=[], total_bindings=3, live_binding_count=3),
-                "3 topics bound, all windows alive",
-                id="all-alive",
-            ),
-            pytest.param(
-                AuditResult(issues=[], total_bindings=0, live_binding_count=0),
-                "No topic bindings",
-                id="no-bindings",
+                _audit(total=0, live=0), "No topic bindings", id="no-bindings"
             ),
         ],
     )
-    def test_no_keyboard_cases(self, audit: AuditResult, expected_text: str) -> None:
+    def test_clean_report_has_no_keyboard(
+        self, audit: AuditResult, expected_text: str
+    ) -> None:
         text, keyboard = _format_report(audit)
         assert expected_text in text
         assert keyboard is None
 
-    def test_ghost_binding_is_fixable(self) -> None:
-        audit = AuditResult(
-            issues=[
+    @pytest.mark.parametrize(
+        ("audit", "expected_text"),
+        [
+            pytest.param(
+                _audit(
+                    AuditIssue(
+                        "ghost_binding",
+                        "user:100 thread:42 window:@7 (dead)",
+                        fixable=True,
+                    ),
+                    live=2,
+                ),
+                ["ghost binding"],
+                id="ghost-binding",
+            ),
+            pytest.param(
+                _audit(AuditIssue("orphaned_display_name", "@7 (old)", fixable=True)),
+                ["1 orphaned display name"],
+                id="orphaned-display-name",
+            ),
+            pytest.param(
+                _audit(
+                    AuditIssue("orphaned_window", "@5 (stray)", fixable=True),
+                    total=1,
+                    live=1,
+                ),
+                ["unbound window"],
+                id="orphaned-window",
+            ),
+            pytest.param(
+                _audit(
+                    AuditIssue(
+                        "dead_topic",
+                        "user:100 thread:42 window:@2 (qmd-go)",
+                        fixable=True,
+                    )
+                ),
+                ["1 dead topic", "deleted in Telegram"],
+                id="dead-topic",
+            ),
+        ],
+    )
+    def test_fixable_issue_offers_fix_and_dismiss(
+        self, audit: AuditResult, expected_text: list[str]
+    ) -> None:
+        text, keyboard = _format_report(audit)
+
+        for fragment in expected_text:
+            assert fragment in text
+        assert keyboard is not None
+        assert "Fix 1 issue" in keyboard.inline_keyboard[0][0].text
+        buttons = [btn.callback_data for row in keyboard.inline_keyboard for btn in row]
+        assert CB_SYNC_FIX in buttons
+        assert CB_SYNC_DISMISS in buttons
+
+    def test_known_retired_candidate_reports_reason_and_offers_fix(self) -> None:
+        text, keyboard = _format_report(
+            _audit(
                 AuditIssue(
-                    "ghost_binding",
-                    "user:100 thread:42 window:@7 (dead)",
+                    "retired_topic",
+                    "reason:system_replacement",
                     fixable=True,
-                )
-            ],
-            total_bindings=3,
-            live_binding_count=2,
+                ),
+                total=0,
+                live=0,
+            )
         )
-        text, keyboard = _format_report(audit)
-        assert "ghost binding" in text
+
+        assert "known retired topic cleanup candidate" in text
+        assert "system_replacement" in text
         assert keyboard is not None
         assert "Fix 1 issue" in keyboard.inline_keyboard[0][0].text
 
-    def test_fixable_issues_show_fix_button(self) -> None:
-        audit = AuditResult(
-            issues=[
-                AuditIssue("orphaned_display_name", "@7 (old)", fixable=True),
-            ],
-            total_bindings=3,
-            live_binding_count=3,
+    def test_retired_cleanup_outcomes_are_distinguished_in_report(self) -> None:
+        text, _keyboard = _format_report(
+            _audit(total=0, live=0),
+            retired_outcomes={
+                "deleted": 1,
+                "closed": 2,
+                "already_gone": 3,
+                "failed": 4,
+            },
         )
-        text, keyboard = _format_report(audit)
-        assert "1 orphaned display name" in text
-        assert keyboard is not None
-        data = [btn.callback_data for row in keyboard.inline_keyboard for btn in row]
-        assert CB_SYNC_FIX in data
-        assert CB_SYNC_DISMISS in data
-        assert "Fix 1 issue" in keyboard.inline_keyboard[0][0].text
 
-    def test_fixed_mode_header(self) -> None:
-        audit = AuditResult(issues=[], total_bindings=3, live_binding_count=3)
-        text, _keyboard = _format_report(audit, fixed_count=2)
-        assert "\u2705 Fixed 2 issues" in text
+        assert "Deleted 1 known retired topic" in text
+        assert "Closed 2 known retired topic" in text
+        assert "Already gone 3 known retired topic" in text
+        assert "Could not remove 4 known retired topic" in text
 
-    def test_multiple_fixable_issues(self) -> None:
-        audit = AuditResult(
-            issues=[
+    def test_fix_button_counts_every_issue(self) -> None:
+        _text, keyboard = _format_report(
+            _audit(
                 AuditIssue("orphaned_display_name", "@7 (old)", fixable=True),
                 AuditIssue("stale_offset", "user 100, window @9", fixable=True),
                 AuditIssue(
                     "display_name_drift", "@1: stored='a' tmux='b'", fixable=True
                 ),
-            ],
-            total_bindings=3,
-            live_binding_count=3,
+            )
         )
-        _text, keyboard = _format_report(audit)
+
         assert keyboard is not None
         assert "Fix 3 issues" in keyboard.inline_keyboard[0][0].text
 
-    def test_report_shows_stale_topic_hint(self) -> None:
-        audit = AuditResult(issues=[], total_bindings=0, live_binding_count=0)
-        text, _keyboard = _format_report(audit, fixed_count=1, closed_topic_count=2)
-        assert "Removed 2 stale topics" in text
-
-    def test_report_shows_singular_stale_topic_hint(self) -> None:
-        audit = AuditResult(issues=[], total_bindings=0, live_binding_count=0)
-        text, _keyboard = _format_report(audit, fixed_count=1, closed_topic_count=1)
-        assert "Removed 1 stale topic" in text
-
-    def test_clean_state_shows_all_clear(self) -> None:
-        audit = AuditResult(issues=[], total_bindings=3, live_binding_count=3)
-        text, _keyboard = _format_report(audit)
-        assert "No orphaned entries" in text
-
-    def test_legacy_herdr_report_explains_archive_and_explicit_rebind(self) -> None:
-        audit = AuditResult(
-            issues=[
+    def test_legacy_herdr_binding_is_reported_but_not_fixable(self) -> None:
+        text, keyboard = _format_report(
+            _audit(
                 AuditIssue(
                     "legacy_herdr",
                     "w2:t1 is blocked; archive or explicitly rebind to a listed session target",
                     fixable=False,
-                )
-            ],
-            total_bindings=1,
-            live_binding_count=0,
+                ),
+                total=1,
+                live=0,
+            )
         )
-        text, keyboard = _format_report(audit)
+
         assert "legacy Herdr binding" in text
         assert "explicitly rebind" in text
         assert keyboard is None
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected_text"),
+        [
+            pytest.param({"fixed_count": 2}, "✅ Fixed 2 issues", id="fixed-header"),
+            pytest.param(
+                {"fixed_count": 1, "closed_topic_count": 1},
+                "Removed 1 stale topic",
+                id="closed-singular",
+            ),
+            pytest.param(
+                {"fixed_count": 1, "closed_topic_count": 2},
+                "Removed 2 stale topics",
+                id="closed-plural",
+            ),
+            pytest.param(
+                {"fixed_count": 1, "recreated_topic_count": 1},
+                "Recreated 1 topic",
+                id="recreated-singular",
+            ),
+            pytest.param(
+                {"fixed_count": 2, "recreated_topic_count": 2},
+                "Recreated 2 topics",
+                id="recreated-plural",
+            ),
+        ],
+    )
+    def test_fixed_mode_summary(self, kwargs: dict, expected_text: str) -> None:
+        text, _keyboard = _format_report(_audit(total=0, live=0), **kwargs)
+        assert expected_text in text
+
+
+class TestRetiredTopicCleanup:
+    @staticmethod
+    def _topic() -> RetiredTopic:
+        return RetiredTopic(
+            user_id=100,
+            chat_id=-999,
+            thread_id=42,
+            reason="system_replacement",
+            cleanup_eligible=True,
+            sequence=1,
+        )
+
+    async def test_deleted_outcome_removes_known_retired_topic(
+        self, _patch_deps
+    ) -> None:
+        *_, mock_tr, _, _ = _patch_deps
+        topic = self._topic()
+        mock_tr.iter_retired_topics.return_value = [topic]
+        mock_tr.get_window_for_chat_thread.return_value = None
+        client = AsyncMock()
+
+        outcomes = await _cleanup_retired_topics(client)
+
+        assert outcomes == {"deleted": 1}
+        client.delete_forum_topic.assert_awaited_once_with(-999, 42)
+        client.close_forum_topic.assert_not_awaited()
+        mock_tr.discard_retired_topic.assert_called_once_with(topic)
+
+    async def test_close_fallback_is_reported_separately(self, _patch_deps) -> None:
+        *_, mock_tr, _, _ = _patch_deps
+        topic = self._topic()
+        mock_tr.iter_retired_topics.return_value = [topic]
+        mock_tr.get_window_for_chat_thread.return_value = None
+        client = AsyncMock()
+        client.delete_forum_topic.side_effect = TelegramError("not permitted")
+
+        outcomes = await _cleanup_retired_topics(client)
+
+        assert outcomes == {"closed": 1}
+        client.close_forum_topic.assert_awaited_once_with(-999, 42)
+        mock_tr.discard_retired_topic.assert_called_once_with(topic)
+
+    async def test_already_gone_is_terminal_not_a_failed_delete(
+        self, _patch_deps
+    ) -> None:
+        *_, mock_tr, _, _ = _patch_deps
+        topic = self._topic()
+        mock_tr.iter_retired_topics.return_value = [topic]
+        mock_tr.get_window_for_chat_thread.return_value = None
+        client = AsyncMock()
+        client.delete_forum_topic.side_effect = BadRequest("Message thread not found")
+
+        outcomes = await _cleanup_retired_topics(client)
+
+        assert outcomes == {"already_gone": 1}
+        client.close_forum_topic.assert_not_awaited()
+        mock_tr.discard_retired_topic.assert_called_once_with(topic)
+
+    async def test_failed_calls_remain_in_registry_for_later_fix(
+        self, _patch_deps
+    ) -> None:
+        *_, mock_tr, _, _ = _patch_deps
+        topic = self._topic()
+        mock_tr.iter_retired_topics.return_value = [topic]
+        mock_tr.get_window_for_chat_thread.return_value = None
+        client = AsyncMock()
+        client.delete_forum_topic.side_effect = TelegramError("not permitted")
+        client.close_forum_topic.side_effect = TelegramError("not permitted")
+
+        outcomes = await _cleanup_retired_topics(client)
+
+        assert outcomes == {"failed": 1}
+        mock_tr.discard_retired_topic.assert_not_called()
+
+    async def test_active_or_rebound_topic_is_protected_before_api_call(
+        self, _patch_deps
+    ) -> None:
+        *_, mock_tr, _, _ = _patch_deps
+        topic = self._topic()
+        mock_tr.iter_retired_topics.return_value = [topic]
+        # Simulates a rebind after the Fix snapshot but before its API call.
+        mock_tr.get_window_for_chat_thread.return_value = "@rebound"
+        client = AsyncMock()
+
+        outcomes = await _cleanup_retired_topics(client)
+
+        assert outcomes == {"protected_active": 1}
+        client.delete_forum_topic.assert_not_awaited()
+        client.close_forum_topic.assert_not_awaited()
+        mock_tr.discard_retired_topic.assert_not_called()
 
 
 class TestSyncDismiss:
@@ -175,6 +337,86 @@ class TestSyncDismiss:
             await handle_sync_dismiss(query)
             query.delete_message.assert_awaited_once()
             mock_edit.assert_called_once_with(query, "Dismissed", reply_markup=None)
+
+
+class TestSyncLiveTopicNames:
+    async def test_limits_concurrent_telegram_calls_to_five(self, _patch_deps) -> None:
+        _, _, _, mock_tr, _, _ = _patch_deps
+        bindings = [(100, thread_id, f"window-{thread_id}") for thread_id in range(8)]
+        mock_tr.iter_thread_bindings.return_value = bindings
+        mock_tr.resolve_chat_id.return_value = -999
+        mock_tr.get_display_name.side_effect = lambda window_id: window_id
+
+        active = 0
+        peak = 0
+        started = 0
+        first_batch_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_call(*_args) -> None:
+            nonlocal active, peak, started
+            active += 1
+            peak = max(peak, active)
+            started += 1
+            if started == 5:
+                first_batch_started.set()
+            await release.wait()
+            active -= 1
+
+        with patch(
+            "ccgram.handlers.sync_command.sync_topic_name",
+            new=AsyncMock(side_effect=hold_call),
+        ) as mock_sync:
+            task = asyncio.create_task(
+                _sync_live_topic_names(
+                    MagicMock(), {window_id for _, _, window_id in bindings}
+                )
+            )
+            await asyncio.wait_for(first_batch_started.wait(), timeout=1)
+            assert peak == 5
+            assert not task.done()
+            release.set()
+            await asyncio.wait_for(task, timeout=1)
+
+        assert mock_sync.await_count == len(bindings)
+
+    async def test_waits_for_other_topic_syncs_after_unexpected_error(
+        self, _patch_deps
+    ) -> None:
+        _, _, _, mock_tr, _, _ = _patch_deps
+        bindings = [(100, 1, "window-1"), (100, 2, "window-2")]
+        mock_tr.iter_thread_bindings.return_value = bindings
+        mock_tr.resolve_chat_id.return_value = -999
+        mock_tr.get_display_name.side_effect = lambda window_id: window_id
+
+        blocked_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fail_or_block(_client, _chat_id, thread_id, _name) -> None:
+            if thread_id == 1:
+                raise RuntimeError("unexpected")
+            blocked_started.set()
+            await release.wait()
+
+        with (
+            patch(
+                "ccgram.handlers.sync_command.sync_topic_name",
+                new=AsyncMock(side_effect=fail_or_block),
+            ),
+            patch("ccgram.handlers.sync_command.logger") as mock_logger,
+        ):
+            task = asyncio.create_task(
+                _sync_live_topic_names(
+                    MagicMock(), {window_id for _, _, window_id in bindings}
+                )
+            )
+            await asyncio.wait_for(blocked_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            await asyncio.wait_for(task, timeout=1)
+
+        mock_logger.error.assert_called_once()
 
 
 class TestSyncCommand:
@@ -229,6 +471,8 @@ class TestSyncCommand:
         update = MagicMock()
         update.effective_user = MagicMock(id=100)
         update.message = AsyncMock()
+        update.message.chat.id = -999
+        update.message.message_thread_id = None
 
         with (
             patch(
@@ -239,6 +483,7 @@ class TestSyncCommand:
                 "ccgram.handlers.sync_command.safe_edit",
                 new_callable=AsyncMock,
             ) as mock_edit,
+            patch("ccgram.handlers.sync_command.logger") as mock_logger,
         ):
             await sync_command(update, MagicMock())
             mock_reply.assert_awaited_once_with(update.message, "🔍 State audit…")
@@ -246,9 +491,60 @@ class TestSyncCommand:
             mock_edit.assert_awaited_once()
             assert "2 topics bound" in mock_edit.call_args.args[1]
 
-    async def test_reconciles_live_topic_names_before_reporting(
+        assert mock_logger.info.call_args_list[0].args == (
+            "State audit command started",
+        )
+        assert mock_logger.info.call_args_list[0].kwargs == {
+            "chat_id": -999,
+            "thread_id": None,
+        }
+        assert mock_logger.info.call_args_list[-1].args == (
+            "State audit command completed",
+        )
+
+    async def test_topic_probe_timeout_still_returns_audit_report(
         self, _patch_deps
     ) -> None:
+        mock_sm, _, _, _, _, _ = _patch_deps
+        mock_sm.audit_state.return_value = AuditResult(
+            issues=[], total_bindings=2, live_binding_count=2
+        )
+
+        update = MagicMock()
+        update.effective_user = MagicMock(id=100)
+        update.message = AsyncMock()
+        update.message.chat.id = -999
+        update.message.message_thread_id = None
+        update.get_bot.return_value = AsyncMock()
+        status_message = MagicMock()
+
+        async def never_finishes(_client) -> list[AuditIssue]:
+            await asyncio.Event().wait()
+            return []
+
+        with (
+            patch(
+                "ccgram.handlers.sync_command.safe_reply",
+                new_callable=AsyncMock,
+                return_value=status_message,
+            ),
+            patch(
+                "ccgram.handlers.sync_command.safe_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+            patch(
+                "ccgram.handlers.sync_command._probe_dead_topics",
+                new_callable=AsyncMock,
+                side_effect=never_finishes,
+            ),
+            patch("ccgram.handlers.sync_command._TELEGRAM_PROBE_TIMEOUT_S", 0.01),
+        ):
+            await sync_command(update, MagicMock())
+
+        mock_edit.assert_awaited_once()
+        assert "Telegram topic check incomplete" in mock_edit.call_args.args[1]
+
+    async def test_audit_does_not_mutate_live_topic_names(self, _patch_deps) -> None:
         mock_sm, _, _, mock_tr, mock_tm, _ = _patch_deps
         mock_sm.audit_state.return_value = AuditResult(
             issues=[], total_bindings=1, live_binding_count=1
@@ -275,13 +571,8 @@ class TestSyncCommand:
             ) as mock_sync_topic_name,
         ):
             await sync_command(update, MagicMock())
-            mock_sync_topic_name.assert_called_once()
-            args = mock_sync_topic_name.call_args.args
-            assert args[1:] == (-999, 42, "ccgram-codex")
-            from ccgram.telegram_client import PTBTelegramClient
 
-            assert isinstance(args[0], PTBTelegramClient)
-            assert args[0].bot is bot
+        mock_sync_topic_name.assert_not_awaited()
 
 
 class TestSyncFix:
@@ -315,12 +606,20 @@ class TestSyncFix:
 
         query = MagicMock()
 
-        with patch("ccgram.handlers.sync_command.safe_edit") as mock_edit:
+        with (
+            patch("ccgram.handlers.sync_command.safe_edit") as mock_edit,
+            patch(
+                "ccgram.handlers.sync_command._sync_live_topic_names",
+                new_callable=AsyncMock,
+            ) as mock_sync_topic_names,
+        ):
             await handle_sync_fix(query)
             mock_sm.sync_display_names.assert_called_once_with([])
             mock_sm.prune_stale_state.assert_called_once_with(set())
             mock_sms.prune_session_map.assert_called_once_with(set())
             mock_sm.prune_stale_window_states.assert_called_once_with(set())
+            mock_sync_topic_names.assert_awaited_once()
+            assert mock_sync_topic_names.call_args.args[1] == set()
             assert mock_sm.audit_state.call_count == 2
             assert mock_edit.call_count == 2
             assert "🔧 Fixing…" in mock_edit.call_args_list[0].args[1]
@@ -388,7 +687,9 @@ class TestSyncFix:
             assert cleanup_args.args[:2] == (100, 42)
             assert cleanup_args.kwargs["window_id"] == "w2:t1"
             assert cleanup_args.kwargs["client"].bot is mock_bot
-            mock_tr.unbind_thread.assert_called_once_with(100, 42)
+            mock_tr.unbind_thread.assert_called_once_with(
+                100, 42, retirement_reason="remote_removed"
+            )
             report_text = mock_edit.call_args[0][1]
             assert "Removed 1 stale topic" in report_text
 
@@ -473,7 +774,9 @@ class TestSyncFix:
             assert cleanup_args.args[:2] == (100, 42)
             assert cleanup_args.kwargs["window_id"] == "@7"
             assert cleanup_args.kwargs["client"].bot is mock_bot
-            mock_tr.unbind_thread.assert_called_once_with(100, 42)
+            mock_tr.unbind_thread.assert_called_once_with(
+                100, 42, retirement_reason="remote_removed"
+            )
 
     async def test_fix_adopts_orphaned_windows(self, _patch_deps) -> None:
         mock_sm, _, mock_wq, _, _, _ = _patch_deps
@@ -505,18 +808,6 @@ class TestSyncFix:
             event = mock_handle.call_args[0][0]
             assert event.window_id == "w2:t5"
             assert event.window_name == "stray-proj"
-
-    def test_orphaned_window_label(self) -> None:
-        audit = AuditResult(
-            issues=[
-                AuditIssue("orphaned_window", "@5 (stray)", fixable=True),
-            ],
-            total_bindings=1,
-            live_binding_count=1,
-        )
-        text, keyboard = _format_report(audit)
-        assert "unbound window" in text
-        assert keyboard is not None
 
 
 class TestDeadTopicDetection:
@@ -565,16 +856,46 @@ class TestDeadTopicDetection:
         issues = await _probe_dead_topics(mock_bot)
         assert issues == []
 
-    async def test_probe_skips_bindings_without_group_chat(self, _patch_deps) -> None:
+    async def test_probe_includes_private_chat_binding(self, _patch_deps) -> None:
         _, _, _, mock_tr, _, _ = _patch_deps
         mock_tr.iter_thread_bindings.return_value = [(100, 42, "@2")]
         mock_tr.resolve_chat_id.return_value = 100
-
         mock_bot = AsyncMock()
+        mock_bot.send_message.return_value = MagicMock(message_id=999)
 
         issues = await _probe_dead_topics(mock_bot)
+
         assert issues == []
-        mock_bot.send_message.assert_not_called()
+        mock_bot.send_message.assert_awaited_once_with(
+            100,
+            ".",
+            message_thread_id=42,
+            disable_notification=True,
+        )
+        mock_bot.delete_message.assert_awaited_once_with(100, 999)
+
+
+class TestPrivateTopicSyncLifecycle:
+    async def test_closes_and_unbinds_private_ghost_topic(self, _patch_deps) -> None:
+        _, _, _, mock_tr, _, _ = _patch_deps
+        mock_tr.get_window_for_thread.return_value = "@2"
+        mock_tr.resolve_chat_id.return_value = 100
+        issue = AuditIssue(
+            "ghost_binding", "user:100 thread:42 window:@2 (private)", fixable=True
+        )
+        client = AsyncMock()
+
+        with patch(
+            "ccgram.handlers.sync_command.clear_topic_state", new_callable=AsyncMock
+        ) as clear_state:
+            closed, manual_close = await _close_ghost_topics(client, [issue])
+
+        assert (closed, manual_close) == (1, 0)
+        client.delete_forum_topic.assert_awaited_once_with(100, 42)
+        clear_state.assert_awaited_once_with(100, 42, client=client, window_id="@2")
+        mock_tr.unbind_thread.assert_called_once_with(
+            100, 42, retirement_reason="remote_removed"
+        )
 
 
 class TestDeadTopicRecreation:
@@ -636,7 +957,9 @@ class TestDeadTopicRecreation:
         ) as mock_handle:
             count = await _recreate_dead_topics(mock_bot, issues)
             assert count == 1
-            mock_tr.unbind_thread.assert_called_once_with(100, 42)
+            mock_tr.unbind_thread.assert_called_once_with(
+                100, 42, retirement_reason="remote_deleted"
+            )
             mock_handle.assert_called_once()
             event = mock_handle.call_args[0][0]
             assert event.window_id == "w2:t2"
@@ -745,54 +1068,12 @@ class TestDeadTopicRecreation:
         ):
             count = await _recreate_dead_topics(mock_bot, issues)
             assert count == 0
-            mock_tr.unbind_thread.assert_called_once_with(100, 42)
+            mock_tr.unbind_thread.assert_called_once_with(
+                100, 42, retirement_reason="remote_deleted"
+            )
             mock_tr.bind_thread.assert_called_once_with(
                 100, 42, "@2", window_name="proj", chat_id=-999
             )
-
-
-class TestBuildReportDeadTopic:
-    def test_dead_topic_is_fixable(self) -> None:
-        audit = AuditResult(
-            issues=[
-                AuditIssue(
-                    "dead_topic",
-                    "user:100 thread:42 window:@2 (qmd-go)",
-                    fixable=True,
-                ),
-            ],
-            total_bindings=3,
-            live_binding_count=3,
-        )
-        _text, keyboard = _format_report(audit)
-        assert keyboard is not None
-        assert "Fix 1 issue" in keyboard.inline_keyboard[0][0].text
-
-    def test_recreated_topic_count_in_report(self) -> None:
-        audit = AuditResult(issues=[], total_bindings=2, live_binding_count=2)
-        text, _ = _format_report(audit, fixed_count=1, recreated_topic_count=1)
-        assert "Recreated 1 topic" in text
-
-    def test_recreated_topics_plural(self) -> None:
-        audit = AuditResult(issues=[], total_bindings=2, live_binding_count=2)
-        text, _ = _format_report(audit, fixed_count=2, recreated_topic_count=2)
-        assert "Recreated 2 topics" in text
-
-    def test_dead_topic_shown_as_dedicated_line(self) -> None:
-        audit = AuditResult(
-            issues=[
-                AuditIssue(
-                    "dead_topic",
-                    "user:100 thread:42 window:@2 (qmd-go)",
-                    fixable=True,
-                ),
-            ],
-            total_bindings=3,
-            live_binding_count=3,
-        )
-        text, _ = _format_report(audit)
-        assert "1 dead topic" in text
-        assert "deleted in Telegram" in text
 
 
 class TestSyncFixDeadTopic:
@@ -830,7 +1111,9 @@ class TestSyncFixDeadTopic:
             ) as mock_handle,
         ):
             await handle_sync_fix(query)
-            mock_tr.unbind_thread.assert_called_once_with(100, 42)
+            mock_tr.unbind_thread.assert_called_once_with(
+                100, 42, retirement_reason="remote_deleted"
+            )
             mock_handle.assert_called_once()
             report_text = mock_edit.call_args[0][1]
             assert "Recreated 1 topic" in report_text

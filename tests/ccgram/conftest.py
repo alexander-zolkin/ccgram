@@ -8,9 +8,10 @@ import os
 import time
 
 import pytest
+import pytest_asyncio
 
 
-@pytest.fixture(autouse=True)
+@pytest_asyncio.fixture(autouse=True)
 async def _shutdown_queue_workers():
     """Kill background queue workers created as side-effects of handler calls.
 
@@ -27,6 +28,24 @@ async def _shutdown_queue_workers():
 
     if _queue_workers:
         await shutdown_workers()
+
+
+@pytest.fixture(autouse=True)
+def _clean_reaction_dedupe_cache():
+    """Reset the module-level reaction dedupe cache between tests.
+
+    ``reactions._last_reaction`` suppresses a repeat reaction to the same
+    (chat_id, message_id). That is correct in production and poison across
+    tests: one that reacts and then takes a failure path leaves the entry
+    behind, and the next test to react to the same ids has its call silently
+    skipped. Six test files reach this code, and xdist ordering decides which
+    pairing happens, so it surfaces only as a rare parallel-run failure.
+    """
+    from ccgram.handlers import reactions
+
+    reactions._last_reaction.clear()
+    yield
+    reactions._last_reaction.clear()
 
 
 @pytest.fixture(autouse=True)

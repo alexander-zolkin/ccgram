@@ -116,8 +116,7 @@ class Config:
         # Provider selection
         self.provider_name: str = os.getenv("CCGRAM_PROVIDER", "claude")
 
-        # Terminal-multiplexer backend selection (tmux default; herdr opt-in)
-        self.multiplexer_name: str = os.getenv("CCGRAM_MULTIPLEXER", "tmux")
+        self._init_multiplexer()
 
         # Directory browser: show hidden (dot) directories
         self.show_hidden_dirs: bool = os.getenv(
@@ -165,6 +164,18 @@ class Config:
             "true",
             "yes",
         )
+        # Voice confirmation is safer by default; enable only for trusted,
+        # low-friction dictation workflows.
+        self.voice_autosend: bool = os.getenv(
+            "CCGRAM_VOICE_AUTOSEND", "false"
+        ).lower() in ("1", "true", "yes")
+        # Hide only the transient status presentation; replies and controls
+        # remain available through their normal paths.
+        self.hide_status: bool = os.getenv("CCGRAM_HIDE_STATUS", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         # Global default batch mode: ephemeral tools (single rolling message deleted
         # on completion). Off by default. Per-window batch_mode takes precedence when
@@ -188,6 +199,11 @@ class Config:
             len(self.allowed_users),
             self.tmux_session_name,
         )
+
+    def _init_multiplexer(self) -> None:
+        """Select the terminal-multiplexer backend."""
+        # tmux default; herdr and agterm opt-in.
+        self.multiplexer_name: str = os.getenv("CCGRAM_MULTIPLEXER", "tmux")
 
     def _init_live_view(self) -> None:
         self.live_view_interval: int = max(

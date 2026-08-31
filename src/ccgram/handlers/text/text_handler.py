@@ -54,7 +54,10 @@ from ..messaging_pipeline.message_sender import (
 )
 from ..recovery.recovery_banner import RecoveryBanner, render_banner
 from ..polling.polling_state import lifecycle_strategy
-from ..telegram_origin import send_telegram_to_window
+from ..telegram_origin import (
+    agent_origin_returned_to_shell,
+    send_telegram_to_window,
+)
 from ...topic_state_registry import topic_state
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
@@ -410,7 +413,10 @@ async def _handle_dead_window(
         return True
 
     w = await tmux_manager.find_window_by_id(window_id)
-    if w:
+    logically_dead = lifecycle_strategy.is_dead_notified(
+        user_id, thread_id, window_id
+    ) or (w is not None and await agent_origin_returned_to_shell(window_id, w))
+    if w and not logically_dead:
         lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
         return False
 
@@ -429,7 +435,12 @@ async def _handle_dead_window(
             user_id,
             thread_id,
         )
-        thread_router.unbind_thread(user_id, thread_id)
+        thread_router.unbind_thread(
+            user_id,
+            thread_id,
+            retirement_reason="system_replacement",
+            cleanup_eligible=True,
+        )
         lifecycle_strategy.clear_dead_notification(user_id, thread_id)
         start_path = str(Path.cwd())
         msg_text, keyboard, subdirs = build_directory_browser(
@@ -527,10 +538,14 @@ async def _forward_message(
         _bash_capture_tasks[(user_id, thread_id)] = task
 
     # If in interactive mode, refresh the UI after sending text
-    interactive_window = get_interactive_window(user_id, thread_id)
+    interactive_window = get_interactive_window(
+        user_id, thread_id, chat_id=message.chat.id
+    )
     if interactive_window and interactive_window == window_id:
         await asyncio.sleep(0.2)
-        await handle_interactive_ui(client, user_id, window_id, thread_id)
+        await handle_interactive_ui(
+            client, user_id, window_id, thread_id, chat_id=message.chat.id
+        )
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -248,7 +248,8 @@ def run_cmd(**kwargs: object) -> None:
     "--provider",
     "provider_name",
     type=click.Choice(
-        ["claude", "pi", "codex", "gemini", "grok"], case_sensitive=False
+        ["claude", "pi", "codex", "gemini", "grok", "antigravity"],
+        case_sensitive=False,
     ),
     default="claude",
     help="Agent provider hook contract to use.",

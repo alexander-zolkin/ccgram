@@ -10,7 +10,7 @@ brew upgrade ccgram                   # Homebrew
 
 ## CLI Reference
 
-```
+```text
 ccgram                        # Start the bot
 ccgram status                 # Show running state (no token needed)
 ccgram doctor                 # Validate setup and diagnose issues
@@ -26,9 +26,9 @@ ccgram -v                     # Run with debug logging
 
 ### Platform Support
 
-CCGram supports Linux, macOS, and WSL2. Native Windows is not supported.
+CCGram supports Linux, macOS, and WSL2. Native Windows is not supported. The agterm backend is macOS-native.
 
-On Windows, install and run CCGram inside WSL2. Install the multiplexer and agent CLI inside the WSL distribution.
+On Windows, install and run CCGram inside WSL2. Install the multiplexer and agent CLI inside the WSL distribution; use agterm only on macOS.
 
 ### BotFather Setup
 
@@ -39,29 +39,25 @@ You need a Telegram bot token to run CCGram. Create one via [@BotFather](https:/
    - Name: anything (e.g., "MyCodeBot")
    - Username: must be unique and end with `bot` (e.g., "my_code_bot")
    - You'll receive a **Bot Token** — save this for `TELEGRAM_BOT_TOKEN`
-3. **Configure bot settings:** Send `/mybots` → select your bot → **Bot Settings**
-   - Enable **Allow Groups**: On
-   - Enable **Group Privacy**: Off _(required so the bot sees all messages in topics)_
-   - Enable **Topics**: On
-4. **Add bot to your Telegram group:**
-   - Create or open a Telegram group with Topics enabled
-   - Invite the bot to the group
-   - **Promote the bot to Administrator** with these permissions:
-     - Create Topics
-     - Pin Messages
-     - Read Messages / View The Chat
-5. **Get your user ID:** Open [@userinfobot](https://t.me/userinfobot) → it shows your numeric user ID. Save this for `ALLOWED_USERS`
-6. **Get your group ID:** Open [@RawDataBot](https://t.me/RawDataBot) in the group → under **Peer ID**, note the number (remove leading `-100`, or keep it — both formats work)
-   - Save this for `CCGRAM_GROUP_ID` (prefix with `-100` if needed)
+3. **Configure bot settings:** Send `/mybots` → select your bot → **Bot Settings**.
+   - Enable **Topics** for a private-chat setup.
+   - Enable **Allow Groups** for a group setup.
+   - Disable **Group Privacy** so the bot can read all group-topic messages.
+4. **Choose a topic setup:**
+   - **Private chat:** Open the bot chat. Topic 1 is the General/control topic.
+   - **Group:** Create or open a Topics-enabled group. Add the bot and promote it to Administrator with Create Topics, Pin Messages, and Read Messages permissions.
+5. **Get your user ID:** Open [@userinfobot](https://t.me/userinfobot). Save the numeric ID for `ALLOWED_USERS`.
+6. **For a group, get its ID:** Open [@RawDataBot](https://t.me/RawDataBot) in the group. Save the Peer ID for `CCGRAM_GROUP_ID`. Both forms with and without the `-100` prefix work.
 7. **Create `~/.ccgram/.env`:**
 
    ```ini
    TELEGRAM_BOT_TOKEN=your_bot_token_here
    ALLOWED_USERS=your_user_id_here
+   # Group setup only:
    CCGRAM_GROUP_ID=your_group_id_here
    ```
 
-8. **Test:** Run `ccgram` and create a new topic in your Telegram group. Send a message and the directory browser should appear.
+8. **Test:** Run `ccgram`. Create a topic in the configured chat and send a message. The directory browser must appear.
 
 ### Validation
 
@@ -76,9 +72,38 @@ ccgram doctor --fix   # Auto-fix common issues (install hooks, kill orphans, etc
 
 Herdr topics use `agent.list` as their sole identity source. CCGram stores only an opaque `herdr-session-v1-…` target; tabs, panes, terminal IDs, names, directories, and focus are live locators, not topic identity. Each action takes a fresh snapshot and fails closed when its target is missing, duplicate, malformed, or sessionless.
 
-Existing Herdr tab/pane bindings are marked `legacy_herdr` and blocked. Use `/unbind` to archive the CCGram binding without closing the Herdr session; rollback can restore that record but it remains blocked. Send a message in the topic and explicitly choose a listed session target to rebind. CCGram never guesses a migration target.
+Existing Herdr tab/pane/terminal bindings are marked `legacy_herdr` and blocked. Use `/unbind` to archive the CCGram binding without closing the Herdr session; rollback can restore that record but it remains blocked. Send a message in the topic and explicitly choose a listed session target to rebind. CCGram never guesses a migration target from a name or reusable locator. If an old tab binding now covers several agents, it remains blocked while each live session surfaces as a new pane-qualified topic. Archive the historical binding with `/unbind`, or explicitly rebind it to one selected session; CCGram never chooses for you.
 
 A session can change after the fresh guard and before Herdr receives an action. CCGram records that post-guard dispatch race and does not claim atomic delivery. Run live Herdr tests only against a disposable server and redact target/session evidence.
+
+### Shared tabs and topic names
+
+Herdr exposes one Telegram topic for each agent session, not one topic for each
+tab. Every generated name is `<workspace> ▸ <tab> ▸ <pane>`, including a tab
+that currently has one agent. The pane suffix distinguishes siblings without
+flapping when siblings join or leave, but it remains display state rather than
+identity and can change when Herdr remints pane locators.
+
+Telegram topic rename is disabled for shared tabs because Herdr's tab rename
+would rename every sibling. Rename the Herdr tab directly only when its tab has
+one agent; the next reconciliation updates the topic name. If Herdr reports the
+same session target more than once, CCGram quarantines only that target and
+keeps unrelated topics operational.
+
+## Local Dev in agterm
+
+Set `CCGRAM_MULTIPLEXER=agterm` to use [agterm](https://github.com/umputun/agterm) as the session backend. agterm is macOS-native. Install `agtermctl` from agterm's **Help > Install Command Line Tool**, start agterm, and make sure that `agtermctl` can reach its control socket. Set `AGTERM_SOCKET` when the default control-socket path is not the one to use.
+
+Set `CCGRAM_AGTERM_WORKSPACES` to a comma-separated list of workspace names.
+Use `*` to include all workspaces. CCGram shows the workspace picker when agterm
+supports workspace selection, and it uses the selected workspace for new sessions.
+
+Agterm reports session state through its native status field. Provider detection
+uses foreground argv when agterm cannot provide a process-group ID. CCGram does
+not subscribe to agterm events, so status and transcript updates use polling.
+
+Run the standard unit and integration checks before deployment. Run live agterm
+checks only against a disposable agterm instance.
 
 ## Local Dev in tmux
 
@@ -161,6 +186,8 @@ The tests create an isolated `ccgram-e2e` tmux session that does not interfere w
 
 All settings accept both CLI flags and environment variables. CLI flags take precedence. `TELEGRAM_BOT_TOKEN` is env-only for security (flags are visible in `ps`).
 
+<!-- markdownlint-disable MD060 -->
+
 | Variable / Flag                                      | Default                        | Description                                                                                          |
 | ---------------------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------- |
 | `TELEGRAM_BOT_TOKEN`                                 | _(required)_                   | Bot token from @BotFather (env only)                                                                 |
@@ -168,7 +195,8 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 | `CCGRAM_DIR` / `--config-dir`                        | `~/.ccgram`                    | Config and state directory                                                                           |
 | `CLAUDE_CONFIG_DIR` / `--claude-config-dir`          | `~/.claude`                    | Override Claude config directory (for wrappers like ce, cc-mirror)                                   |
 | `TMUX_SESSION_NAME` / `--tmux-session`               | `ccgram`                       | tmux session name                                                                                    |
-| `CCGRAM_MULTIPLEXER`                                 | `tmux`                         | Terminal multiplexer backend: `tmux` (default) or `herdr`                                            |
+| `CCGRAM_MULTIPLEXER`                                 | `tmux`                         | Terminal multiplexer backend: `tmux` (default), `herdr` or `agterm`                                  |
+| `CCGRAM_AGTERM_WORKSPACES`                           | `ccgram`                       | agterm only: workspaces ccgram may adopt sessions from (comma-separated; `*` for all)                |
 | `CCGRAM_PROVIDER` / `--provider`                     | `claude`                       | Default agent provider (`claude`, `codex`, `gemini`, `pi`, `shell`)                                  |
 | `CCGRAM_<NAME>_COMMAND`                              | _(from provider)_              | Per-provider launch command (env only, see below)                                                    |
 | `CCGRAM_GROUP_ID` / `--group-id`                     | _(all groups)_                 | Restrict to one Telegram group                                                                       |
@@ -192,6 +220,8 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 | `CCGRAM_STATUS_MODE` / `--status-mode`               | `system`                       | Topic emoji color scheme: `system` (green=working) or `user` (green=ready)                           |
 | `CCGRAM_HIDE_TOOL_CALLS` / `--hide-tool-calls`       | `false`                        | Set `true` to globally hide `tool_use`/`tool_result` messages (per-window override via `/toolcalls`) |
 | `CCGRAM_HIDE_THINKING` / `--hide-thinking`           | `false`                        | Set `true` to globally hide thinking messages                                                        |
+| `CCGRAM_HIDE_STATUS`                                 | `false`                        | Set `true` to suppress transient status bubbles; replies and controls remain available              |
+| `CCGRAM_VOICE_AUTOSEND`                              | `false`                        | Set `true` to send voice transcriptions without confirmation; transcription is still shown           |
 | `CCGRAM_PROMPT_MODE` / `--prompt-mode`               | `wrap`                         | Shell prompt marker: `wrap` (append `⌘N⌘`) or `replace` (legacy `{prefix}:N❯`)                       |
 | `CCGRAM_PROMPT_MARKER`                               | `ccgram`                       | Marker prefix used only by `replace` mode                                                            |
 | `CCGRAM_PANE_LIFECYCLE_NOTIFY`                       | `false`                        | Default for per-window pane create/close notifications (toggle via `/panes`)                         |
@@ -208,6 +238,8 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 | `CCGRAM_TTS_MODEL`                                   | `gpt-4o-mini-tts`              | OpenAI TTS model (only used when `CCGRAM_TTS_PROVIDER=openai`)                                       |
 | `CCGRAM_TTS_API_KEY`                                 | _(empty)_                      | API key for OpenAI TTS; falls back to `OPENAI_API_KEY`                                               |
 
+<!-- markdownlint-enable MD060 -->
+
 ## Topic Emoji Color Scheme
 
 Topic emojis change color to reflect agent status. The mapping between color and meaning is configurable:
@@ -219,6 +251,12 @@ Topic emojis change color to reflect agent status. The mapping between color and
 
 Set globally via `CCGRAM_STATUS_MODE=user` or `--status-mode user`. Invalid values fall back to `system`.
 
+## Status Bubble Visibility
+
+Status bubbles show transient progress, elapsed time, task state, and toolbar controls.
+Set `CCGRAM_HIDE_STATUS=true` to suppress those bubbles. This does not hide agent
+replies, approval prompts, recovery notices, or the `/toolbar` command.
+
 ## Tool-Call Visibility
 
 By default, `tool_use` and `tool_result` events from Claude/Codex/Gemini are forwarded to Telegram. You can suppress them globally or per-window when they create more noise than signal (e.g., during heavy file or grep work).
@@ -227,6 +265,32 @@ By default, `tool_use` and `tool_result` events from Claude/Codex/Gemini are for
 - **Per-window**: `/toolcalls` in a topic cycles `default → shown → hidden`. The per-window setting always wins over the global default.
 
 Hook events (Stop, StopFailure, SubagentStart/Stop, TaskCompleted, TeammateIdle) are **never** suppressed — they bypass the gate so you still see what matters.
+
+## Delivery, Backlog, and Jump to Live
+
+### Lossless text batching
+
+The outbound queue can combine consecutive eligible transcript text tasks into one Telegram message to reduce API calls. This is not the `/verbose` tool-call batching mode: `/verbose` controls the separate live tool-use display.
+
+A text batch is eligible only when every item is a non-empty, one-part text task with the same **chat, topic/thread, window, role, and transcript source session**. CCGram stops at the first different or ineligible queued item, so it never crosses chats, topics, windows, roles, sessions, tool updates, status updates, media/TTS deliveries, or other queue boundaries. Batches are capped below Telegram's message limit and use a blank line between original items.
+
+Each item is rendered to Telegram entities before the items are combined. Formatting opened in one item cannot alter the next item's formatting, and each item retains the formatting it would have had if sent on its own. This makes the batching lossless for eligible text while preserving the delivery boundaries of everything else.
+
+### Queue progress and severe backlogs
+
+The editable topic status bubble reports:
+
+- **pending** — queued and in-flight transcript content items for that topic/window;
+- **age** — how long the oldest of those items has waited; and
+- **delivery lag** — the elapsed time for the latest completed content delivery (`—` until one completes).
+
+These are in-memory progress metrics, so they reset when CCGram restarts. The status line is refreshed with status updates and its displayed text is throttled for up to 15 seconds. A backlog is severe when it has **100 or more pending items** **or** its oldest item is **5 minutes (300 seconds) or older**. Only then does the status keyboard include **⏭ Jump to live**.
+
+### Confirmed jump semantics
+
+**Jump to live** is an inline, two-step action: tap it, then tap **Confirm jump to live**. Cancel leaves the queue and all watermarks unchanged. On confirmation, CCGram snapshots the selected transcript source at its current EOF, persists a skip barrier before retiring only that source's queued range, and queues a visible notice such as `⏭ Skipped N queued transcript item(s) for live view (bytes A–B). Raw transcript retained.` New transcript bytes written after the snapshot are not part of the jump; an already in-flight send is also left alone rather than cancelled.
+
+The raw provider transcript is retained; Jump to live does not delete or rewrite it. CCGram advances the durable delivered watermark past the skipped range only after Telegram acknowledges the skipped-range notice. If CCGram restarts or notice delivery fails first, it restores the barrier and retries the notice rather than silently advancing. Normal transcript relay is **at-least-once**, not exactly-once: a Telegram outcome that is not confirmed before a retry or restart can produce a duplicate message. This watermark policy favors retaining/replaying output over losing it.
 
 ## Thinking Visibility
 
@@ -268,8 +332,12 @@ CCGRAM_WHISPER_LANGUAGE=en                     # omit for auto-detect
 
 1. Send a voice message in a topic bound to an agent
 2. Bot downloads the audio (max 25 MB) and sends it to the Whisper API
-3. Transcription appears with **✓ Send to agent** and **✗ Discard** buttons
+3. By default, the transcription appears with **✓ Send to agent** and **✗ Discard** buttons
 4. Tap **Send** to forward the text to the agent, or **Discard** to cancel
+
+Set `CCGRAM_VOICE_AUTOSEND=true` to skip the confirmation. The bot still posts the
+transcription for review, then sends it through the same provider-aware path. This is
+less safe for accidental or inaccurate dictation, so confirmation remains the default.
 
 In shell topics, voice transcriptions are automatically routed through the LLM for command generation (if `CCGRAM_LLM_PROVIDER` is set). In agent topics, the transcribed text is sent directly to the agent.
 
@@ -277,7 +345,7 @@ Leave `CCGRAM_WHISPER_PROVIDER` empty (the default) to disable voice transcripti
 
 ## Tmux Session Auto-Detection
 
-> This section applies when `CCGRAM_MULTIPLEXER=tmux` (the default). The herdr backend uses its own workspace/tab model and does not use a tmux session name.
+> This section applies when `CCGRAM_MULTIPLEXER=tmux` (the default). The herdr and agterm backends use their own workspace/session models and do not use a tmux session name.
 
 When ccgram starts inside an existing tmux session, it auto-detects the session name and attaches to it instead of creating a new `ccgram` session. This is useful when you already have a tmux session with agent windows.
 
@@ -298,9 +366,9 @@ When ccgram starts inside an existing tmux session, it auto-detects the session 
 | Inside tmux, no flags            | Auto-detects session, skips own window, no creation |
 | Inside tmux, `--tmux-session=X`  | Overrides auto-detect, uses `X`                     |
 
-## Herdr Backend (Alternative Multiplexer)
+## Alternative Multiplexer Backends
 
-ccgram talks to the terminal multiplexer through a backend-neutral seam. tmux is the default; [herdr](https://github.com/ogulcancelik/herdr) is an opt-in alternative selected with `CCGRAM_MULTIPLEXER=herdr`. Everything else — topics, providers, hooks, status, recovery — works the same; only the multiplexer underneath changes.
+ccgram talks to the terminal multiplexer through a backend-neutral seam. tmux is the default; [herdr](https://github.com/ogulcancelik/herdr) and [agterm](https://github.com/umputun/agterm) are opt-in alternatives selected with `CCGRAM_MULTIPLEXER=herdr` and `CCGRAM_MULTIPLEXER=agterm`, respectively. Backend capabilities differ; the backend-specific sections describe their user-visible constraints.
 
 ### Setup
 
@@ -318,26 +386,40 @@ CCGRAM_MULTIPLEXER=herdr
 
 ### Protocol version pinning
 
-ccgram accepts herdr socket protocols 14, 15, 16, and 17 without warnings. On the first call it reads `herdr status`; an older, newer, missing, or otherwise unknown protocol emits a warning and ccgram continues in best-effort mode, so CLI-backed operations can still work after a herdr upgrade or downgrade. A stopped server, failed status command, or malformed status response still prevents startup. Run the live herdr contract suite before relying on an untested protocol.
+ccgram accepts herdr socket protocols 14–20 without warnings. On the first call it reads `herdr status`; an older, newer, missing, or otherwise unknown protocol emits a warning and ccgram continues in best-effort mode, so CLI-backed operations can still work after a herdr upgrade or downgrade. A stopped server, failed status command, or malformed status response still prevents startup. Run the live herdr contract suite before relying on an untested protocol.
 
 ### Differences from tmux
 
 herdr advertises its own capabilities through the seam; the behavioral consequences a user sees:
 
+<!-- markdownlint-disable MD060 -->
+
 | Aspect                    | tmux                            | herdr                                                                      |
 | ------------------------- | ------------------------------- | -------------------------------------------------------------------------- |
-| Topic = window            | every window is eligible        | only **agent tabs** surface as topics — a bare shell tab does not          |
+| Topic = agent session     | every window is eligible        | each reported agent session surfaces as one topic; a bare shell does not   |
 | Foreground detection      | `ps -t <tty>`                   | `pane process-info` (no tty)                                               |
 | Scrollback capture        | unbounded                       | clamped to **1000 lines**; longer output is flagged as truncated           |
 | Agent status              | inferred from terminal scraping | native (herdr reports agent status directly)                               |
 | Window IDs across restart | stable                          | guarded session target is revalidated from fresh `agent.list`; ccgram never re-resolves a tab/pane ID |
-| Topic labels              | window name                     | adaptive `"<workspace> ▸ <tab>"` (tab name is primary)                     |
+| Topic labels              | window name                     | `<workspace> ▸ <tab> ▸ <pane>` for every reported agent session             |
+
+<!-- markdownlint-enable MD060 -->
 
 Creating sessions from the terminal on herdr is covered in [Creating Sessions from the Terminal](#creating-sessions-from-the-terminal).
 
 > **Workspace picker:** On herdr, `/new` shows an extra step after directory selection. Choose a workspace to pin the new tab there, or skip it: ccgram then explicitly creates a workspace from the requested directory and uses only its returned ID. It never infers the active or a matching workspace.
 >
 > **Self-hosting escape hatch:** Workspaces or tabs whose label matches `__*__` (e.g. `__main__`) are invisible to ccgram. Use this naming convention to run ccgram itself inside herdr without it auto-adopting its own terminal as a topic.
+
+## Sync and Retired Topic Cleanup
+
+`/sync` audits CCGram's local bindings and offers **Fix** for repairable items. Its retired-topic cleanup is intentionally narrow: it considers only a bounded local registry (up to 100 entries) of exact chat/topic bindings that CCGram previously owned and marked eligible for cleanup. It does **not** discover, list, or act on arbitrary forum topics. The Bot API does not let bots enumerate unknown topics, so a topic that was never recorded by CCGram cannot become a `/sync` cleanup candidate.
+
+When you choose **Fix**, CCGram rechecks each known retired topic immediately before the Bot API call. A topic that is active or was rebound in the meantime is reported as **Protected active or rebound** and receives no delete or close request. A new binding for the same chat/topic also removes the old retired record.
+
+For an eligible, still-retired topic, `/sync` tries `deleteForumTopic` first. Deletion is irreversible and removes the topic history. If deletion is unavailable or fails, `/sync` tries `closeForumTopic`; closing hides/closes the topic but retains its history. A successful delete, successful close, or an already-gone topic is removed from the local registry. Failed delete-and-close attempts stay in the registry for a later `/sync` attempt, and the report distinguishes Deleted, Closed, Already gone, Could not remove, and Protected active or rebound outcomes.
+
+The bot must be a group administrator with Telegram's **Manage Topics** (`can_manage_topics`) permission for topic cleanup. Configure forum topics and the admin permissions in [BotFather Setup](#botfather-setup); if Telegram denies either operation, `/sync` leaves the local record in place and reports the failure. Review candidates before pressing Fix because a successful delete cannot be undone.
 
 ## Auto-Close Behavior
 
@@ -354,7 +436,7 @@ ccgram --autoclose-done 0 --autoclose-dead 0
 
 ## Multi-Instance Setup
 
-Run multiple ccgram instances on the same machine, each owning a different Telegram group. All instances can share a single bot token.
+Run multiple ccgram instances on the same machine, each owning a different Telegram group. All instances can share a single bot token. Because Telegram rate limits are token-wide, divide the expected aggregate traffic across instances; these processes do not share a rate-limit coordinator.
 
 ### Example: work + personal instances
 
@@ -416,9 +498,11 @@ The window must be in the ccgram tmux session (configurable via `TMUX_SESSION_NA
 
 Open a new herdr tab in the appropriate workspace, then start any supported agent CLI. CCGram discovers agent panes automatically; bare shell panes are not surfaced as topics (only active agent panes are).
 
-### Both backends
+### Multiplexer backends
 
 For Claude, the SessionStart hook registers the session automatically. For Codex, Gemini, and Pi, CCGram auto-detects the provider from the running process name and discovers the session from transcript files on disk. In all cases, the bot creates a matching Telegram topic.
+
+With agterm, open the session in the `ccgram` workspace (or a workspace listed in `CCGRAM_AGTERM_WORKSPACES`) and start a supported agent CLI. agterm reports the foreground command for active sessions; an idle shell has no foreground argv, so bare shell panes are not surfaced as topics.
 
 This works even on a fresh instance with no existing topic bindings (cold-start).
 
@@ -430,7 +514,7 @@ When an agent session exits or crashes, the bot detects the dead window and offe
 - **Continue** — Resume the last conversation (all providers support this)
 - **Resume** — Browse and select a past session to resume from
 
-The buttons shown adapt to each provider's capabilities. Claude, Codex, Gemini, and Pi support Fresh, Continue, and Resume. Shell supports Fresh only (shell sessions are ephemeral).
+The buttons shown adapt to each provider's capabilities. Claude and Antigravity support Fresh, Continue, and the CCGram Resume picker. Codex, Gemini, and Pi support Fresh and Continue; their CLIs can resume known session IDs, but CCGram does not yet enumerate those providers' sessions. Shell supports Fresh only because shell sessions are ephemeral.
 
 ## Manual Provider Override (`/agent`)
 
@@ -438,7 +522,7 @@ The buttons shown adapt to each provider's capabilities. Claude, Codex, Gemini, 
 
 Forms:
 
-```
+```text
 /agent              # show picker (current marked ✓, with (manual override) badge if set)
 /agent shell        # switch to shell
 /agent claude       # switch to Claude (also: codex, gemini, pi)
@@ -510,7 +594,7 @@ Tunables: `CCGRAM_SEND_SEARCH_DEPTH` (default 5), `CCGRAM_SEND_MAX_RESULTS` (def
 
 ## Action Toolbar (`/toolbar`)
 
-`/toolbar` opens an inline keyboard of provider-specific tmux key actions. Row 1 is universal: `[📷 Screen, ⏹ Ctrl-C, 📺 Live]`. Row 2 varies per provider: Claude (Mode, Think, Esc), Codex (Esc, Tab, Mode), Gemini (Mode, YOLO, Esc), Pi (Esc, Tab, π Model), Shell (Enter, EOF, Suspend). Claude/Codex/Gemini/Pi add a navigation row (Up, Enter, Down). The final row is `[📄 Last, Get File, Close]`; Shell folds Esc in: `[📄 Last, Get File, Esc, Close]`.
+`/toolbar` opens an inline keyboard of provider-specific tmux key actions. Row 1 is universal: `[📷 Screen, ⏹ Ctrl-C, 📺 Live]`. Row 2 varies per provider: Antigravity (Esc, Tab, Model), Claude (Mode, Think, Esc), Codex (Esc, Tab, Mode), Gemini (Mode, YOLO, Esc), Pi (Esc, Tab, π Model), Shell (Enter, EOF, Suspend). Antigravity/Claude/Codex/Gemini/Pi add a navigation row (Up, Enter, Down). The final row is `[📄 Last, Get File, Close]`; Shell folds Esc in: `[📄 Last, Get File, Esc, Close]`.
 
 Toggle actions (Mode = Shift+Tab, Think = Tab, YOLO = Ctrl+Y) capture the pane ~250 ms after the key press and report the resulting mode-line in the toast (e.g., `auto-accept edits on`).
 
@@ -573,14 +657,14 @@ CCGram supports Claude Code, Codex CLI, Gemini CLI, Pi, and Shell. Each topic ca
 
 All state files live in `$CCGRAM_DIR` (`~/.ccgram/` by default):
 
-| File                 | Description                                                 |
-| -------------------- | ----------------------------------------------------------- |
-| `state.json`         | Thread bindings, window states, display names, read offsets |
-| `session_map.json`   | Hook-generated window → session mappings                    |
-| `events.jsonl`       | Append-only hook event log (read incrementally by monitor)  |
-| `monitor_state.json` | Byte offsets per session (prevents duplicate notifications) |
+| File                 | Description                                                         |
+| -------------------- | ------------------------------------------------------------------- |
+| `state.json`         | Thread bindings, window states, display names, read offsets         |
+| `session_map.json`   | Hook-generated window → session mappings                            |
+| `events.jsonl`       | Append-only hook event log (read incrementally by monitor)          |
+| `monitor_state.json` | Delivered transcript watermarks and pending Jump-to-live barriers   |
 
-Session transcripts are read from provider-specific locations (read-only): `~/.claude/projects/` (Claude), `~/.codex/sessions/` (Codex), `~/.gemini/tmp/` (Gemini), `~/.pi/agent/sessions/` (Pi). Shell has no transcript — output is captured directly from the tmux pane. The bot never writes to agent data directories.
+Session transcripts are read from provider-specific locations (read-only): `~/.claude/projects/` (Claude), `~/.codex/sessions/` (Codex), `~/.gemini/tmp/` (Gemini), `~/.pi/agent/sessions/` (Pi). Shell has no transcript — output is captured directly from the tmux pane. The bot never writes to agent data directories; the delivered watermark records relay progress, not a mutation of the raw transcript.
 
 ## Running as a Service
 

@@ -18,9 +18,8 @@ import signal
 import time
 
 import structlog
-from telegram.error import BadRequest, Conflict, NetworkError
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter
 from telegram.ext import (
-    AIORateLimiter,
     Application,
     ContextTypes,
     filters,
@@ -38,6 +37,7 @@ from .handlers.text.text_handler import handle_text_message, text_handler
 from .handlers.topics import new_command
 from .handlers.topics.directory_browser import clear_browse_state
 from .session import session_manager
+from .telegram_rate_limiter import CCGramAIORateLimiter, retry_after_seconds
 from .telegram_request import ResilientPollingHTTPXRequest
 from .thread_router import thread_router
 
@@ -70,6 +70,7 @@ __all__ = [
 logger = structlog.get_logger()
 
 _CONFLICT_GRACE_PERIOD_S = 90.0
+_GET_UPDATES_READ_TIMEOUT_S = 20.0
 
 
 class _PollingConflictState:
@@ -158,14 +159,18 @@ async def _send_shutdown_notification(application: Application) -> None:
         await application.bot.send_message(
             chat_id=config.group_id,
             text=text,
-            message_thread_id=1,  # General topic
         )
     except (TelegramError, RuntimeError) as exc:
         logger.debug("Shutdown notification skipped: %s", exc)
 
 
 async def post_stop(application: Application) -> None:
-    """Send shutdown notification while HTTP transport is still alive."""
+    """Stop producers and drain pending deliveries while HTTP is alive.
+
+    PTB runs post_stop before Application.shutdown (HTTPXRequest teardown),
+    so this is the only place where queued Telegram sends can still succeed.
+    """
+    await bootstrap.stop_delivery_runtime()
     await _send_shutdown_notification(application)
 
 
@@ -194,6 +199,12 @@ async def _error_handler(_update: object, context: ContextTypes.DEFAULT_TYPE) ->
     if isinstance(context.error, BadRequest) and "too old" in str(context.error):
         logger.debug("Callback query expired (query too old)")
         return
+    if isinstance(context.error, RetryAfter):
+        logger.warning(
+            "Telegram rate limit persisted after retries",
+            retry_after_seconds=retry_after_seconds(context.error),
+        )
+        return
     if isinstance(context.error, NetworkError) and not isinstance(
         context.error, BadRequest
     ):
@@ -213,7 +224,7 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        .rate_limiter(AIORateLimiter(max_retries=5))
+        .rate_limiter(CCGramAIORateLimiter(max_retries=3))
         # CCGRAM-HOTFIX:file-dl-timeouts — PTB's defaults on the main request
         # object are read/write/connect=5s, pool=1s. All bot traffic on the N100
         # goes through the local xray proxy (HTTPS_PROXY=127.0.0.1:20171), where
@@ -228,11 +239,14 @@ def create_bot() -> Application:
                 write_timeout=60.0,
                 media_write_timeout=120.0,
                 pool_timeout=5.0,
+                request_name="Bot API",
             )
         )
         .get_updates_request(
             ResilientPollingHTTPXRequest(
                 connection_pool_size=1,
+                read_timeout=_GET_UPDATES_READ_TIMEOUT_S,
+                request_name="getUpdates",
                 on_success=_record_successful_poll,
             )
         )

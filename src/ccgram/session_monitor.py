@@ -17,7 +17,9 @@ Re-exported from transcript_reader for backward-compatible imports.
 """
 
 import asyncio
+import contextlib
 import structlog
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -25,9 +27,17 @@ from typing import Any
 from telegram.error import TelegramError
 
 from .config import config
+from .delivery_contract import (
+    DeliveryReceipt,
+    activate_delivery_receipt,
+    deactivate_delivery_receipt,
+    new_delivery_receipt,
+    settled_prefix,
+    settled_run_offset,
+)
 from .event_reader import read_new_events
 from .idle_tracker import IdleTracker
-from .monitor_state import MonitorState
+from .monitor_state import BacklogSkipIntent, MonitorState
 from .providers import get_provider_for_window, registry  # noqa: F401 (used by test patches)
 from .session_map import parse_session_map, read_session_map_raw, session_map_prefix
 from .session_lifecycle import session_lifecycle
@@ -55,6 +65,8 @@ _LoopError = (OSError, RuntimeError, json.JSONDecodeError, ValueError, TelegramE
 
 _BACKOFF_MIN = 2.0
 _BACKOFF_MAX = 30.0
+_SKIP_RETRY_BASE_SECONDS = 2.0
+_SKIP_RETRY_MAX_SECONDS = 60.0
 _MSG_PREVIEW_LENGTH = 80
 
 logger = structlog.get_logger()
@@ -98,7 +110,26 @@ class SessionMonitor:
         self._hook_event_callback: Callable[[HookEvent], Awaitable[None]] | None = None
 
         self._idle_tracker = IdleTracker()
-        self._transcript_reader = TranscriptReader(self.state, self._idle_tracker)
+        self._transcript_reader = TranscriptReader(
+            self.state,
+            self._idle_tracker,
+            on_session_retired=self._discard_session_delivery_state,
+        )
+        # Receipts are grouped by transcript session so one failed send only
+        # freezes its own watermark.
+        self._delivery_receipts: dict[str, list[DeliveryReceipt]] = {}
+        # Backlog skips cross the monitor/queue boundary through injected
+        # adapters, preserving this module's handler independence.
+        self._skip_purge_callback: (
+            Callable[[BacklogSkipIntent], Awaitable[int | None]] | None
+        ) = None
+        self._skip_validate_callback: Callable[[BacklogSkipIntent], bool] | None = None
+        self._skip_notice_callback: (
+            Callable[[BacklogSkipIntent], Awaitable[None]] | None
+        ) = None
+        self._skip_notice_receipts: dict[str, DeliveryReceipt] = {}
+        self._skip_retry_attempts: dict[str, int] = {}
+        self._skip_retry_at: dict[str, float] = {}
 
     # Delegation properties for backward-compatible test access
     @property
@@ -125,6 +156,12 @@ class SessionMonitor:
         """Get monotonic timestamp of last transcript activity for a session."""
         return self._idle_tracker.get_last_activity(session_id)
 
+    def _discard_session_delivery_state(self, session_id: str) -> None:
+        """Drop receipts tied to a session identity that no longer exists."""
+        self._delivery_receipts.pop(session_id, None)
+        self._skip_notice_receipts.pop(session_id, None)
+        self._clear_skip_retry(session_id)
+
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
@@ -138,11 +175,272 @@ class SessionMonitor:
     def set_hook_event_callback(self, callback: Callable[..., Awaitable[None]]) -> None:
         self._hook_event_callback = callback
 
+    def set_skip_callbacks(
+        self,
+        *,
+        purge: Callable[[BacklogSkipIntent], Awaitable[int | None]],
+        notice: Callable[[BacklogSkipIntent], Awaitable[None]],
+        validate: Callable[[BacklogSkipIntent], bool],
+    ) -> None:
+        """Install the queue adapters used by confirmed backlog skips."""
+        self._skip_purge_callback = purge
+        self._skip_validate_callback = validate
+        self._skip_notice_callback = notice
+
+    async def request_backlog_skip(
+        self, user_id: int, window_id: str, thread_id: int | None, chat_id: int
+    ) -> BacklogSkipIntent | None:
+        """Freeze one source at EOF, persist its barrier, then retire its queue work."""
+        if (
+            self._skip_purge_callback is None
+            or self._skip_notice_callback is None
+            or self._skip_validate_callback is None
+        ):
+            raise RuntimeError("backlog skip callbacks are not wired")
+        session_id = session_lifecycle.resolve_session_id(window_id)
+        if not session_id:
+            return None
+        session = self.state.get_session(session_id)
+        if session is None or session_id in self.state.pending_skips:
+            return None
+        try:
+            snapshot_offset = Path(session.file_path).stat().st_size
+        except OSError:
+            logger.warning(
+                "Cannot snapshot transcript for backlog skip: %s", session.file_path
+            )
+            return None
+        if snapshot_offset < session.last_byte_offset:
+            logger.warning(
+                "Refusing backlog skip with regressed transcript EOF: %s", session_id
+            )
+            return None
+        intent = BacklogSkipIntent(
+            session_id=session_id,
+            window_id=window_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            snapshot_offset=snapshot_offset,
+            range_start=session.last_byte_offset,
+        )
+        # The durable barrier is written before destructive queue retirement.
+        self.state.begin_skip(intent)
+        if not self.state.save_if_dirty():
+            self.state.cancel_skip(session_id)
+            return None
+        prepared = await self._prepare_pending_skip(intent)
+        if prepared is not True:
+            return None
+        if not await self._enqueue_pending_skip_notice(intent):
+            return None
+        return intent
+
+    def _skip_is_current(self, intent: BacklogSkipIntent) -> bool:
+        callback = self._skip_validate_callback
+        if callback is None:
+            return False
+        try:
+            return callback(intent)
+        except Exception:
+            logger.exception(
+                "Failed to validate backlog skip for %s", intent.session_id
+            )
+            return False
+
+    def _skip_retry_due(self, session_id: str) -> bool:
+        return time.monotonic() >= self._skip_retry_at.get(session_id, 0.0)
+
+    def _schedule_skip_retry(self, session_id: str) -> None:
+        attempt = self._skip_retry_attempts.get(session_id, 0) + 1
+        delay = min(
+            _SKIP_RETRY_MAX_SECONDS,
+            _SKIP_RETRY_BASE_SECONDS * (2 ** min(attempt - 1, 5)),
+        )
+        self._skip_retry_attempts[session_id] = attempt
+        self._skip_retry_at[session_id] = time.monotonic() + delay
+        logger.warning(
+            "Backlog skip step failed; retrying later",
+            session_id=session_id,
+            retry=attempt,
+            retry_in_seconds=delay,
+        )
+
+    def _clear_skip_retry(self, session_id: str) -> None:
+        self._skip_retry_attempts.pop(session_id, None)
+        self._skip_retry_at.pop(session_id, None)
+
+    async def _prepare_pending_skip(self, intent: BacklogSkipIntent) -> bool | None:
+        """Retire frozen source work before a skip notice may be sent."""
+        if not self._skip_is_current(intent):
+            logger.warning("Cancelling stale backlog skip for %s", intent.session_id)
+            self.state.cancel_skip(intent.session_id)
+            self.state.save_if_dirty()
+            self._clear_skip_retry(intent.session_id)
+            return None
+        if intent.purge_complete:
+            return True
+        callback = self._skip_purge_callback
+        if callback is None or not self._skip_retry_due(intent.session_id):
+            return False
+        try:
+            skipped = await callback(intent)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to purge backlog for %s", intent.session_id)
+            self._schedule_skip_retry(intent.session_id)
+            return False
+        if skipped is None:
+            logger.warning("Cancelling stale backlog skip for %s", intent.session_id)
+            self.state.cancel_skip(intent.session_id)
+            self.state.save_if_dirty()
+            self._clear_skip_retry(intent.session_id)
+            return None
+        self.state.update_skip_count(intent.session_id, skipped)
+        if not self.state.save_if_dirty():
+            intent.purge_complete = False
+            self._schedule_skip_retry(intent.session_id)
+            return False
+        self._clear_skip_retry(intent.session_id)
+        return True
+
+    async def _enqueue_pending_skip_notice(self, intent: BacklogSkipIntent) -> bool:
+        """Create one receipt-tracked visible notice for a persisted barrier."""
+        if not self._skip_is_current(intent):
+            self.state.cancel_skip(intent.session_id)
+            self.state.save_if_dirty()
+            self._clear_skip_retry(intent.session_id)
+            return False
+        if intent.session_id in self._skip_notice_receipts or not self._skip_retry_due(
+            intent.session_id
+        ):
+            return False
+        callback = self._skip_notice_callback
+        if callback is None:
+            return False
+        receipt = new_delivery_receipt(checkpoint=intent.snapshot_offset)
+        token = activate_delivery_receipt(receipt)
+        try:
+            await callback(intent)
+        except asyncio.CancelledError:
+            receipt.fail()
+            raise
+        except Exception:
+            receipt.fail()
+            logger.exception(
+                "Failed to enqueue backlog skip notice for %s", intent.session_id
+            )
+            self._schedule_skip_retry(intent.session_id)
+        finally:
+            deactivate_delivery_receipt(token)
+            receipt.close()
+        if receipt.failed:
+            return False
+        self._clear_skip_retry(intent.session_id)
+        self._skip_notice_receipts[intent.session_id] = receipt
+        return True
+
+    async def _resume_pending_skip_notices(self) -> None:
+        """Resume persisted skip barriers before reading any skipped bytes."""
+        for intent in tuple(self.state.pending_skips.values()):
+            if not self._skip_retry_due(intent.session_id):
+                continue
+            prepared = await self._prepare_pending_skip(intent)
+            if prepared:
+                await self._enqueue_pending_skip_notice(intent)
+
+    def _commit_pending_skips(self) -> None:
+        """Advance only barriers whose visible notices reached Telegram."""
+        for session_id, receipt in tuple(self._skip_notice_receipts.items()):
+            if receipt.failed:
+                # A failed notice has no acknowledgement boundary. Remove the
+                # failed receipt so the persisted barrier can retry in-process;
+                # the source remains paused until a notice is delivered.
+                self._skip_notice_receipts.pop(session_id, None)
+                self._schedule_skip_retry(session_id)
+                continue
+            if not receipt.commit_ready:
+                continue
+            intent = self.state.pending_skips.get(session_id)
+            if intent is None or not self._skip_is_current(intent):
+                # A topic may rebind after the notice was queued or delivered.
+                # Never advance the old source watermark across that boundary.
+                self.state.cancel_skip(session_id)
+                self.state.save_if_dirty()
+                self._delivery_receipts.pop(session_id, None)
+                self._skip_notice_receipts.pop(session_id, None)
+                self._clear_skip_retry(session_id)
+                continue
+            if self.state.complete_skip(session_id):
+                self.state.save_if_dirty()
+                self._delivery_receipts.pop(session_id, None)
+            else:
+                # The tracked session was removed or re-keyed. Do not retain a
+                # barrier that can no longer be committed or replay safely.
+                self.state.cancel_skip(session_id)
+                self.state.save_if_dirty()
+                self._delivery_receipts.pop(session_id, None)
+            self._skip_notice_receipts.pop(session_id, None)
+            self._clear_skip_retry(session_id)
+
     def record_hook_activity(self, window_id: str) -> None:
         """Record hook-based activity for a window (resets idle timers)."""
         session_id = session_lifecycle.resolve_session_id(window_id)
         if session_id:
             self._idle_tracker.record_activity(session_id)
+
+    def commit_delivered_watermarks(self) -> None:
+        """Persist receipts acknowledged by the delivery boundary.
+
+        Called after a normal monitor cycle and after the bounded shutdown
+        drain. It intentionally has no queue implementation knowledge.
+        """
+        self._commit_watermark_prefixes()
+
+    def _commit_watermark_prefixes(self) -> None:
+        """Commit each session's longest settled receipt run (#205).
+
+        Waiting for every receipt of a session to close (the previous
+        policy) never commits under sustained output: in-flight tasks hold
+        back the whole settled run, so a restart replays it in full into
+        the outbound queue. The run policy lives in
+        delivery_contract.settled_prefix / settled_run_offset (including
+        the shared-batch-checkpoint tie rule: persistence lags delivery by
+        at most one in-flight batch); this coordinator groups receipts by
+        session, keeps the pending-tools and pending-skip fences, and persists
+        one batched commit per cycle. The settled run
+        is consumed even when the tie rule defers its commit: replay then
+        re-delivers those messages, which at-least-once permits.
+        """
+        delivered_offsets: dict[str, int] = {}
+        consumed: dict[str, int] = {}
+        self._commit_pending_skips()
+        for session_id, receipts in self._delivery_receipts.items():
+            if (
+                not receipts
+                or session_id in self.state.pending_skips
+                or session_id in self._pending_tools
+            ):
+                continue
+            prefix = settled_prefix(receipts)
+            if not prefix:
+                continue
+            fence = receipts[len(prefix)] if len(prefix) < len(receipts) else None
+            offset = settled_run_offset(prefix, fence)
+            if offset is not None:
+                delivered_offsets[session_id] = offset
+            consumed[session_id] = len(prefix)
+        if delivered_offsets and self.state.commit_parsed_offsets(
+            set(delivered_offsets), delivered_offsets=delivered_offsets
+        ):
+            self.state.save_if_dirty()
+        for session_id, count in consumed.items():
+            remainder = self._delivery_receipts[session_id][count:]
+            if remainder:
+                self._delivery_receipts[session_id] = remainder
+            else:
+                self._delivery_receipts.pop(session_id, None)
 
     async def check_for_updates(self, current_map: dict) -> list[NewMessage]:
         """Check all sessions for new assistant messages.
@@ -168,6 +466,8 @@ class SessionMonitor:
             fallback_session_ids.add(session_id)
 
         for session_id, file_path in direct_sessions:
+            if session_id in self.state.pending_skips:
+                continue
             try:
                 await self._process_session_file(
                     session_id,
@@ -182,7 +482,10 @@ class SessionMonitor:
             active_cwds = await self._get_active_cwds()
             sessions = self._scan_projects_sync(active_cwds) if active_cwds else []
             for session_info in sessions:
-                if session_info.session_id not in fallback_session_ids:
+                if (
+                    session_info.session_id not in fallback_session_ids
+                    or session_info.session_id in self.state.pending_skips
+                ):
                     continue
                 try:
                     await self._process_session_file(
@@ -318,6 +621,15 @@ class SessionMonitor:
                 if provider_name:
                     _sm.set_window_provider(window_id, provider_name)
 
+                if thread_router.has_window(window_id):
+                    # A key that is new to the map is not a window that is new
+                    # to ccgram. Identity folding runs first (``_monitor_loop``),
+                    # so a re-keyed or late-published identity already carries
+                    # the topic it was bound under; announcing it here would
+                    # ask for a second topic for the same agent. Both other
+                    # discovery paths skip bound windows for the same reason.
+                    continue
+
                 if self._new_window_callback:
                     event = NewWindowEvent(
                         window_id=window_id,
@@ -417,6 +729,45 @@ class SessionMonitor:
                     window_id,
                 )
 
+    def _register_delivery_receipts(
+        self, messages: list[NewMessage]
+    ) -> list[tuple[NewMessage, DeliveryReceipt]]:
+        """Register a non-ready receipt for every parsed message synchronously."""
+        pending: list[tuple[NewMessage, DeliveryReceipt]] = []
+        if self._message_callback is None:
+            return pending
+        for msg in messages:
+            session = self.state.get_session(msg.session_id)
+            checkpoint = session.parsed_offset if session is not None else None
+            receipt = new_delivery_receipt(checkpoint=checkpoint)
+            self._delivery_receipts.setdefault(msg.session_id, []).append(receipt)
+            pending.append((msg, receipt))
+        return pending
+
+    async def _dispatch_message_with_receipt(
+        self, msg: NewMessage, receipt: DeliveryReceipt | None = None
+    ) -> None:
+        """Run one transcript callback under a delivery-boundary receipt."""
+        if self._message_callback is None:
+            return
+        if receipt is None:
+            session = self.state.get_session(msg.session_id)
+            checkpoint = session.parsed_offset if session is not None else None
+            receipt = new_delivery_receipt(checkpoint=checkpoint)
+            self._delivery_receipts.setdefault(msg.session_id, []).append(receipt)
+        token = activate_delivery_receipt(receipt)
+        try:
+            await self._message_callback(msg)
+        except asyncio.CancelledError:
+            receipt.fail()
+            raise
+        except _CallbackError:
+            receipt.fail()
+            logger.exception("Message callback error for session=%s", msg.session_id)
+        finally:
+            deactivate_delivery_receipt(token)
+            receipt.close()
+
     async def _monitor_loop(self) -> None:
         """Background poll loop."""
         logger.info("Session monitor started, polling every %ss", self.poll_interval)
@@ -434,18 +785,40 @@ class SessionMonitor:
         error_streak = 0
         while self._running:
             try:
-                await self._read_hook_events()
                 raw_session_map = await read_session_map_raw()
-                await session_map_sync.load_session_map(raw_session_map)
 
-                current_map = await self._detect_and_cleanup_changes(raw_session_map)
-
+                # A fresh listing owns identity convergence. It must precede
+                # session-map loading because loading rejects raw legacy keys;
+                # after a successful fold, re-read the hook file under its
+                # normal parser so the canonical key is what lifecycle sees.
                 all_windows = await list_windows_for_reconciliation(tmux_manager)
                 if all_windows is None:
                     logger.warning(
                         "Multiplexer listing unavailable; skipping window reconciliation"
                     )
                 else:
+                    # Before anything keys off these ids, let the backend
+                    # reconcile only aliases it explicitly attests as safe.
+                    # Herdr publishes no raw locator aliases, so a missing or
+                    # changed session target remains unresolved until an
+                    # operator explicitly rebinds it.
+                    # Lazy: importing session_manager at module scope forms a
+                    # hard cycle on bootstrap (same reason as below).
+                    from .session import session_manager as _sm
+
+                    _sm.reconcile_window_aliases(all_windows)
+                    raw_session_map = await read_session_map_raw()
+
+                # Dispatch only after identity convergence and the session-map
+                # re-read: hook routing is exact-bound, so consuming a canonical
+                # event before moving a legacy topic binding would drop it.
+                await self._read_hook_events()
+
+                await session_map_sync.load_session_map(raw_session_map)
+                current_map = await self._detect_and_cleanup_changes(raw_session_map)
+
+                monitored_map = current_map
+                if all_windows is not None:
                     live_window_ids = {w.window_id for w in all_windows}
                     session_map_sync.prune_session_map(live_window_ids)
                     known_window_ids = set(current_map.keys())
@@ -455,10 +828,23 @@ class SessionMonitor:
                     await self._emit_known_unbound_window_events(
                         current_map, live_window_ids
                     )
+                    monitored_map = {
+                        window_id: details
+                        for window_id, details in current_map.items()
+                        if window_id in live_window_ids
+                    }
 
-                new_messages = await self.check_for_updates(current_map)
+                # A persisted barrier must be noticed before its source is read
+                # again; this preserves the exact EOF snapshot across restarts.
+                await self._resume_pending_skip_notices()
+                self._commit_pending_skips()
+                new_messages = await self.check_for_updates(monitored_map)
+                # Register every parsed message before the next await. A
+                # shutdown cancellation between parse and dispatch must leave
+                # a non-ready receipt so its offset remains replayable.
+                pending_dispatches = self._register_delivery_receipts(new_messages)
 
-                for msg in new_messages:
+                for msg, receipt in pending_dispatches:
                     structlog.contextvars.clear_contextvars()
                     structlog.contextvars.bind_contextvars(session_id=msg.session_id)
                     status = "complete" if msg.is_complete else "streaming"
@@ -466,14 +852,9 @@ class SessionMonitor:
                         "..." if len(msg.text) > _MSG_PREVIEW_LENGTH else ""
                     )
                     logger.debug("[%s] session=%s: %s", status, msg.session_id, preview)
-                    if self._message_callback:
-                        try:
-                            await self._message_callback(msg)
-                        except _CallbackError:
-                            logger.exception(
-                                "Message callback error for session=%s",
-                                msg.session_id,
-                            )
+                    await self._dispatch_message_with_receipt(msg, receipt)
+
+                self.commit_delivered_watermarks()
 
             except _LoopError:
                 logger.exception("Monitor loop error")
@@ -502,14 +883,24 @@ class SessionMonitor:
         self._task.add_done_callback(task_done_callback)
 
     def stop(self) -> None:
+        """Request producer cancellation; use ``stop_and_wait`` before drain."""
         self._running = False
         if self._task:
             self._task.cancel()
-            self._task = None
         self.state.save()
         # Distinct from the loop's "Session monitor stopped" (logged when the
         # poll loop actually exits) — this marks the stop request + state save.
         logger.info("Session monitor stop requested; state saved")
+
+    async def stop_and_wait(self) -> None:
+        """Cancel the monitor producer and wait until it cannot enqueue again."""
+        self.stop()
+        task = self._task
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            if self._task is task:
+                self._task = None
 
 
 _active_monitor: SessionMonitor | None = None

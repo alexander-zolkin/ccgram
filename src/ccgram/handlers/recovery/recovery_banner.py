@@ -188,7 +188,7 @@ def _recovery_help_text(window_id: str) -> str:
     parts = ["Start fresh"]
     if caps.supports_continue:
         parts.append("Continue last session")
-    if caps.supports_resume:
+    if caps.supports_resume and caps.supports_resume_picker:
         parts.append("Resume from list")
     return " · ".join(parts)
 
@@ -222,7 +222,7 @@ def build_recovery_keyboard(window_id: str) -> InlineKeyboardMarkup:
                 ),
             )
         )
-    if caps.supports_resume:
+    if caps.supports_resume and caps.supports_resume_picker:
         options.append(
             InlineKeyboardButton(
                 "⏪ Resume",
@@ -249,12 +249,23 @@ async def _create_and_bind_window(
     agent_args: str = "",
     success_label: str = "Session started.",
     old_window_id: str = "",
+    provider_name: str = "",
 ) -> bool:
     """Create a new tmux window, bind it, rename topic, forward pending text.
 
+    ``provider_name`` overrides the provider inherited from ``old_window_id``.
+    A resume pick needs it: the picker widens to every provider precisely when
+    the old window has no provider name, so inheriting from it would resolve to
+    the config default and launch that agent with another agent's resume args.
+
     Returns True on success, False on failure.
     """
-    thread_router.unbind_thread(user_id, thread_id)
+    thread_router.unbind_thread(
+        user_id,
+        thread_id,
+        retirement_reason="system_replacement",
+        cleanup_eligible=True,
+    )
     # Lazy: polling_state → recovery_banner via callback_registry
     # side effects.
     # Lazy: polling.polling_state pulls heavy strategy stack; defer per-call
@@ -265,9 +276,14 @@ async def _create_and_bind_window(
     if old_window_id:
         old_view = window_query.view_window(old_window_id)
         provider = get_provider_for_window(
-            old_window_id, provider_name=old_view.provider_name if old_view else None
+            old_window_id,
+            provider_name=provider_name
+            or (old_view.provider_name if old_view else None),
         )
         approval_mode = old_view.approval_mode if old_view else "normal"
+    elif provider_name:
+        provider = get_provider_for_window("", provider_name=provider_name)
+        approval_mode = "normal"
     else:
         provider = get_provider()
         approval_mode = "normal"
@@ -293,7 +309,12 @@ async def _create_and_bind_window(
     topic_orchestration.register_pending_creation(created_wid)
 
     if provider.capabilities.supports_hook:
-        await session_map_sync.wait_for_session_map_entry(created_wid)
+        await session_map_sync.wait_for_session_map_entry(
+            created_wid,
+            timeout=5.0,
+            resolve_window_id=window_query.resolve_window_alias,
+        )
+    created_wid = window_query.resolve_window_alias(created_wid)
 
     session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
     session_manager.set_window_provider(created_wid, provider.capabilities.name)
@@ -648,6 +669,51 @@ def _cwd_for_window(window_id: str) -> str:
     return view.cwd if view else ""
 
 
+async def _recovery_cwd_or_report(
+    query: CallbackQuery,
+    window_id: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> str | None:
+    """Return the recovery cwd, or report which of two failures happened.
+
+    Fresh/Continue/Resume all need the directory, and both ways of not having
+    it used to share one message that claimed the directory was gone (#176).
+    A missing window state means the directory is *unknown*, which is a
+    different problem with a different way out: Browse still works without
+    state, so offer it rather than ending the flow on a false statement about
+    the filesystem.
+    """
+    cwd = _cwd_for_window(window_id)
+    if not cwd:
+        await safe_edit(
+            query,
+            "⚠ This topic's session state is gone, so its folder is unknown.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "\U0001f5c2 Browse other projects",
+                            callback_data=compact_callback_data(
+                                CB_RECOVERY_BROWSE,
+                                f"{CB_RECOVERY_BROWSE}{window_id}",
+                                window_id,
+                            ),
+                        )
+                    ]
+                ]
+            ),
+        )
+        # Deliberately not cleared: Browse re-validates against this state.
+        await query.answer("State gone")
+        return None
+    if not Path(cwd).is_dir():
+        await safe_edit(query, "\u274c Directory no longer exists.")
+        _clear_recovery_state(context.user_data)
+        await query.answer("Project gone")
+        return None
+    return cwd
+
+
 async def _handle_back(
     query: CallbackQuery,
     data: str,
@@ -695,11 +761,8 @@ async def _handle_fresh(
         return
 
     thread_id, _ = validated
-    cwd = _cwd_for_window(old_wid)
-    if not cwd or not Path(cwd).is_dir():
-        await safe_edit(query, "❌ Directory no longer exists.")
-        _clear_recovery_state(context.user_data)
-        await query.answer("Project gone")
+    cwd = await _recovery_cwd_or_report(query, old_wid, context)
+    if cwd is None:
         return
 
     await _create_and_bind_window(
@@ -733,20 +796,28 @@ async def _handle_continue(
         return
 
     thread_id, _ = validated
-    cwd = _cwd_for_window(old_wid)
-    if not cwd or not Path(cwd).is_dir():
-        await safe_edit(query, "❌ Directory no longer exists.")
-        _clear_recovery_state(context.user_data)
-        await query.answer("Project gone")
+    cwd = await _recovery_cwd_or_report(query, old_wid, context)
+    if cwd is None:
         return
 
-    if not await asyncio.to_thread(scan_sessions_for_cwd, cwd):
+    provider_name = window_query.get_window_provider(old_wid)
+    provider = get_provider_for_window(old_wid, provider_name=provider_name)
+    # Probe with the resolved name, not the raw three-valued one. Resume may
+    # widen an unknown provider to every picker-capable one because each entry
+    # carries its own provider to the relaunch; Continue cannot, because it
+    # launches exactly this ``provider``. Probing wider would find another
+    # agent's sessions, skip the empty state, and run `<default> --continue`
+    # into a folder it has nothing to continue — the silent failure the empty
+    # state exists to prevent.
+    if provider.capabilities.supports_resume_picker and not await asyncio.to_thread(
+        scan_sessions_for_cwd,
+        cwd,
+        provider.capabilities.name,
+    ):
         await _send_empty_state(query, old_wid, cwd)
         return
 
-    launch_args = get_provider_for_window(
-        old_wid, provider_name=window_query.get_window_provider(old_wid)
-    ).make_launch_args(use_continue=True)
+    launch_args = provider.make_launch_args(use_continue=True)
     await _create_and_bind_window(
         query,
         user_id,
@@ -773,21 +844,28 @@ async def _handle_resume(
         await query.answer("Stale recovery (topic mismatch)", show_alert=True)
         return
 
-    cwd = _cwd_for_window(old_wid)
-    if not cwd or not Path(cwd).is_dir():
-        await safe_edit(query, "❌ Directory no longer exists.")
-        _clear_recovery_state(context.user_data)
-        await query.answer("Project gone")
+    cwd = await _recovery_cwd_or_report(query, old_wid, context)
+    if cwd is None:
         return
 
-    sessions = await asyncio.to_thread(scan_sessions_for_cwd, cwd)
+    provider_name = window_query.get_window_provider(old_wid)
+    sessions = await asyncio.to_thread(
+        scan_sessions_for_cwd,
+        cwd,
+        provider_name,
+    )
     if not sessions:
         await _send_empty_state(query, old_wid, cwd)
         return
 
     if context.user_data is not None:
         context.user_data[RECOVERY_SESSIONS] = [
-            {"session_id": s.session_id, "summary": s.summary, "mtime": s.mtime}
+            {
+                "session_id": s.session_id,
+                "summary": s.summary,
+                "mtime": s.mtime,
+                "provider_name": s.provider_name,
+            }
             for s in sessions
         ]
 
@@ -847,7 +925,8 @@ async def _handle_browse(
         await query.answer("Stale recovery (topic mismatch)", show_alert=True)
         return
 
-    sessions = await asyncio.to_thread(scan_all_sessions)
+    provider_name = window_query.get_window_provider(old_wid)
+    sessions = await asyncio.to_thread(scan_all_sessions, provider_name)
     if not sessions:
         await safe_edit(query, "⚠ No past sessions found in any project.")
         _clear_recovery_state(context.user_data)
@@ -864,6 +943,7 @@ async def _handle_browse(
                 "cwd": s.cwd,
                 "mtime": s.mtime,
                 "msg_count": s.msg_count,
+                "provider_name": s.provider_name,
             }
             for s in sessions
         ]

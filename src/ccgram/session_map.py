@@ -43,6 +43,40 @@ logger = structlog.get_logger()
 
 _DEFAULT_PRIMARY_SESSION_GRACE_SEC = 60.0
 
+# "A creation flow currently owns this window" — wired at startup to the
+# topic-creation flow's pending set, which lives with the flow that owns it
+# (a core → handlers import would invert the dependency).
+_in_flight_window_predicate: Callable[[str], bool] | None = None
+
+
+def register_in_flight_window_predicate(predicate: Callable[[str], bool]) -> None:
+    """Wire the in-flight-creation check (called once at startup).
+
+    Raises RuntimeError if called more than once — wiring happens exactly
+    once at startup; double registration is a programming error.
+    """
+    global _in_flight_window_predicate
+    if _in_flight_window_predicate is not None:
+        raise RuntimeError("register_in_flight_window_predicate already registered")
+    _in_flight_window_predicate = predicate
+
+
+def _reset_in_flight_window_predicate_for_testing() -> None:
+    """Restore the unwired default — only for tests."""
+    global _in_flight_window_predicate
+    _in_flight_window_predicate = None
+
+
+def _creation_in_flight(window_id: str) -> bool:
+    """Whether a creation flow currently owns this window id.
+
+    Unwired (``doctor``, ``status``, unit tests) means nothing is being
+    created, so nothing is protected.
+    """
+    if _in_flight_window_predicate is None:
+        return False
+    return _in_flight_window_predicate(window_id)
+
 
 def _primary_session_grace_sec() -> float:
     raw = os.getenv("CCGRAM_NESTED_SESSION_GRACE_SEC")
@@ -92,6 +126,18 @@ def session_map_prefix() -> str:
     ``f"{config.tmux_session_name}:"``.
     """
     return session_map_prefix_for(config.multiplexer_name, config.tmux_session_name)
+
+
+def strip_session_map_prefix(window_key: str, prefix: str) -> str | None:
+    """Return a window ID only when ``window_key`` has the exact ``prefix``.
+
+    ``events.jsonl`` and ``session_map.json`` share this key scheme. A target
+    alone is not enough to route a hook event: another backend or tmux session
+    can use the same target, so callers must reject unmatched prefixes.
+    """
+    if not window_key.startswith(prefix):
+        return None
+    return window_key.removeprefix(prefix)
 
 
 def is_backend_window_id(window_id: str) -> bool:
@@ -206,9 +252,11 @@ def parse_session_map(raw: dict[str, Any], prefix: str) -> dict[str, dict[str, s
         return {}
     result: dict[str, dict[str, str]] = {}
     for key, info in raw.items():
-        if not isinstance(key, str) or not key.startswith(prefix):
+        if not isinstance(key, str):
             continue
-        window_name = key[len(prefix) :]
+        window_name = strip_session_map_prefix(key, prefix)
+        if window_name is None:
+            continue
         # A Herdr prefix alone is not authority: only an exact versioned
         # guarded-session target is accepted. Raw tab/pane IDs are legacy
         # migration records and must not reach monitor lifecycle processing.
@@ -261,12 +309,22 @@ def _dead_session_map_entries(
 def _remove_dead_session_map_entries(
     raw: dict[str, Any], dead_entries: list[tuple[str, str]], window_store: Any
 ) -> bool:
+    # Lazy: window_state_store / thread_router proxies wired by SessionManager constructor
+    from .thread_router import thread_router
+
+    # A window dying is exactly when the recovery banner goes up, and its
+    # Fresh/Continue/Resume buttons read the directory back out of the window
+    # state. Dropping that state here answered every button with "Directory no
+    # longer exists" while the directory was sitting there (#176). The dead
+    # entry still goes; the state a live topic still points at stays until the
+    # topic unbinds and ``_remove_stale_window_states`` reclaims it.
+    bound_wids = thread_router.all_bound_window_ids()
     changed_state = False
     for key, window_id in dead_entries:
         logger.info("Pruning dead session_map entry: %s (window %s)", key, window_id)
         del raw[key]
         log_throttle_reset(f"preserve-primary:{window_id}")
-        if window_store.has_window(window_id):
+        if window_id not in bound_wids and window_store.has_window(window_id):
             window_store.remove_window(window_id)
             changed_state = True
     return changed_state
@@ -381,12 +439,12 @@ class SessionMapSync:
         # Lazy: window_state_store / thread_router proxies wired by SessionManager constructor
         from .window_state_store import window_store
 
-        bound_wids = {
-            wid
-            for user_bindings in thread_router.thread_bindings.values()
-            for wid in user_bindings.values()
-            if wid
-        }
+        # Must cover chat-scoped bindings too: ``set_group_chat_id`` moves a
+        # binding out of ``thread_bindings`` into ``chat_thread_bindings``, so
+        # in a forum deployment the legacy dict is empty and reading it alone
+        # leaves this guard dead — sweeping the state of every bound window
+        # whose provider has no hook to keep it in the session map.
+        bound_wids = {wid for wid in thread_router.all_bound_window_ids() if wid}
         stale_wids = [
             w
             for w in window_store.iter_window_ids()
@@ -396,6 +454,13 @@ class SessionMapSync:
                 and w not in bound_wids
                 and window_store.get_session_id_for_window(w) not in old_format_sids
                 and not window_store.is_archived_legacy_herdr(w)
+                # A window being created is neither in the session map (its
+                # hook has not fired) nor bound (the flow binds afterwards),
+                # so it looks exactly like a stale one. Dropping it discards
+                # the cwd, provider, approval mode and origin the flow just
+                # wrote — the window then comes back re-derived and, having
+                # lost its ccgram origin, outside ccgram's lifecycle.
+                and not _creation_in_flight(w)
             )
         ]
         for wid in stale_wids:
@@ -408,18 +473,40 @@ class SessionMapSync:
         session_map: dict[str, Any],
         old_format_keys: list[str],
     ) -> None:
-        """Remove old-format (window-name-keyed) entries from session_map.json."""
-        if not old_format_keys:
-            return
+        """Retain unrecognized persistence keys until explicit migration/rebind.
+
+        A raw legacy Herdr key can be the only evidence that connects an old
+        Telegram topic to a newly discovered canonical target.  Deleting it
+        before the adapter has supplied an unambiguous alias makes recovery
+        impossible, so this method intentionally does not mutate the file.
+        ``session_map`` stays non-actionable because parsing still accepts only
+        backend-valid identities.
+        """
+        del session_map
         for key in old_format_keys:
-            logger.info("Removing old-format session_map key: %s", key)
-            del session_map[key]
-        atomic_write_json(config.session_map_file, session_map)
+            logger.warning(
+                "Retaining unrecognized session_map key for recovery; "
+                "wait for a unique live alias or explicitly rebind: %s",
+                key,
+            )
 
     async def wait_for_session_map_entry(
-        self, window_id: str, timeout: float = 5.0, interval: float = 0.5
+        self,
+        window_id: str,
+        timeout: float = 5.0,
+        interval: float = 0.5,
+        *,
+        resolve_window_id: Callable[[str], str] | None = None,
     ) -> bool:
         """Poll session_map.json until an entry for window_id appears.
+
+        ``resolve_window_id`` is re-applied on every poll. A backend whose
+        window identity firms up over time (Herdr mints the durable one once
+        the agent session is published) can supersede the id the caller was
+        handed *while this wait runs*, and the hook then writes its entry
+        under the new one. Re-resolving each pass means the wait watches the
+        key the window actually answers to instead of timing out on an id
+        nothing will ever write again. Callers on stable-id backends omit it.
 
         Returns True if the entry was found within timeout, False otherwise.
         """
@@ -428,10 +515,13 @@ class SessionMapSync:
             window_id,
             timeout,
         )
-        key = f"{session_map_prefix()}{window_id}"
+        current_id = window_id
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
+            if resolve_window_id is not None:
+                current_id = resolve_window_id(window_id)
+            key = f"{session_map_prefix()}{current_id}"
             try:
                 if config.session_map_file.exists():
                     async with aiofiles.open(config.session_map_file, "r") as f:
@@ -443,7 +533,7 @@ class SessionMapSync:
                     if isinstance(info, dict):
                         parse_session_map_entry(info)
                         logger.debug(
-                            "session_map entry found for window_id %s", window_id
+                            "session_map entry found for window_id %s", current_id
                         )
                         await self.load_session_map(session_map)
                         return True
@@ -451,7 +541,7 @@ class SessionMapSync:
                 pass
             await asyncio.sleep(interval)
         logger.warning(
-            "Timed out waiting for session_map entry: window_id=%s", window_id
+            "Timed out waiting for session_map entry: window_id=%s", current_id
         )
         return False
 
@@ -497,6 +587,86 @@ class SessionMapSync:
                     fcntl.flock(lock_f, fcntl.LOCK_UN)
         except OSError as exc:
             logger.warning("Failed to lock session_map for pruning: %s", exc)
+
+    @staticmethod
+    def identity_migration_backup_path(map_file: Path) -> Path:
+        """Return the retained pre-migration copy for a hook-written map."""
+        return map_file.with_name(f"{map_file.name}.identity-migration.bak")
+
+    def rename_session_map_entries(self, migrations: list[tuple[str, str]]) -> bool:
+        """Atomically re-key a set of aliases while holding the hook file lock.
+
+        The first destructive migration retains the complete pre-migration map
+        beside it.  A missing map is not an error: there is no coupled file
+        state to move.  A read, backup, lock, or write failure is an error so
+        callers can leave every in-memory store untouched and retry later.
+        """
+        map_file = config.session_map_file
+        pairs = [
+            (alias_id, canonical_id)
+            for alias_id, canonical_id in migrations
+            if alias_id and canonical_id and alias_id != canonical_id
+        ]
+        if not pairs or not map_file.exists():
+            return True
+        prefix = session_map_prefix()
+        lock_path = map_file.with_suffix(".lock")
+        try:
+            with open(lock_path, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                try:
+                    # Re-read under the hook-compatible lock so a concurrent
+                    # hook write cannot be lost between read and write.
+                    raw = _read_session_map_for_pruning()
+                    if raw is None:
+                        logger.warning(
+                            "Session-map migration deferred: map is unreadable"
+                        )
+                        return False
+                    moves = [
+                        (f"{prefix}{alias_id}", f"{prefix}{canonical_id}")
+                        for alias_id, canonical_id in pairs
+                        if f"{prefix}{alias_id}" in raw
+                    ]
+                    if not moves:
+                        return True
+                    backup = self.identity_migration_backup_path(map_file)
+                    if not backup.exists():
+                        atomic_write_json(backup, raw)
+                    for alias_key, live_key in moves:
+                        entry = raw.pop(alias_key)
+                        # The live hook entry is fresher; retain it on a
+                        # collision while still removing the superseded key.
+                        raw.setdefault(live_key, entry)
+                    atomic_write_json(map_file, raw)
+                    logger.info(
+                        "Re-keyed %d session_map entr%s",
+                        len(moves),
+                        "y" if len(moves) == 1 else "ies",
+                    )
+                    return True
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+        except OSError as exc:
+            logger.warning("Failed to lock session_map for re-keying: %s", exc)
+            return False
+
+    def rename_session_map_entry(self, alias_window_id: str, window_id: str) -> bool:
+        """Backward-compatible single-entry wrapper.
+
+        False retains the historical meaning that no file entry changed; batch
+        callers use ``rename_session_map_entries`` to distinguish safe no-ops
+        from a failed migration.
+        """
+        map_file = config.session_map_file
+        if alias_window_id == window_id or not map_file.exists():
+            return False
+        prefix = session_map_prefix()
+        alias_key = f"{prefix}{alias_window_id}"
+        raw = _read_session_map_for_pruning()
+        if raw is None or alias_key not in raw:
+            return False
+        return self.rename_session_map_entries([(alias_window_id, window_id)])
 
     def register_hookless_session(
         self,
@@ -589,6 +759,32 @@ class SessionMapSync:
                     fcntl.flock(lock_f, fcntl.LOCK_UN)
         except OSError:
             logger.exception("Failed to write session_map for hookless session")
+
+    async def session_map_entry_may_exist(self, window_id: str) -> bool:
+        """Return whether the hook may have an entry for ``window_id``.
+
+        Deliberately answers True when the file cannot be read: callers use
+        this to decide whether it is safe to write state that would clear a
+        live entry, and an unreadable map is "unknown", not "absent". Guessing
+        absent there destroys a running session's tracking; guessing present
+        only defers a heal to the next tick.
+        """
+        raw = await read_session_map_raw()
+        if raw is None:
+            return True
+        info = raw.get(f"{session_map_prefix()}{window_id}")
+        if info is None:
+            return False
+        try:
+            # The premise is that the monitor will rebuild state from this
+            # entry, which only holds for entries load_session_map accepts. One
+            # it rejects (no session_id, or a schema_version from a newer build
+            # after a downgrade) never becomes state, so treating the bare key
+            # as proof of tracking would wedge the window unhealed forever.
+            parse_session_map_entry(info)
+        except StateFileValidationError:
+            return False
+        return True
 
     def clear_session_map_entry(self, window_id: str) -> None:
         """Remove a window's entry from session_map.json if present."""

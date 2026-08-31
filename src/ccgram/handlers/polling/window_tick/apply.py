@@ -113,14 +113,33 @@ async def _transition_to_idle(
     chat_id: int,
     display: str,
     runtime: "PollingRuntime | None" = None,
+    *,
+    send_status: bool = True,
 ) -> None:
+    """Idle transition; ``send_status=False`` does the side effects only.
+
+    Used for never-active windows on startup timeout: the window must be
+    settled and its typing/emoji restored, but a fresh "Ready" bubble would
+    be restart noise (issue #180).
+    """
     ps = runtime.poll_state if runtime is not None else terminal_poll_state
     lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
-    ps.cancel_startup_timer(window_id)
+    # Settle the window, don't just stop its clock: clearing the startup
+    # timestamp alone leaves it indistinguishable from one that never started,
+    # so the very next tick decides "starting" again — green topic, typing
+    # indicator, another 30s grace, idle, repeat. A quiet settlement also
+    # cannot use has_seen_status: that flag means a genuine status was shown.
+    if send_status:
+        ps.mark_seen_status(window_id)
+        ps.mark_idle_status_announced(window_id)
+    else:
+        ps.mark_startup_quietly_settled(window_id)
     client = PTBTelegramClient(bot)
     await update_topic_emoji(client, chat_id, thread_id, "idle", display)
     lc.clear_autoclose_timer(user_id, thread_id)
     lc.clear_typing_state(user_id, thread_id)
+    if not send_status:
+        return
     await enqueue_status_update(
         client, user_id, window_id, IDLE_STATUS_TEXT, thread_id=thread_id
     )
@@ -406,7 +425,11 @@ async def _probe_topic_after_death(
                 window_id=wid,
                 window_dead=True,
             )
-            thread_router.unbind_thread(user_id, thread_id)
+            thread_router.unbind_thread(
+                user_id,
+                thread_id,
+                retirement_reason="remote_deleted",
+            )
             logger.info(
                 "Topic deleted: unbound window %s for thread %d, user %d",
                 wid,
@@ -472,14 +495,17 @@ async def _apply_done_transition(
     lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
     chat_id = thread_router.resolve_chat_id(user_id, thread_id)
     display = thread_router.get_display_name(window_id)
-    ps.cancel_startup_timer(window_id)
+    # Same reason as the idle transition: a window that reached done has
+    # finished starting, whoever reports its completion. Leaving the flag
+    # unset for hook-backed providers put exactly those windows — the ones
+    # whose Stop hook makes done reliable — back into the startup grace on
+    # the next tick, so a finished agent kept re-painting its topic green.
+    ps.mark_seen_status(window_id)
     client = PTBTelegramClient(bot)
     await update_topic_emoji(client, chat_id, thread_id, "done", display)
     lc.start_autoclose_timer(user_id, thread_id, "done", time.monotonic())
     lc.clear_typing_state(user_id, thread_id)
     await enqueue_status_update(client, user_id, window_id, None, thread_id=thread_id)
-    if not _get_provider(window_id).capabilities.supports_hook:
-        ps.mark_seen_status(window_id)
 
 
 async def _apply_starting_transition(
@@ -529,6 +555,7 @@ async def _apply_tick_decision(
             thread_router.resolve_chat_id(user_id, thread_id),
             thread_router.get_display_name(window_id),
             runtime=runtime,
+            send_status=decision.send_status,
         )
     elif decision.transition == "done":
         await _apply_done_transition(

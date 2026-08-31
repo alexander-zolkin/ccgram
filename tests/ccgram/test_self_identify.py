@@ -85,26 +85,6 @@ class TestResolveSelfIdentity:
         )
         assert ident == expected
 
-    def test_herdr_without_herdr_query_returns_none(self) -> None:
-        # No herdr_query supplied → probe unavailable → None (skip session_map write).
-        ident = resolve_self_identity(
-            {"HERDR_PANE_ID": "w0:p0"}, tmux_query=_fail_query
-        )
-        assert ident is None
-
-    def test_herdr_query_resolves_opaque_session_target(self) -> None:
-        ident = resolve_self_identity(
-            {"HERDR_WORKSPACE_ID": "w0", "HERDR_PANE_ID": "w0:p0"},
-            tmux_query=_fail_query,
-            herdr_query=lambda _workspace, _pane: "herdr-session-v1-target",
-        )
-        assert ident == SelfIdentity(
-            "herdr",
-            "herdr:herdr-session-v1-target",
-            "herdr-session-v1-target",
-            "",
-        )
-
     def test_herdr_without_workspace_fails_closed(self) -> None:
         assert (
             resolve_self_identity(
@@ -126,6 +106,57 @@ class TestResolveSelfIdentity:
     def test_neither_env_does_not_probe_tmux(self) -> None:
         assert resolve_self_identity({}, tmux_query=_fail_query) is None
 
+    def test_agterm_session_id_resolves_without_a_probe(self) -> None:
+        # The session UUID is the identity: agterm persists and restores it, so
+        # unlike herdr there is no locator to resolve and nothing to fail on.
+        env = {"AGTERM_SESSION_ID": "157B4C8C-EFAE-40C2-BA54-9A5D7FD8B5E4"}
+        ident = resolve_self_identity(env, tmux_query=_fail_query)
+        assert ident is not None
+        assert ident.mux == "agterm"
+        assert ident.window_id == "157B4C8C-EFAE-40C2-BA54-9A5D7FD8B5E4"
+        assert ident.session_window_key == "agterm:157B4C8C-EFAE-40C2-BA54-9A5D7FD8B5E4"
+        assert ident.pane_tty == ""
+
+    def test_tmux_inside_agterm_reports_tmux(self) -> None:
+        # Every shell agterm spawns inherits AGTERM_SESSION_ID, including one
+        # running a nested tmux, so agterm must be the last branch checked or it
+        # would claim panes belonging to the inner multiplexer.
+        env = {"TMUX_PANE": "%1", "AGTERM_SESSION_ID": "157B4C8C"}
+        ident = resolve_self_identity(
+            env, tmux_query=lambda _pane: ("s:@1", "@1", "win", "/dev/ttys1")
+        )
+        assert ident is not None and ident.mux == "tmux"
+
+    def test_herdr_inside_agterm_reports_herdr(self) -> None:
+        env = {
+            "HERDR_PANE_ID": "w2:p1",
+            "HERDR_WORKSPACE_ID": "w2",
+            "AGTERM_SESSION_ID": "157B4C8C",
+        }
+        ident = resolve_self_identity(
+            env,
+            tmux_query=_fail_query,
+            herdr_query=lambda _workspace, _pane: "herdr-session-v1-target",
+        )
+        assert ident is not None and ident.mux == "herdr"
+
+    def test_failed_herdr_probe_inside_agterm_does_not_fall_through(self) -> None:
+        # A herdr pane whose probe fails must skip the session_map write, not
+        # silently record the surrounding agterm session as its identity.
+        env = {
+            "HERDR_PANE_ID": "w2:p1",
+            "HERDR_WORKSPACE_ID": "w2",
+            "AGTERM_SESSION_ID": "157B4C8C",
+        }
+        assert (
+            resolve_self_identity(
+                env,
+                tmux_query=_fail_query,
+                herdr_query=lambda _workspace, _pane: None,
+            )
+            is None
+        )
+
 
 class TestResolveHerdrTarget:
     @staticmethod
@@ -143,7 +174,12 @@ class TestResolveHerdrTarget:
             },
         }
 
-    def _resolve(self, monkeypatch, records: list[dict]) -> str | None:
+    def _resolve(
+        self,
+        monkeypatch,
+        records: list[dict],
+        provider_name: str | None = None,
+    ) -> str | None:
         import ccgram.hook as hook
 
         monkeypatch.setattr(
@@ -162,7 +198,11 @@ class TestResolveHerdrTarget:
                 target_id_for_live_record=lambda _record: "herdr-session-v1-target"
             ),
         )
-        return hook._resolve_herdr_target_id("w2", "w2:p1")
+        return hook._resolve_herdr_target_id(
+            "w2",
+            "w2:p1",
+            provider_name,  # type: ignore[arg-type]
+        )
 
     def test_unique_workspace_pane_locator_returns_opaque_target(
         self, monkeypatch
@@ -176,6 +216,15 @@ class TestResolveHerdrTarget:
         self, monkeypatch
     ) -> None:
         assert self._resolve(monkeypatch, [self._record(), self._record()]) is None
+
+    def test_nested_provider_in_live_pane_fails_closed(self, monkeypatch) -> None:
+        assert self._resolve(monkeypatch, [self._record()], provider_name="pi") is None
+
+    def test_live_provider_hook_resolves(self, monkeypatch) -> None:
+        assert (
+            self._resolve(monkeypatch, [self._record()], provider_name="claude")
+            == "herdr-session-v1-target"
+        )
 
 
 class TestLocatePrimaryWindowThroughResolver:
@@ -211,9 +260,22 @@ class TestLocatePrimaryWindowThroughResolver:
     def test_no_env_returns_none(self, monkeypatch) -> None:
         monkeypatch.delenv("TMUX_PANE", raising=False)
         monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+        # Every shell agterm spawns exports this, so a suite run from inside
+        # agterm would otherwise resolve an identity here.
+        monkeypatch.delenv("AGTERM_SESSION_ID", raising=False)
         from ccgram.hook import _locate_primary_window
 
         assert _locate_primary_window("sid", "Stop", "claude") is None
+
+    def test_agterm_session_resolves_through_the_hook(self, monkeypatch) -> None:
+        monkeypatch.delenv("TMUX_PANE", raising=False)
+        monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+        monkeypatch.setenv("AGTERM_SESSION_ID", "157B4C8C-EFAE-40C2-BA54-9A5D7FD8B5E4")
+        from ccgram.hook import _locate_primary_window
+
+        located = _locate_primary_window("sid", "Stop", "claude")
+        assert located is not None
+        assert located[0] == "agterm:157B4C8C-EFAE-40C2-BA54-9A5D7FD8B5E4"
 
     def test_herdr_pane_resolves_to_session_target(self, monkeypatch) -> None:
         monkeypatch.delenv("TMUX_PANE", raising=False)
@@ -221,7 +283,7 @@ class TestLocatePrimaryWindowThroughResolver:
         monkeypatch.setenv("HERDR_PANE_ID", "w2:p1")
         monkeypatch.setattr(
             "ccgram.hook._resolve_herdr_target_id",
-            lambda _workspace, _pane: "herdr-session-v1-target",
+            lambda _workspace, _pane, _provider: "herdr-session-v1-target",
         )
         from ccgram.hook import _locate_primary_window
 
@@ -238,7 +300,7 @@ class TestLocatePrimaryWindowThroughResolver:
         monkeypatch.setenv("HERDR_PANE_ID", "w2:p1")
         monkeypatch.setattr(
             "ccgram.hook._resolve_herdr_target_id",
-            lambda _workspace, _pane: None,
+            lambda _workspace, _pane, _provider: None,
         )
         from ccgram.hook import _locate_primary_window
 

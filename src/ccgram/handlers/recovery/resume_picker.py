@@ -17,7 +17,6 @@ Public surface:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,9 +30,11 @@ from telegram import (
 )
 
 from ... import window_query
-from ...config import config
-from ...providers import get_provider_for_window
-from ...utils import read_session_metadata_from_jsonl
+from ...providers import (
+    get_provider_for_window,
+    is_known_provider,
+    providers_to_scan,
+)
 from ..callback_data import (
     CB_RECOVERY_BACK,
     CB_RECOVERY_CANCEL,
@@ -43,13 +44,11 @@ from ..callback_data import (
 )
 from ..callback_helpers import get_thread_id
 from ..callback_tokens import compact_callback_data
-from ..messaging_pipeline.message_sender import safe_edit
 from ..user_state import (
     PENDING_THREAD_ID,
     RECOVERY_SESSIONS,
     RECOVERY_WINDOW_ID,
 )
-from .recovery_callbacks import _clear_recovery_state
 
 if TYPE_CHECKING:
     from telegram.ext import ContextTypes
@@ -66,6 +65,7 @@ class _SessionEntry:
     session_id: str
     summary: str
     mtime: float = 0.0
+    provider_name: str = "claude"
 
 
 def _build_resume_picker_keyboard(
@@ -138,121 +138,35 @@ def _build_empty_resume_keyboard(window_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def scan_sessions_for_cwd(cwd: str) -> list[_SessionEntry]:
-    """Scan project directories for sessions matching a working directory.
+def scan_sessions_for_cwd(
+    cwd: str,
+    provider_name: str | None = "claude",
+) -> list[_SessionEntry]:
+    """List resumable sessions for an exact workspace.
 
-    Supports both legacy sessions-index.json and bare JSONL files
-    (Claude Code >= Feb 2026 no longer writes index files).
-
-    Returns up to _MAX_RESUME_SESSIONS entries, most-recent file first.
+    Covers one provider when the caller knows which; every picker-capable one
+    when it does not — see ``providers_to_scan``.
     """
-    if not config.claude_projects_path.exists():
+    try:
+        resolved_cwd = str(Path(cwd).expanduser().resolve())
+    except OSError, ValueError:
         return []
 
-    try:
-        resolved_cwd = str(Path(cwd).resolve())
-    except OSError:
-        return []
-
-    candidates: list[tuple[float, _SessionEntry]] = []
-    seen_ids: set[str] = set()
-
-    for project_dir in config.claude_projects_path.iterdir():
-        if not project_dir.is_dir():
-            continue
-
-        index_file = project_dir / "sessions-index.json"
-        if index_file.exists():
-            _scan_index_for_cwd(index_file, resolved_cwd, seen_ids, candidates)
-
-        _scan_bare_jsonl_for_cwd(project_dir, resolved_cwd, seen_ids, candidates)
-
-    candidates.sort(key=lambda c: c[0], reverse=True)
-    return [entry for _, entry in candidates[:_MAX_RESUME_SESSIONS]]
-
-
-def _scan_index_for_cwd(
-    index_file: Path,
-    resolved_cwd: str,
-    seen_ids: set[str],
-    candidates: list[tuple[float, _SessionEntry]],
-) -> None:
-    """Scan a sessions-index.json for sessions matching a cwd."""
-    try:
-        index_data = json.loads(index_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return
-
-    original_path = index_data.get("originalPath", "")
-    for entry in index_data.get("entries", []):
-        session_id = entry.get("sessionId", "")
-        full_path = entry.get("fullPath", "")
-        project_path = entry.get("projectPath", original_path)
-        if not session_id or not full_path or session_id in seen_ids:
-            continue
-
-        try:
-            norm_pp = str(Path(project_path).resolve())
-        except OSError:
-            norm_pp = project_path
-
-        if norm_pp != resolved_cwd:
-            continue
-
-        file_path = Path(full_path)
-        if not file_path.exists():
-            continue
-
-        try:
-            mtime = file_path.stat().st_mtime
-        except OSError:
-            mtime = 0.0
-
-        summary = (
-            entry.get("summary", "") or entry.get("firstPrompt", "") or session_id[:12]
+    entries = [
+        _SessionEntry(
+            session_id=session.session_id,
+            summary=session.summary,
+            mtime=session.mtime,
+            provider_name=session.provider_name,
         )
-        seen_ids.add(session_id)
-        candidates.append((mtime, _SessionEntry(session_id, summary, mtime)))
-
-
-def _scan_bare_jsonl_for_cwd(
-    project_dir: Path,
-    resolved_cwd: str,
-    seen_ids: set[str],
-    candidates: list[tuple[float, _SessionEntry]],
-) -> None:
-    """Scan bare JSONL files for sessions matching a cwd."""
-    try:
-        jsonl_iter = project_dir.glob("*.jsonl")
-    except OSError:
-        return
-
-    for jsonl_file in jsonl_iter:
-        session_id = jsonl_file.stem
-        if session_id in seen_ids:
-            continue
-
-        file_cwd, summary = read_session_metadata_from_jsonl(jsonl_file)
-        if not file_cwd:
-            continue
-
-        try:
-            norm_cwd = str(Path(file_cwd).resolve())
-        except OSError:
-            norm_cwd = file_cwd
-
-        if norm_cwd != resolved_cwd:
-            continue
-
-        try:
-            mtime = jsonl_file.stat().st_mtime
-        except OSError:
-            mtime = 0.0
-
-        seen_ids.add(session_id)
-        candidates.append(
-            (mtime, _SessionEntry(session_id, summary or session_id[:12], mtime))
+        for provider in providers_to_scan(provider_name)
+        for session in provider.discover_resumable_sessions(
+            cwd=resolved_cwd,
+            limit=_MAX_RESUME_SESSIONS,
         )
+    ]
+    entries.sort(key=lambda e: e.mtime, reverse=True)
+    return entries[:_MAX_RESUME_SESSIONS]
 
 
 async def _handle_resume_pick(
@@ -297,22 +211,32 @@ async def _handle_resume_pick(
 
     picked = stored_sessions[idx]
     session_id = picked["session_id"]
+    provider_name = picked.get("provider_name", "")
 
     old_wid = context.user_data.get(RECOVERY_WINDOW_ID) if context.user_data else None
     if not old_wid:
         await query.answer("Recovery menu expired", show_alert=True)
         return
 
-    view = window_query.view_window(old_wid)
-    if view is None or not view.cwd or not Path(view.cwd).is_dir():
-        await safe_edit(query, "❌ Directory no longer exists.")
-        _clear_recovery_state(context.user_data)
-        await query.answer("Project gone")
+    # Lazy: resume_picker ↔ recovery_banner cycle
+    from .recovery_banner import _recovery_cwd_or_report
+
+    cwd = await _recovery_cwd_or_report(query, old_wid, context)
+    if cwd is None:
         return
-    cwd = view.cwd
+    view = window_query.view_window(old_wid)
+    window_provider = view.provider_name if view else ""
+    if not provider_name:
+        provider_name = window_provider
+    # Same test the scan used: an unregistered name widened the picker, so
+    # refusing every foreign-provider row it then listed would leave nothing
+    # pickable.
+    if is_known_provider(window_provider) and provider_name != window_provider:
+        await query.answer("Session provider mismatch", show_alert=True)
+        return
 
     launch_args = get_provider_for_window(
-        old_wid, provider_name=view.provider_name
+        old_wid, provider_name=provider_name
     ).make_launch_args(resume_id=session_id)
     await _create_and_bind_window(
         query,
@@ -323,4 +247,5 @@ async def _handle_resume_pick(
         agent_args=launch_args,
         success_label=f"Resuming session: {picked['summary'][:40]}",
         old_window_id=old_wid,
+        provider_name=provider_name,
     )

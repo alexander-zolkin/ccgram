@@ -12,7 +12,8 @@ Core responsibilities:
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import time
 from pathlib import Path
@@ -140,7 +141,19 @@ def _is_window_already_bound(window_id: str) -> bool:
 # 30s TTL is the safety net in case directory_callbacks crashes before
 # clearing the entry — handle_new_window will eventually reclaim the window.
 _pending_user_creations: dict[str, float] = {}
+_pending_creation_transactions: set[object] = set()
 _PENDING_CREATION_TTL_S = 30.0
+
+
+@contextmanager
+def pending_creation_transaction() -> Iterator[None]:
+    """Block auto-adoption until a new target has a durable ID."""
+    token = object()
+    _pending_creation_transactions.add(token)
+    try:
+        yield
+    finally:
+        _pending_creation_transactions.discard(token)
 
 
 def register_pending_creation(window_id: str) -> None:
@@ -160,12 +173,8 @@ def clear_pending_creation(window_id: str) -> None:
     _pending_user_creations.pop(window_id, None)
 
 
-def _is_pending_user_creation(window_id: str) -> bool:
-    """Return True iff a directory flow is mid-creation for this window.
-
-    Expired entries are evicted lazily on read so a crashed directory flow
-    can't permanently shadow a window from auto-topic-creation.
-    """
+def _is_registered_pending_creation(window_id: str) -> bool:
+    """Return whether a concrete window target is owned by a creation flow."""
     expires_at = _pending_user_creations.get(window_id)
     if expires_at is None:
         return False
@@ -173,6 +182,22 @@ def _is_pending_user_creation(window_id: str) -> bool:
         _pending_user_creations.pop(window_id, None)
         return False
     return True
+
+
+def _is_pending_user_creation(window_id: str) -> bool:
+    """Return True iff auto-adoption must wait for a directory flow.
+
+    A transaction covers the short interval before a backend returns a target
+    ID. Once the ID exists, the per-window marker owns it until binding ends.
+    """
+    return bool(_pending_creation_transactions) or _is_registered_pending_creation(
+        window_id
+    )
+
+
+def is_pending_creation(window_id: str) -> bool:
+    """Return whether this exact window is protected from stale-state cleanup."""
+    return _is_registered_pending_creation(window_id)
 
 
 async def _auto_detect_provider(window_id: str) -> None:
@@ -212,8 +237,8 @@ async def _auto_detect_provider(window_id: str) -> None:
 
 
 def collect_target_chats(window_id: str) -> set[int]:
-    """Collect unique group chat IDs for topic creation."""
-    seen_chats: set[int] = set()
+    """Collect topic-capable group and observed private-topic chats."""
+    seen_chats = set(thread_router.iter_private_topic_chat_ids())
     for user_id, thread_id, _ in thread_router.iter_thread_bindings():
         chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         if isinstance(chat_id, int) and chat_id < 0:
@@ -301,7 +326,27 @@ async def create_topic_in_chat(
     *,
     user_id: int | None = None,
 ) -> bool:
-    """Create and bind one forum topic, returning whether it succeeded."""
+    """Create and bind one topic, returning whether it succeeded."""
+    if chat_id > 0:
+        try:
+            bot_user = await client.get_me()
+        except TelegramError:
+            logger.warning(
+                "Skipping private topic creation for window %s in chat %d: "
+                "could not observe bot topic capability",
+                window_id,
+                chat_id,
+            )
+            return False
+        if getattr(bot_user, "has_topics_enabled", None) is not True:
+            logger.info(
+                "Skipping private topic creation for window %s in chat %d: "
+                "bot topics are not enabled",
+                window_id,
+                chat_id,
+            )
+            return False
+
     owner_id = _find_topic_owner(chat_id, window_id, user_id)
     if owner_id is None:
         logger.warning(
@@ -379,8 +424,6 @@ async def _rebind_existing_topic_by_name(
         if await tmux_manager.find_window_by_id(old_window_id):
             continue
         chat_id = thread_router.resolve_chat_id(user_id, thread_id)
-        if chat_id == user_id:
-            continue
         matches.append((user_id, thread_id, old_window_id, chat_id))
 
     if len(matches) != 1:
@@ -477,8 +520,10 @@ async def _handle_new_window_locked(
     await _auto_detect_provider(event.window_id)
 
     topic_name = event.window_name or Path(event.cwd).name or event.window_id
-    if target_user_id is None and await _rebind_existing_topic_by_name(
-        event, client, topic_name
+    if (
+        target_user_id is None
+        and tmux_manager.capabilities.supports_display_name_rebind
+        and await _rebind_existing_topic_by_name(event, client, topic_name)
     ):
         return True
 

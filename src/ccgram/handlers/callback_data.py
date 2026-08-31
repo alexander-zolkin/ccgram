@@ -52,6 +52,7 @@ CB_ASK_ENTER = "aq:enter:"  # aq:enter:<window>
 CB_ASK_SPACE = "aq:spc:"  # aq:spc:<window>
 CB_ASK_TAB = "aq:tab:"  # aq:tab:<window>
 CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
+CB_ASK_CHOICE = "aq:pick:"  # aq:pick:<key>:<sequence>:<window>
 
 # Sessions dashboard
 CB_SESSIONS_REFRESH = "sess:ref"
@@ -65,6 +66,9 @@ CB_STATUS_SCREENSHOT = "st:ss:"  # st:ss:<window_id>
 CB_STATUS_RECALL = "st:rc:"  # st:rc:<window_id>:<history_index>
 CB_STATUS_LAST_REPLY = "st:lr:"  # st:lr:<window_id>
 CB_STATUS_GET_FILE = "st:gf:"  # st:gf:<window_id>
+CB_STATUS_BACKLOG_JUMP = "st:bl:"  # st:bl:<window_id> (opens confirmation)
+CB_STATUS_BACKLOG_CONFIRM = "st:blok:"  # st:blok:<window_id>
+CB_STATUS_BACKLOG_CANCEL = "st:blx:"  # st:blx:<window_id>
 
 # Recovery UI (dead window)
 CB_RECOVERY_FRESH = "rec:f:"  # rec:f:<window_id>

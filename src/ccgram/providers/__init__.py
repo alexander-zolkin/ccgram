@@ -19,6 +19,7 @@ from ccgram.providers.base import (
     AgentProvider,
     DiscoveredCommand,
     ProviderCapabilities,
+    ResumableSession,
     SessionStartEvent,
     StatusUpdate,
 )
@@ -31,6 +32,7 @@ logger = structlog.get_logger()
 _APPROVAL_MODE_NORMAL = "normal"
 _APPROVAL_MODE_YOLO = "yolo"
 _YOLO_FLAGS: dict[str, str] = {
+    "antigravity": "--dangerously-skip-permissions",
     "claude": "--dangerously-skip-permissions",
     "codex": "--dangerously-bypass-approvals-and-sandbox",
     "gemini": "--yolo",
@@ -56,6 +58,9 @@ def _ensure_registered() -> None:
     if _registered:
         return
     # Lazy: provider classes register against the registry at import; defer until the registry factory runs
+    from ccgram.providers.antigravity import AntigravityProvider
+
+    # Lazy: provider classes register against the registry at import; defer until the registry factory runs
     from ccgram.providers.claude import ClaudeProvider
 
     # Lazy: provider classes register against the registry at import; defer until the registry factory runs
@@ -73,6 +78,7 @@ def _ensure_registered() -> None:
     # Lazy: provider classes register against the registry at import; defer until the registry factory runs
     from ccgram.providers.shell import ShellProvider
 
+    registry.register("antigravity", AntigravityProvider)
     registry.register("claude", ClaudeProvider)
     registry.register("codex", CodexProvider)
     registry.register("gemini", GeminiProvider)
@@ -132,6 +138,50 @@ def get_provider_for_window(
     return get_provider()
 
 
+def picker_capable_providers() -> list[AgentProvider]:
+    """Return every registered provider that offers a resume picker."""
+    _ensure_registered()
+    providers = [registry.get(name) for name in registry.provider_names()]
+    return [
+        p
+        for p in providers
+        if p.capabilities.supports_resume and p.capabilities.supports_resume_picker
+    ]
+
+
+def is_known_provider(provider_name: str | None) -> bool:
+    """Return whether ``provider_name`` names a provider this build registers.
+
+    Registers first: ``is_valid`` on an empty registry answers False for every
+    name, which would silently widen a caller's narrow request rather than
+    failing loudly.
+    """
+    if not provider_name:
+        return False
+    _ensure_registered()
+    return registry.is_valid(provider_name)
+
+
+def providers_to_scan(provider_name: str | None) -> list[AgentProvider]:
+    """Resolve which providers a resumable-session scan should cover.
+
+    A falsy name means the caller could not resolve the window's provider:
+    ``None`` when there is no state row, ``""`` when the row exists but never
+    recorded one, and a name this build does not register (version skew — a
+    provider persisted by a build that had it). Resolving either to the config default lists one agent's
+    sessions under another agent's topic, so cover every picker-capable
+    provider instead and let each entry's own ``provider_name`` decide what a
+    pick relaunches.
+
+    Every session scan must route through here. Normalising inside one scanner
+    is how the recovery banner's Resume button kept the defaulting behaviour
+    after /resume and Browse were fixed.
+    """
+    if not is_known_provider(provider_name):
+        return picker_capable_providers()
+    return [get_provider_for_window("", provider_name=provider_name)]
+
+
 def detect_provider_from_command(pane_current_command: str) -> str:
     """Detect provider name from a tmux pane's running process.
 
@@ -147,8 +197,12 @@ def detect_provider_from_command(pane_current_command: str) -> str:
     # Match basename only (first token) to avoid false positives
     # from paths like /home/claude/bin/vim
     basename = os.path.basename(cmd.split()[0])
-    for name in ("claude", "codex", "gemini", "pi", "grok"):
-        if basename == name or basename.startswith(name + "-"):
+    for name in ("antigravity", "claude", "codex", "gemini", "pi", "grok"):
+        if (
+            basename == name
+            or (name == "antigravity" and basename == "agy")
+            or basename.startswith(name + "-")
+        ):
             return name
     # Grok's ccgram launcher wrapper execs the official binary; treat it as grok.
     if basename == "kara_grok":
@@ -181,6 +235,16 @@ def detect_provider_from_transcript_path(transcript_path: str) -> str:
     normalized = transcript_path.strip().lower().replace("\\", "/")
     if not normalized:
         return ""
+    if any(
+        marker in normalized
+        for marker in (
+            "/.gemini/antigravity-cli/brain/",
+            "/.antigravity/brain/",
+            "/.config/antigravity/brain/",
+            "/.local/share/antigravity/brain/",
+        )
+    ):
+        return "antigravity"
     if "/.codex/sessions/" in normalized:
         return "codex"
     if _CLAUDE_PROJECTS_RE.search(normalized):
@@ -297,6 +361,12 @@ def resolve_launch_command(
             provider = "claude"
             command = registry.get("claude").capabilities.launch_command
 
+    if provider == "antigravity" and not override:
+        # Lazy: only needed for antigravity launch path; importing at top would pull provider code
+        from ccgram.providers.antigravity import resolve_antigravity_executable
+
+        command = shlex.quote(resolve_antigravity_executable())
+
     # CCGRAM_GEMINI_COMMAND overrides stay fully user-controlled.
     # For ccgram-managed Gemini launches, force stable shell mode defaults.
     if provider == "gemini" and not override:
@@ -389,11 +459,15 @@ def resolve_capabilities(provider_name: str | None = None) -> ProviderCapabiliti
 
 
 __all__ = [
+    "is_known_provider",
+    "picker_capable_providers",
+    "providers_to_scan",
     "AgentMessage",
     "AgentProvider",
     "DiscoveredCommand",
     "ProviderCapabilities",
     "ProviderRegistry",
+    "ResumableSession",
     "SessionStartEvent",
     "StatusUpdate",
     "UnknownProviderError",

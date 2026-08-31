@@ -4,9 +4,8 @@ Extracts the launch sequence from directory_callbacks._create_window_and_bind
 into a self-contained service module.  Callers build a ``WindowLaunchRequest``
 and call ``launch_window``; the result is a ``WindowLaunchResult``.
 
-CRITICAL ordering invariant (MC-2967):
-  create_window() → register_pending_creation(window_id)
-  must have NO await between them.  See the inline comment for full context.
+Creation is protected by a transaction guard until the durable target is
+registered. This keeps the SessionMonitor from adopting it before binding.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
 from ..telegram_origin import send_telegram_to_window
 from ...user_preferences import user_preferences
+from ... import window_query
 from ...window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
 from ..messaging_pipeline.message_sender import safe_edit, safe_send
 from ..status.topic_emoji import format_topic_name_for_mode, get_stored_topic_name
@@ -158,22 +158,29 @@ async def _create_topic_window(
         # The native worktree API cannot pin a preselected workspace.  Creating
         # into an implicit workspace would violate the user's selection.
         if chosen_workspace_id:
-            return False, "Selected workspace cannot create a native worktree", "", ""
-        return await tmux_manager.create_worktree_window(
+            return (
+                False,
+                "Selected workspace cannot create a native worktree",
+                "",
+                "",
+            )
+        success, message, name, window_id = await tmux_manager.create_worktree_window(
             wt_repo,
             wt_path,
             wt_branch,
             window_name=Path(wt_path).name,
             launch_command=launch_command,
         )
-    # Tmux preserves its long-standing creation behavior. Herdr's native
-    # agent-status capability selects the guarded-session creation transaction.
-    if tmux_manager.capabilities.native_agent_status is not True:
-        return await tmux_manager.create_window(
+        return success, message, name, window_id
+    # Tmux and agterm create normal durable windows. Herdr uses its guarded
+    # native topic-target transaction.
+    if tmux_manager.capabilities.native_topic_targets is not True:
+        success, message, name, window_id = await tmux_manager.create_window(
             selected_path,
             launch_command=launch_command,
             workspace_id=chosen_workspace_id,
         )
+        return success, message, name, window_id
     try:
         target = await tmux_manager.create_topic_target(
             selected_path,
@@ -234,6 +241,28 @@ async def _accept_yolo_confirmation(window_id: str, *, timeout: float = 8.0) -> 
     return False
 
 
+def _follow_supersession(window_id: str) -> str:
+    """Re-point creation at the id its window answers to now.
+
+    Reconciliation runs on the monitor cycle, so a backend that firms up
+    window identity late (Herdr, once the agent session is published) can
+    rename the target while creation is still waiting on the hook. Every
+    step after the wait — releasing the guard, cleaning up a failure,
+    reporting the window — has to act on the current id; acting on the one
+    creation minted killed nothing and quarantined a healthy topic.
+
+    Carries the creation guard across to the new id so the monitor cannot
+    adopt it into a second topic in the window before the flow finishes.
+    """
+    current = window_query.resolve_window_alias(window_id)
+    if current == window_id:
+        return window_id
+    topic_orchestration.register_pending_creation(current)
+    topic_orchestration.clear_pending_creation(window_id)
+    logger.info("Creation target superseded: %s -> %s", window_id, current)
+    return current
+
+
 # ── main entry point ──────────────────────────────────────────────────────────
 
 
@@ -247,11 +276,10 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
     Shared by _handle_mode_select (after mode picker) and _handle_provider_select
     (when mode picker is skipped for providers without YOLO flags).
 
-    CRITICAL (MC-2967): ``create_window`` → ``register_pending_creation(wid)``
-    must have NO await between them.  The provider's SessionStart hook fires
-    inside the new pane within seconds; the SessionMonitor's 1 s poll cycle would
-    otherwise see an unbound window and auto-create a duplicate Telegram topic
-    before ``bind_thread`` runs below.
+    CRITICAL (MC-2967): creation starts inside a global transaction guard,
+    then its durable target is registered before the transaction releases. This
+    prevents the SessionMonitor from auto-creating a topic while Herdr publishes
+    a session identity or before ``bind_thread`` runs below.
     """
     # Lazy: providers package heavy bootstrap
     from ccgram.providers import resolve_launch_command
@@ -329,19 +357,24 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         context.user_data.get(PENDING_WORKSPACE_ID) if context.user_data else None
     ) or None
 
-    success, message, created_wname, created_wid = await _create_topic_window(
-        selected_path, launch_command, chosen_workspace_id, context
-    )
+    with topic_orchestration.pending_creation_transaction():
+        (
+            success,
+            message,
+            created_wname,
+            created_wid,
+        ) = await _create_topic_window(
+            selected_path,
+            launch_command,
+            chosen_workspace_id,
+            context,
+        )
+        if success:
+            topic_orchestration.register_pending_creation(created_wid)
+
     if not success:
         await _abort_topic_creation(query, message, context)
         return WindowLaunchResult(success=False, error_message=message)
-
-    # Race-guard: tag this window as "directory flow in progress" BEFORE any
-    # subsequent await. The provider's SessionStart hook fires inside the new
-    # tmux pane within seconds; the SessionMonitor's 1s poll cycle would
-    # otherwise see an unbound window and auto-create a duplicate Telegram
-    # topic before bind_thread() runs below. See MC-2967 for full repro.
-    topic_orchestration.register_pending_creation(created_wid)
 
     user_preferences.update_user_mru(user_id, selected_path)
     session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
@@ -368,7 +401,12 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         if await tmux_manager.kill_window(created_wid):
             topic_orchestration.clear_pending_creation(created_wid)
             if pending_thread_id is not None:
-                thread_router.unbind_thread(user_id, pending_thread_id)
+                thread_router.unbind_thread(
+                    user_id,
+                    pending_thread_id,
+                    retirement_reason="system_replacement",
+                    cleanup_eligible=True,
+                )
         raise
 
     query_message = query.message
@@ -385,7 +423,12 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
             if await tmux_manager.kill_window(created_wid):
                 topic_orchestration.clear_pending_creation(created_wid)
                 if pending_thread_id is not None:
-                    thread_router.unbind_thread(user_id, pending_thread_id)
+                    thread_router.unbind_thread(
+                        user_id,
+                        pending_thread_id,
+                        retirement_reason="system_replacement",
+                        cleanup_eligible=True,
+                    )
             raise
 
     if pending_thread_id is not None:
@@ -394,7 +437,7 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
             pending_thread_id,
             created_wid,
             window_name=created_wname,
-            chat_id=chat.id if chat and chat.type in ("group", "supergroup") else None,
+            chat_id=chat.id if chat else None,
         )
         if chat and chat.type in ("group", "supergroup"):
             thread_router.set_group_chat_id(user_id, pending_thread_id, chat.id)
@@ -405,16 +448,26 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
             await _accept_yolo_confirmation(created_wid)
 
         map_entry_found = (
-            await session_map_sync.wait_for_session_map_entry(created_wid)
+            await session_map_sync.wait_for_session_map_entry(
+                created_wid, resolve_window_id=window_query.resolve_window_alias
+            )
             if provider.capabilities.supports_hook
             else True
         )
     except BaseException:
+        created_wid = _follow_supersession(created_wid)
         if await tmux_manager.kill_window(created_wid):
             topic_orchestration.clear_pending_creation(created_wid)
             if pending_thread_id is not None:
-                thread_router.unbind_thread(user_id, pending_thread_id)
+                thread_router.unbind_thread(
+                    user_id,
+                    pending_thread_id,
+                    retirement_reason="system_replacement",
+                    cleanup_eligible=True,
+                )
         raise
+
+    created_wid = _follow_supersession(created_wid)
 
     if not map_entry_found:
         # Do not release the guard or binding unless the target is actually
@@ -424,7 +477,12 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         if await tmux_manager.kill_window(created_wid):
             topic_orchestration.clear_pending_creation(created_wid)
             if pending_thread_id is not None:
-                thread_router.unbind_thread(user_id, pending_thread_id)
+                thread_router.unbind_thread(
+                    user_id,
+                    pending_thread_id,
+                    retirement_reason="system_replacement",
+                    cleanup_eligible=True,
+                )
             message = "Session did not register with ccgram in time"
         else:
             message = (

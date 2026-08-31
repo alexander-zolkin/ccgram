@@ -685,12 +685,17 @@ def _hook_status(provider_name: str = "claude") -> int:  # noqa: PLR0911
     return 1
 
 
-def _resolve_herdr_target_id(workspace_id: str, pane_id: str) -> str | None:
+def _resolve_herdr_target_id(
+    workspace_id: str,
+    pane_id: str,
+    provider_name: ProviderName | None = None,
+) -> str | None:
     """Resolve one exact Herdr locator to a guarded opaque session target.
 
     A hook must not bind a tab or raw pane locator: a fresh ``agent list``
     snapshot must contain exactly one complete session record for this
-    ``(workspace_id, pane_id)`` pair.
+    ``(workspace_id, pane_id)`` pair. Hooks from a nested agent are rejected
+    when their provider differs from the live agent occupying that pane.
     """
     try:
         result = subprocess.run(
@@ -717,6 +722,25 @@ def _resolve_herdr_target_id(workspace_id: str, pane_id: str) -> str | None:
     if len(matches) != 1:
         return None
 
+    record = matches[0]
+    live_agent = record.get("agent")
+    agent_session = record.get("agent_session")
+    if not isinstance(live_agent, str) and isinstance(agent_session, dict):
+        live_agent = agent_session.get("agent")
+    known_hook_agents = {"claude", "pi", "codex", "gemini"}
+    if (
+        provider_name is not None
+        and live_agent in known_hook_agents
+        and live_agent != provider_name
+    ):
+        logger.info(
+            "Skipping %s hook from nested agent in Herdr pane %s; live agent is %s",
+            provider_name,
+            pane_id,
+            live_agent,
+        )
+        return None
+
     # Keep record parsing and canonical target construction in the adapter;
     # this hook only establishes the unique live locator match.
     target_for_record = getattr(
@@ -724,7 +748,7 @@ def _resolve_herdr_target_id(workspace_id: str, pane_id: str) -> str | None:
     )
     if not callable(target_for_record):
         return None
-    target_id = target_for_record(matches[0])
+    target_id = target_for_record(record)
     return target_id if isinstance(target_id, str) else None
 
 
@@ -1252,7 +1276,7 @@ def _provider_from_pane_tty(pane_tty: str) -> ProviderName | None:
 
 
 def _locate_primary_window(
-    session_id: str, event: str, provider_name: str = "claude"
+    session_id: str, event: str, provider_name: ProviderName = "claude"
 ) -> tuple[str, str, str] | None:
     """Resolve TMUX_PANE → primary window, or None to drop the hook.
 
@@ -1264,17 +1288,25 @@ def _locate_primary_window(
     Identity resolution is backend-neutral via ``resolve_self_identity``: tmux
     panes resolve through ``_resolve_window_id`` (``display-message``), herdr
     panes resolve their exact workspace/pane locator to a session target, so
-    the session_map key becomes ``herdr:<opaque-target-id>``.
+    the session_map key becomes ``herdr:<opaque-target-id>``, and an agterm
+    session is its own identity, keyed ``agterm:<session-uuid>``.
     """
     identity = resolve_self_identity(
         os.environ,
         tmux_query=_resolve_window_id,
-        herdr_query=_resolve_herdr_target_id,
+        herdr_query=lambda workspace_id, pane_id: _resolve_herdr_target_id(
+            workspace_id, pane_id, provider_name
+        ),
     )
     if identity is None:
-        if not os.environ.get("TMUX_PANE") and not os.environ.get("HERDR_PANE_ID"):
+        if (
+            not os.environ.get("TMUX_PANE")
+            and not os.environ.get("HERDR_PANE_ID")
+            and not os.environ.get("AGTERM_SESSION_ID")
+        ):
             logger.warning(
-                "Neither TMUX_PANE nor HERDR_PANE_ID set, cannot determine window"
+                "None of TMUX_PANE, HERDR_PANE_ID or AGTERM_SESSION_ID set, "
+                "cannot determine window"
             )
         elif os.environ.get("HERDR_PANE_ID"):
             logger.warning(
@@ -1352,7 +1384,9 @@ def _process_hook_stdin(
         logger.debug("Ignoring unhandled event: %s", event)
         return None
 
-    located = _locate_primary_window(normalized.session_id, event, detected_provider)
+    located = _locate_primary_window(
+        normalized.session_id, event, normalized.provider_name
+    )
     if located is None:
         return None
     session_window_key, _window_id, window_name = located

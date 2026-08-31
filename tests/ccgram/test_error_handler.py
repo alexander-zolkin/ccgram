@@ -3,10 +3,11 @@
 import contextlib
 import io
 import signal
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telegram.error import BadRequest, Conflict, NetworkError, TelegramError
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TelegramError
 from telegram.request import HTTPXRequest
 
 from ccgram.bot import (
@@ -39,6 +40,17 @@ class TestErrorHandlerNetworkError:
 
         mock_logger.info.assert_called_once()
         mock_logger.warning.assert_not_called()
+        mock_logger.error.assert_not_called()
+
+    async def test_retry_after_logged_as_warning_without_traceback(self) -> None:
+        ctx = _make_context(RetryAfter(timedelta(seconds=3)))
+
+        with patch("ccgram.bot.logger") as mock_logger:
+            await _error_handler(None, ctx)
+
+        mock_logger.warning.assert_called_once()
+        assert mock_logger.warning.call_args.kwargs["retry_after_seconds"] == 3.0
+        assert "exc_info" not in mock_logger.warning.call_args.kwargs
         mock_logger.error.assert_not_called()
 
 
@@ -154,7 +166,7 @@ class TestShutdownNotification:
         app.bot.send_message.assert_called_once()
         call_kwargs = app.bot.send_message.call_args.kwargs
         assert call_kwargs["chat_id"] == -100123
-        assert call_kwargs["message_thread_id"] == 1
+        assert "message_thread_id" not in call_kwargs
         assert "SIGINT" in call_kwargs["text"]
 
     async def test_skipped_without_group_id(self) -> None:

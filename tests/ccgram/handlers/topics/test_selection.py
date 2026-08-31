@@ -385,7 +385,9 @@ class TestHandleModeSelect:
         )
 
         mock_accept_yolo.assert_awaited_once_with("@5")
-        mock_sms.wait_for_session_map_entry.assert_awaited_once_with("@5")
+        mock_sms.wait_for_session_map_entry.assert_awaited_once_with(
+            "@5", resolve_window_id=ANY
+        )
 
     @patch("ccgram.handlers.topics.provider_mode_callbacks.provider_registry")
     async def test_rejects_unknown_mode(self, mock_registry: MagicMock) -> None:

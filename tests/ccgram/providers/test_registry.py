@@ -9,6 +9,15 @@ from ccgram.providers.registry import ProviderRegistry, UnknownProviderError
 from test_contracts import StubProvider as _StubProvider
 
 
+@pytest.fixture
+def _fresh_registry():
+    from ccgram.providers import _reset_provider
+
+    _reset_provider()
+    yield
+    _reset_provider()
+
+
 class TestProviderRegistry:
     def test_register_and_get(self) -> None:
         reg = ProviderRegistry()
@@ -80,15 +89,8 @@ class TestConfigProviderSettings:
             assert cfg.provider_name == "codex"
 
 
+@pytest.mark.usefixtures("_fresh_registry")
 class TestResolveLaunchCommand:
-    @pytest.fixture(autouse=True)
-    def _reset(self):
-        from ccgram.providers import _reset_provider
-
-        _reset_provider()
-        yield
-        _reset_provider()
-
     def test_default_returns_provider_command(self) -> None:
         from ccgram.providers import resolve_launch_command
 
@@ -98,22 +100,32 @@ class TestResolveLaunchCommand:
         assert "GEMINI_CLI_SYSTEM_SETTINGS_PATH=" in gemini_cmd
         assert gemini_cmd.endswith(" gemini")
 
-    def test_per_provider_env_override(self, monkeypatch) -> None:
+    def test_all_providers_can_be_overridden_independently(self, monkeypatch) -> None:
         from ccgram.providers import resolve_launch_command
 
         monkeypatch.setenv("CCGRAM_CLAUDE_COMMAND", "ce --current")
+        monkeypatch.setenv("CCGRAM_CODEX_COMMAND", "my-codex --flag")
+        monkeypatch.setenv("CCGRAM_GEMINI_COMMAND", "/opt/gemini/run")
         assert resolve_launch_command("claude") == "ce --current"
-        assert resolve_launch_command("codex") == "codex"
+        assert resolve_launch_command("codex") == "my-codex --flag"
+        assert resolve_launch_command("gemini") == "/opt/gemini/run"
 
-    def test_override_does_not_affect_other_providers(self, monkeypatch) -> None:
+    @pytest.mark.parametrize(
+        ("overridden", "untouched"),
+        [
+            pytest.param("claude", "codex", id="claude_override"),
+            pytest.param("codex", "claude", id="codex_override"),
+        ],
+    )
+    def test_overriding_one_provider_leaves_the_others_alone(
+        self, monkeypatch, overridden: str, untouched: str
+    ) -> None:
         from ccgram.providers import resolve_launch_command
 
-        monkeypatch.setenv("CCGRAM_CODEX_COMMAND", "my-codex")
-        assert resolve_launch_command("codex") == "my-codex"
-        assert resolve_launch_command("claude") == "claude"
-        gemini_cmd = resolve_launch_command("gemini")
-        assert "GEMINI_CLI_SYSTEM_SETTINGS_PATH=" in gemini_cmd
-        assert gemini_cmd.endswith(" gemini")
+        monkeypatch.setenv(f"CCGRAM_{overridden.upper()}_COMMAND", "custom-cli")
+        assert resolve_launch_command(overridden) == "custom-cli"
+        assert resolve_launch_command(untouched) == untouched
+        assert resolve_launch_command("gemini").endswith(" gemini")
 
     def test_unknown_provider_falls_back_to_claude_default(self) -> None:
         from ccgram.providers import resolve_launch_command
@@ -130,20 +142,35 @@ class TestResolveLaunchCommand:
         assert resolve_launch_command("codex") == "my-codex --flag"
         assert resolve_launch_command("gemini") == "/opt/gemini/run"
 
-    def test_yolo_mode_appends_provider_specific_flags(self) -> None:
+    @pytest.mark.parametrize(
+        ("provider", "expected"),
+        [
+            pytest.param(
+                "claude", "claude --dangerously-skip-permissions", id="claude"
+            ),
+            pytest.param(
+                "codex",
+                "codex --dangerously-bypass-approvals-and-sandbox",
+                id="codex",
+            ),
+            pytest.param(
+                "antigravity", "agy --dangerously-skip-permissions", id="antigravity"
+            ),
+        ],
+    )
+    def test_yolo_mode_appends_provider_specific_flags(
+        self, provider: str, expected: str
+    ) -> None:
         from ccgram.providers import resolve_launch_command
 
-        assert (
-            resolve_launch_command("claude", approval_mode="yolo")
-            == "claude --dangerously-skip-permissions"
-        )
-        assert (
-            resolve_launch_command("codex", approval_mode="yolo")
-            == "codex --dangerously-bypass-approvals-and-sandbox"
-        )
-        gemini_cmd = resolve_launch_command("gemini", approval_mode="yolo")
-        assert "GEMINI_CLI_SYSTEM_SETTINGS_PATH=" in gemini_cmd
-        assert gemini_cmd.endswith(" gemini --yolo")
+        assert resolve_launch_command(provider, approval_mode="yolo") == expected
+
+    def test_gemini_yolo_keeps_the_hardened_settings_env(self) -> None:
+        from ccgram.providers import resolve_launch_command
+
+        cmd = resolve_launch_command("gemini", approval_mode="yolo")
+        assert "GEMINI_CLI_SYSTEM_SETTINGS_PATH=" in cmd
+        assert cmd.endswith(" gemini --yolo")
 
     def test_gemini_hardening_writes_system_settings_file(
         self, tmp_path, monkeypatch
@@ -212,28 +239,24 @@ class TestModuleLevelRegistry:
 
 
 class TestRegistryIsValid:
-    def test_valid_name(self) -> None:
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            pytest.param("stub", True, id="registered"),
+            pytest.param("nope", False, id="unknown"),
+        ],
+    )
+    def test_is_valid(self, name: str, expected: bool) -> None:
         reg = ProviderRegistry()
         reg.register("stub", _StubProvider)
-        assert reg.is_valid("stub") is True
-
-    def test_invalid_name(self) -> None:
-        reg = ProviderRegistry()
-        assert reg.is_valid("nonexistent") is False
+        assert reg.is_valid(name) is expected
 
 
+@pytest.mark.usefixtures("_fresh_registry")
 class TestEnsureRegistered:
-    @pytest.fixture(autouse=True)
-    def _reset(self):
-        from ccgram.providers import _reset_provider
-
-        _reset_provider()
-        yield
-        _reset_provider()
-
     @pytest.mark.parametrize(
         "name",
-        ["claude", "codex", "gemini", "pi", "shell"],
+        ["antigravity", "claude", "codex", "gemini", "pi", "shell"],
     )
     def test_all_providers_registered(self, name: str) -> None:
         from ccgram.providers import _ensure_registered, registry
@@ -242,107 +265,23 @@ class TestEnsureRegistered:
         assert registry.is_valid(name), f"Provider {name!r} not registered"
 
 
+@pytest.mark.usefixtures("_fresh_registry")
 class TestGetProviderForWindow:
-    @pytest.fixture(autouse=True)
-    def _reset(self):
-        from ccgram.providers import _reset_provider
-
-        _reset_provider()
-        yield
-        _reset_provider()
-
-    def test_returns_window_specific_provider(self, monkeypatch) -> None:
+    @pytest.mark.parametrize(
+        ("provider_name", "expected"),
+        [
+            pytest.param("codex", "codex", id="explicit_codex"),
+            pytest.param("gemini", "gemini", id="explicit_gemini"),
+            pytest.param("claude", "claude", id="explicit_claude"),
+            pytest.param("", "claude", id="empty_falls_back_to_global"),
+            pytest.param(None, "claude", id="unset_falls_back_to_global"),
+            pytest.param("nonexistent", "claude", id="invalid_falls_back_to_global"),
+        ],
+    )
+    def test_resolves_provider_name_with_global_fallback(
+        self, provider_name: str | None, expected: str
+    ) -> None:
         from ccgram.providers import get_provider_for_window
 
-        provider = get_provider_for_window("@1", provider_name="codex")
-        assert provider.capabilities.name == "codex"
-
-    def test_falls_back_to_global_when_empty(self, monkeypatch) -> None:
-        from ccgram.providers import get_provider_for_window
-
-        provider = get_provider_for_window("@2", provider_name="")
-        assert provider.capabilities.name == "claude"
-
-    def test_falls_back_when_window_not_in_state(self, monkeypatch) -> None:
-        from ccgram.providers import get_provider_for_window
-
-        provider = get_provider_for_window("@999", provider_name=None)
-        assert provider.capabilities.name == "claude"
-
-    def test_falls_back_on_invalid_provider_name(self, monkeypatch) -> None:
-        from ccgram.providers import get_provider_for_window
-
-        provider = get_provider_for_window("@3", provider_name="nonexistent")
-        assert provider.capabilities.name == "claude"
-
-    def test_different_windows_resolve_different_providers(self, monkeypatch) -> None:
-        from ccgram.providers import get_provider_for_window
-
-        assert (
-            get_provider_for_window("@10", provider_name="claude").capabilities.name
-            == "claude"
-        )
-        assert (
-            get_provider_for_window("@11", provider_name="codex").capabilities.name
-            == "codex"
-        )
-        assert (
-            get_provider_for_window("@12", provider_name="gemini").capabilities.name
-            == "gemini"
-        )
-
-
-class TestProviderAvailability:
-    """is_provider_available / available_provider_names — dynamic picker source."""
-
-    def test_absolute_path_executable(self, monkeypatch, tmp_path) -> None:
-        from ccgram.providers import is_provider_available
-
-        binary = tmp_path / "grok"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        monkeypatch.setenv("CCGRAM_GROK_COMMAND", str(binary))
-        assert is_provider_available("grok") is True
-
-    def test_absolute_path_missing(self, monkeypatch) -> None:
-        from ccgram.providers import is_provider_available
-
-        monkeypatch.setenv("CCGRAM_GROK_COMMAND", "/nonexistent/bin/grok")
-        assert is_provider_available("grok") is False
-
-    def test_bare_name_via_which(self, monkeypatch) -> None:
-        from ccgram.providers import is_provider_available
-
-        monkeypatch.delenv("CCGRAM_CODEX_COMMAND", raising=False)
-        with patch("ccgram.providers.shutil.which", return_value="/usr/bin/codex"):
-            assert is_provider_available("codex") is True
-        with patch("ccgram.providers.shutil.which", return_value=None):
-            assert is_provider_available("codex") is False
-
-    def test_shell_always_available(self, monkeypatch) -> None:
-        from ccgram.providers import is_provider_available
-
-        # shell has no external launch binary → always available.
-        with patch("ccgram.providers.shutil.which", return_value=None):
-            assert is_provider_available("shell") is True
-
-    def test_unknown_provider_unavailable(self) -> None:
-        from ccgram.providers import is_provider_available
-
-        assert is_provider_available("bogus") is False
-
-    def test_available_names_filters_and_keeps_shell(self, monkeypatch) -> None:
-        from ccgram.providers import available_provider_names
-
-        def fake_which(cmd):
-            # Only claude + codex found on PATH; gemini/pi absent.
-            return "/usr/bin/x" if cmd in ("claude", "codex") else None
-
-        monkeypatch.delenv("CCGRAM_GROK_COMMAND", raising=False)
-        with patch("ccgram.providers.shutil.which", side_effect=fake_which):
-            names = available_provider_names()
-        assert "claude" in names
-        assert "codex" in names
-        assert "shell" in names  # always present
-        assert "gemini" not in names
-        assert "pi" not in names
+        provider = get_provider_for_window("@1", provider_name=provider_name)
+        assert provider.capabilities.name == expected

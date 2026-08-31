@@ -45,6 +45,7 @@ _WRAPPER_TOKENS = frozenset(
 
 # Basename → provider name.  Checked via exact match and prefix (``claude-*``).
 _PROVIDER_BASENAMES: tuple[tuple[frozenset[str], str], ...] = (
+    (frozenset({"antigravity", "agy"}), "antigravity"),
     (frozenset({"claude", "ce", "cc-mirror", "zai"}), "claude"),
     (frozenset({"codex"}), "codex"),
     (frozenset({"gemini"}), "gemini"),
@@ -58,6 +59,7 @@ _PROVIDER_BASENAMES: tuple[tuple[frozenset[str], str], ...] = (
 # Path substrings that identify a provider when basename alone is ambiguous
 # (e.g. ``cli.js`` launched by bun).
 _PROVIDER_PATH_MARKERS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("antigravity-cli",), "antigravity"),
     (("claude-code", "cc-team"), "claude"),
     (("@openai/codex", "/codex/", "/codex-"), "codex"),
     (("gemini-cli",), "gemini"),
@@ -134,8 +136,10 @@ async def detect_provider_cached(window_id: str, fg: ForegroundInfo | None) -> s
     ``classify_provider_from_argv`` is skipped.  Returns ``""`` when there is
     no foreground process to classify.
     """
-    if fg is None or not fg.argv or fg.pgid == 0:
+    if fg is None or not fg.argv:
         return ""
+    if fg.pgid == 0:
+        return classify_provider_from_argv(fg.argv)
 
     cached = _pgid_cache.get(window_id)
     if cached and cached[0] == fg.pgid:
