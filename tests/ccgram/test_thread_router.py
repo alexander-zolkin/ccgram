@@ -289,3 +289,66 @@ class TestScheduleSave:
         router._schedule_save = lambda: calls.append(1)
         router.set_display_name("@1", "proj")
         assert len(calls) == 1
+
+
+class TestCrossScopeDedup:
+    """CCGRAM-HOTFIX:topic-dedup-cross-scope — a window bound both legacy and
+    chat-scoped must collapse to one topic, or replies double-send."""
+
+    CHAT = -1003565724875
+
+    def _split_state(self) -> dict:
+        # window @26 bound legacy->15804 (old "Psyche") AND chat-scoped->19761
+        # ("Новые часы"); @5 is legacy-only and should just be promoted.
+        return {
+            "thread_bindings": {"100": {"15804": "@26", "9999": "@5"}},
+            "group_chat_ids": {
+                f"100:15804": self.CHAT,
+                f"100:19761": self.CHAT,
+                f"100:9999": self.CHAT,
+            },
+            "chat_thread_bindings": {f"100:{self.CHAT}:19761": "@26"},
+            "window_display_names": {"@26": "Новые часы", "@5": "Other"},
+        }
+
+    def test_split_window_collapses_to_newest_topic(
+        self, router: ThreadRouter
+    ) -> None:
+        router.from_dict(self._split_state())
+        # @26 relays into exactly one topic — the chat-scoped 19761, not 15804.
+        assert router.get_thread_for_window(100, "@26", chat_id=self.CHAT) == 19761
+        occ = [
+            (tid, wid)
+            for _u, tid, wid in router.iter_thread_bindings()
+            if wid == "@26"
+        ]
+        assert occ == [(19761, "@26")]
+
+    def test_legacy_only_binding_promoted_to_chat_scope(
+        self, router: ThreadRouter
+    ) -> None:
+        router.from_dict(self._split_state())
+        assert router.get_thread_for_window(100, "@5", chat_id=self.CHAT) == 9999
+        # no legacy rows survive the group-backed promotion
+        assert router.thread_bindings == {}
+
+    def test_repair_schedules_one_save(self, router: ThreadRouter) -> None:
+        calls: list[int] = []
+        router._schedule_save = lambda: calls.append(1)
+        router.from_dict(self._split_state())
+        assert len(calls) == 1
+
+    def test_clean_state_does_not_schedule_save(
+        self, router: ThreadRouter
+    ) -> None:
+        calls: list[int] = []
+        router._schedule_save = lambda: calls.append(1)
+        router.from_dict(
+            {
+                "thread_bindings": {},
+                "group_chat_ids": {},
+                "chat_thread_bindings": {f"100:{self.CHAT}:19761": "@26"},
+                "window_display_names": {},
+            }
+        )
+        assert calls == []

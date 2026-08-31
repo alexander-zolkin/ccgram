@@ -104,8 +104,51 @@ class ThreadRouter:
         for (uid, chat_id, _tid), wid in self.chat_thread_bindings.items():
             self._chat_window_to_thread[(uid, chat_id, wid)] = _tid
 
-    def _dedup_thread_bindings(self) -> None:
+    def _remove_group_routing_metadata(self, user_id: int, thread_id: int) -> bool:
+        """Remove group_chat_ids metadata belonging to one evicted topic claim."""
+        prefix = f"{user_id}:{thread_id}"
+        stale_keys = [
+            key
+            for key in self.group_chat_ids
+            if key == prefix or key.startswith(f"{prefix}:")
+        ]
+        for key in stale_keys:
+            del self.group_chat_ids[key]
+        return bool(stale_keys)
+
+    def _normalize_group_backed_bindings(self) -> bool:
+        """Promote legacy bindings with a persisted chat ID to chat scope.
+
+        CCGRAM-HOTFIX:topic-dedup-cross-scope — ``thread_bindings`` predates
+        chat-local topic identity.  A matching ``group_chat_ids`` entry is
+        sufficient evidence to promote such a legacy row to a chat-scoped
+        binding; a natively chat-scoped row for the same topic wins over the
+        older representation.  Removing the now-redundant routing metadata
+        stops the legacy row surviving as a stale fallback route — the
+        legacy/chat-scoped split that made one window relay replies into two
+        topics (double-send).  Backport of upstream 790ba49 (dedup part only).
+        """
+        changed = False
+        for user_id, bindings in list(self.thread_bindings.items()):
+            for thread_id, window_id in list(bindings.items()):
+                metadata_key = f"{user_id}:{thread_id}"
+                chat_id = self.group_chat_ids.get(metadata_key)
+                if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+                    continue
+                del bindings[thread_id]
+                scoped_key = (user_id, chat_id, thread_id)
+                # A natively scoped row is the newer, unambiguous record for
+                # this exact topic, so never overwrite it based on JSON order.
+                self.chat_thread_bindings.setdefault(scoped_key, window_id)
+                self._remove_group_routing_metadata(user_id, thread_id)
+                changed = True
+            if not bindings:
+                del self.thread_bindings[user_id]
+        return changed
+
+    def _dedup_thread_bindings(self) -> bool:
         """Enforce 1 window = 1 thread.  Keep highest thread_id per window."""
+        changed = False
         for _uid, bindings in self.thread_bindings.items():
             window_threads: dict[str, list[int]] = {}
             for tid, wid in bindings.items():
@@ -116,6 +159,7 @@ class ThreadRouter:
                     for tid in tids:
                         if tid != keep:
                             del bindings[tid]
+                            changed = True
                             logger.warning(
                                 "Startup: removed duplicate binding "
                                 "thread %d -> window %s (keeping %d)",
@@ -123,6 +167,33 @@ class ThreadRouter:
                                 wid,
                                 keep,
                             )
+        return self._dedup_chat_thread_bindings() or changed
+
+    def _dedup_chat_thread_bindings(self) -> bool:
+        """Keep one deterministic chat-scoped binding per chat and window."""
+        changed = False
+        window_bindings: dict[tuple[int, str], list[tuple[int, int, int]]] = {}
+        for key, wid in self.chat_thread_bindings.items():
+            window_bindings.setdefault((key[1], wid), []).append(key)
+        for (chat_id, wid), keys in window_bindings.items():
+            if len(keys) <= 1:
+                continue
+            keep = max(keys, key=lambda key: (key[2], key[0]))
+            for key in keys:
+                if key == keep:
+                    continue
+                del self.chat_thread_bindings[key]
+                self._remove_group_routing_metadata(key[0], key[2])
+                changed = True
+                logger.warning(
+                    "Startup: removed duplicate binding chat %d thread %d -> "
+                    "window %s (keeping thread %d)",
+                    chat_id,
+                    key[2],
+                    wid,
+                    keep[2],
+                )
+        return changed
 
     # ------------------------------------------------------------------
     # Serialization
@@ -146,8 +217,10 @@ class ThreadRouter:
     def from_dict(self, data: dict[str, Any]) -> None:
         """Restore routing state from persisted data.
 
-        Does NOT call ``_schedule_save`` — loading from disk must not
-        trigger a write.
+        Loading itself does not write; the only ``_schedule_save`` is a
+        one-shot persist when the cross-scope normalization / de-dup
+        (CCGRAM-HOTFIX:topic-dedup-cross-scope) actually repaired a stale
+        legacy/chat-scoped split, so the cleaned routing survives a crash.
         """
         self.thread_bindings = {
             int(uid): {int(tid): wid for tid, wid in bindings.items()}
@@ -159,8 +232,11 @@ class ThreadRouter:
             uid, chat_id, tid = (int(part) for part in key.split(":", 2))
             self.chat_thread_bindings[(uid, chat_id, tid)] = wid
         self.window_display_names = data.get("window_display_names", {})
-        self._dedup_thread_bindings()
+        repaired = self._normalize_group_backed_bindings()
+        repaired = self._dedup_thread_bindings() or repaired
         self._rebuild_reverse_index()
+        if repaired:
+            self._schedule_save()
 
     # ------------------------------------------------------------------
     # Thread binding operations
