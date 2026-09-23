@@ -320,7 +320,11 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
 
         model_id = os.environ.get("CCGRAM_GROK_MODEL", "").strip() or None
     if model_id and supports_model:
-        fresh_args = f"{fresh_args} --model {model_id}".strip()
+        # Lazy: shlex only needed on the model path. Quoted because ids like
+        # ``claude-opus-5-5[1m]`` are shell globs.
+        import shlex
+
+        fresh_args = f"{fresh_args} --model {shlex.quote(model_id)}".strip()
     if fresh_args:
         launch_command = f"{launch_command} {fresh_args}"
 
