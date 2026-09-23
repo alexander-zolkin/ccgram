@@ -57,6 +57,12 @@ class ModelChoice:
 
 _cache: tuple[float, float, list[ModelChoice]] | None = None  # (ts, ttl, models)
 
+# CCGRAM-HOTFIX:model-1m — context window per model id, from the last live
+# /v1/models fetch (``max_input_tokens``). Drives the ``[1m]`` launch suffix.
+_context_windows: dict[str, int] = {}
+_ONE_M = 1_000_000
+_ONE_M_SUFFIX = "[1m]"
+
 
 def _fallback_models() -> list[ModelChoice]:
     return [ModelChoice(id=i, display_name=n) for i, n in STATIC_FALLBACK]
@@ -106,9 +112,13 @@ def _parse_models(payload: dict) -> list[ModelChoice]:
         model_id = entry.get("id")
         if not model_id:
             continue
-        models.append(
-            ModelChoice(id=model_id, display_name=entry.get("display_name") or model_id)
-        )
+        name = entry.get("display_name") or model_id
+        window = entry.get("max_input_tokens")
+        if isinstance(window, int):
+            _context_windows[model_id] = window
+            if window >= _ONE_M:
+                name = f"{name} · 1M"
+        models.append(ModelChoice(id=model_id, display_name=name))
     # The API returns newest-first (created_at desc); trust that order and cap
     # the list so the Telegram keyboard stays one screen tall.
     return models[:_MAX_MODELS]
@@ -151,6 +161,21 @@ async def list_models() -> list[ModelChoice]:
     _cache = (now, _CACHE_TTL_S, models)
     logger.info("model_catalog: fetched %d models from API", len(models))
     return models
+
+
+def with_1m_context(model_id: str) -> str:
+    """Return the Claude CLI model id with the 1M-context ``[1m]`` suffix.
+
+    CCGRAM-HOTFIX:model-1m — Alexander wants every Claude session on the 1M
+    window. Uses ``max_input_tokens`` from the live catalog when known; else
+    assumes 1M for everything but Haiku. Ids that already carry a ``[...]``
+    suffix are returned unchanged.
+    """
+    if not model_id or "[" in model_id:
+        return model_id
+    window = _context_windows.get(model_id)
+    supports = window >= _ONE_M if window is not None else "haiku" not in model_id
+    return f"{model_id}{_ONE_M_SUFFIX}" if supports else model_id
 
 
 # ── Provider-aware dispatch ───────────────────────────────────────────────

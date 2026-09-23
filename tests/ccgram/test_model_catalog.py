@@ -128,3 +128,28 @@ class TestDefaultModelLabel:
         settings.write_text('{"theme": "dark"}')
         with patch.object(model_catalog, "_SETTINGS_PATH", str(settings)):
             assert default_model_label() == model_catalog._DEFAULT_MODEL_FALLBACK
+
+
+class TestWith1mContext:
+    def test_appends_suffix_by_default(self) -> None:
+        from ccgram.model_catalog import with_1m_context
+
+        assert with_1m_context("claude-opus-5-5") == "claude-opus-5-5[1m]"
+
+    def test_keeps_existing_suffix(self) -> None:
+        from ccgram.model_catalog import with_1m_context
+
+        assert with_1m_context("claude-opus-5-5[1m]") == "claude-opus-5-5[1m]"
+
+    def test_skips_haiku(self) -> None:
+        from ccgram.model_catalog import with_1m_context
+
+        assert with_1m_context("claude-haiku-4-5") == "claude-haiku-4-5"
+
+    def test_uses_live_context_window(self, monkeypatch) -> None:
+        from ccgram import model_catalog
+
+        monkeypatch.setitem(model_catalog._context_windows, "claude-small", 200_000)
+        monkeypatch.setitem(model_catalog._context_windows, "claude-big", 1_000_000)
+        assert model_catalog.with_1m_context("claude-small") == "claude-small"
+        assert model_catalog.with_1m_context("claude-big") == "claude-big[1m]"

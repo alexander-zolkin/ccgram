@@ -319,6 +319,12 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         import os
 
         model_id = os.environ.get("CCGRAM_GROK_MODEL", "").strip() or None
+    if model_id and provider_name == "claude":
+        # CCGRAM-HOTFIX:model-1m — always launch Claude on the 1M window.
+        # Lazy: keep the httpx-importing catalog off the launch import path.
+        from ccgram.model_catalog import with_1m_context
+
+        model_id = with_1m_context(model_id)
     if model_id and supports_model:
         # Lazy: shlex only needed on the model path. Quoted because ids like
         # ``claude-opus-5-5[1m]`` are shell globs.
