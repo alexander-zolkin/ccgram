@@ -143,10 +143,15 @@ def _resolve_upload_dir(
         return None, None, "No session bound to this topic."
 
     view = view_window(window_id)
-    if view is None or not view.cwd:
+    cwd = view.cwd if view else ""
+    if not cwd:  # CCGRAM-HOTFIX:file-autoresume — dead window: session_map pruned
+        from .text.text_handler import _recover_cwd_for_window
+
+        cwd = _recover_cwd_for_window(window_id)
+    if not cwd:
         return window_id, None, "Session has no working directory."
 
-    upload_path = Path(view.cwd) / _UPLOAD_DIR
+    upload_path = Path(cwd) / _UPLOAD_DIR
     return window_id, upload_path, None
 
 
@@ -353,6 +358,17 @@ async def _upload_and_notify(
     claude_msg = claude_msg_tpl.format(name=saved_name, path=rel_path)
     if caption:
         claude_msg += f"\n\nUser note: {_sanitize_caption(caption)}"
+
+    # CCGRAM-HOTFIX:file-autoresume — a file sent to a hibernated (dead-but-bound)
+    # topic must wake the session like a text message does, not fail with
+    # "failed to notify Claude". The upload note becomes the pending text.
+    if thread_id is not None:
+        from .text.text_handler import _handle_dead_window
+
+        if await _handle_dead_window(
+            window_id, user_id, thread_id, claude_msg, context.user_data, message
+        ):
+            return
 
     success, err = await send_telegram_to_window(
         user_id, window_id, message.message_thread_id, claude_msg, message.chat.id

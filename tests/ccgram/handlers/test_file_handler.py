@@ -12,6 +12,7 @@ from telegram.error import TimedOut
 from ccgram.handlers.file_handler import (
     _fetch_to_dest,
     _generate_photo_filename,
+    _resolve_upload_dir,
     _sanitize_caption,
     _sanitize_filename,
     _unique_dest,
@@ -281,6 +282,108 @@ class TestUnboundFileFirst:
         mock_download.assert_not_called()
         mock_reply.assert_awaited_once()
         assert "No session bound" in mock_reply.await_args.args[1]
+
+
+class TestDeadWindowAutoresume:
+    """CCGRAM-HOTFIX:file-autoresume — a file sent to a hibernated topic wakes
+    the session (like text) instead of "failed to notify Claude"."""
+
+    async def _upload(self, message: MagicMock) -> None:
+        context = MagicMock()
+        context.user_data = {}
+        await _upload_and_notify(
+            message,
+            context,
+            user_id=100,
+            thread_id=42,
+            filename="photo_x.jpg",
+            file_id="fid",
+            file_size=123,
+            size_label="Photo",
+            claude_msg_tpl="I've uploaded an image to {path} — please take a look.",
+            success_emoji="📷",
+        )
+
+    @patch(f"{_FH}.send_telegram_to_window", new_callable=AsyncMock)
+    @patch("ccgram.handlers.text.text_handler._handle_dead_window")
+    @patch(f"{_FH}._download_and_save", new_callable=AsyncMock)
+    @patch(f"{_FH}._resolve_upload_dir")
+    @patch(f"{_FH}.safe_reply", new_callable=AsyncMock)
+    async def test_dead_window_wakes_with_upload_note(
+        self,
+        mock_reply: AsyncMock,
+        mock_resolve: MagicMock,
+        mock_download: AsyncMock,
+        mock_dead: AsyncMock,
+        mock_send: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        mock_resolve.return_value = ("@27", tmp_path / ".ccgram-uploads", None)
+        mock_download.return_value = "photo_x.jpg"
+        mock_dead.return_value = True
+        message = MagicMock()
+        message.caption = "what is this?"
+        message.chat.send_action = AsyncMock()
+
+        await self._upload(message)
+
+        mock_dead.assert_awaited_once()
+        args = mock_dead.await_args.args
+        assert args[:3] == ("@27", 100, 42)
+        assert ".ccgram-uploads/photo_x.jpg" in args[3]
+        assert "User note: what is this?" in args[3]
+        mock_send.assert_not_called()
+        mock_reply.assert_not_called()
+
+    @patch(f"{_FH}.ack_reaction", new_callable=AsyncMock)
+    @patch(f"{_FH}.PTBTelegramClient")
+    @patch(f"{_FH}.send_telegram_to_window", new_callable=AsyncMock)
+    @patch("ccgram.handlers.text.text_handler._handle_dead_window")
+    @patch(f"{_FH}._download_and_save", new_callable=AsyncMock)
+    @patch(f"{_FH}._resolve_upload_dir")
+    @patch(f"{_FH}.safe_reply", new_callable=AsyncMock)
+    async def test_live_window_forwards_as_before(
+        self,
+        mock_reply: AsyncMock,
+        mock_resolve: MagicMock,
+        mock_download: AsyncMock,
+        mock_dead: AsyncMock,
+        mock_send: AsyncMock,
+        _mock_client: MagicMock,
+        _mock_ack: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        mock_resolve.return_value = ("@31", tmp_path / ".ccgram-uploads", None)
+        mock_download.return_value = "photo_x.jpg"
+        mock_dead.return_value = False
+        mock_send.return_value = (True, "")
+        message = MagicMock()
+        message.caption = None
+        message.chat.send_action = AsyncMock()
+
+        await self._upload(message)
+
+        mock_send.assert_awaited_once()
+        mock_reply.assert_awaited_once()
+        assert "Uploaded" in mock_reply.await_args.args[1]
+
+    @patch("ccgram.handlers.text.text_handler._recover_cwd_for_window")
+    @patch(f"{_FH}.view_window")
+    @patch(f"{_FH}.thread_router")
+    def test_resolve_recovers_cwd_for_pruned_window(
+        self,
+        mock_tr: MagicMock,
+        mock_view: MagicMock,
+        mock_recover: MagicMock,
+    ) -> None:
+        mock_tr.resolve_window_for_thread.return_value = "@27"
+        mock_view.return_value = None  # session_map pruned on death
+        mock_recover.return_value = "/work/dir"
+
+        wid, path, err = _resolve_upload_dir(100, 42, -1)
+
+        assert (wid, err) == ("@27", None)
+        assert path == Path("/work/dir/.ccgram-uploads")
 
 
 class TestFetchToDest:
