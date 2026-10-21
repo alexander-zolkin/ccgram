@@ -305,4 +305,5 @@ def first_exchange(
                 reply = item["text"]
         if len(users) >= max_user and reply:
             break
+    # A reply is optional: titles are made from the first message alone.
     return users, reply

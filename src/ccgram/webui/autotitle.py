@@ -67,7 +67,7 @@ _TITLE_PROMPT = (
     "контекст: не бери из него темы, о которых пользователь не просил. Если "
     "пользователь лишь проверяет связь или здоровается, так и назови "
     "(например «Проверка связи»).\nОтветь ТОЛЬКО названием.\n\n"
-    "Сообщения пользователя:\n{user}\n\nНачало ответа ассистента:\n{reply}"
+    "Сообщения пользователя:\n{user}\n\nНачало ответа ассистента (может не быть):\n{reply}"
 )
 
 
@@ -134,14 +134,14 @@ async def generate_title(path: Path) -> str | None:
     from .transcript import first_exchange
 
     users, reply = await asyncio.to_thread(first_exchange, path)
-    if not users or not reply:
+    if not users:
         return None
     user = "\n---\n".join(u[:700] for u in users)
-    prompt = _TITLE_PROMPT.format(user=user, reply=reply[:500])
+    prompt = _TITLE_PROMPT.format(user=user, reply=reply[:500] or "(ответа ещё нет)")
     env = {
         **os.environ,
         "CLAUDE_CALL_MODEL": "haiku",
-        "CLAUDE_CALL_PERSONA": "",
+        "CLAUDE_CALL_PERSONA": "bare",  # anything but "kara" = no persona
         "CLAUDE_CALL_TOOLS": "",
         "CLAUDE_CALL_BUDGET": "0.03",
         "CLAUDE_CALL_TIMEOUT": str(GEN_TIMEOUT_S - 10),
@@ -167,44 +167,72 @@ async def generate_title(path: Path) -> str | None:
     return _clean_title(out.decode(errors="replace"))
 
 
+def _due(s: dict[str, Any]) -> bool:
+    tid = s["thread_id"]
+    return (
+        tid not in _done
+        and is_placeholder(s["name"])
+        and s["last_activity"] >= time.time() - RECENT_S  # leave old topics alone
+        and time.time() - _failed.get(tid, 0) >= RETRY_S
+    )
+
+
+async def _title_for(tid: int, path: Path) -> str | None:
+    """Claude Code's own title, else one Haiku makes from the first message.
+
+    Like claude.ai, the chat is named without waiting for the reply; a session
+    with no message yet is simply not ready (not a failure).
+    """
+    title = await asyncio.to_thread(find_ai_title, path)
+    if title:
+        return title
+    # Lazy: transcript parser only needed here.
+    from .transcript import first_exchange
+
+    users, _reply = await asyncio.to_thread(first_exchange, path)
+    if not users:
+        return None
+    title = await generate_title(path)
+    if not title:
+        _failed[tid] = time.time()
+    return title
+
+
+async def _rename(bot: Bot, tid: int, binding: Any, title: str) -> bool:
+    # Lazy: service pulls the handler graph; this module stays importable.
+    from . import service
+
+    try:
+        await service.rename(bot, tid, title)
+    except Exception as exc:  # noqa: BLE001 — retry later
+        logger.info("webui: auto-title of %d failed: %s", tid, exc)
+        if _topic_gone(exc) and not binding.web_only:
+            # The rename is the first thing to notice the topic was deleted
+            # in Telegram: let the topic probe confirm it now.
+            # Lazy: topics handler graph only needed on this path.
+            from ..handlers.topics.topic_lifecycle import note_thread_gone
+
+            note_thread_gone(binding.chat_id, binding.thread_id)
+        _failed[tid] = time.time()
+        return False
+    logger.info("webui: auto-titled session %d → %r", tid, title)
+    return True
+
+
 async def _tick(bot: Bot) -> None:
     # Lazy: service pulls the handler graph; this module stays importable.
     from . import service
 
     for s in await service.list_sessions():
+        if not _due(s):
+            continue
         tid = s["thread_id"]
-        if tid in _done or not is_placeholder(s["name"]):
-            continue
-        if s["last_activity"] < time.time() - RECENT_S:
-            continue  # leave old topics alone
-        if time.time() - _failed.get(tid, 0) < RETRY_S:
-            continue
         binding = service.find_binding(tid)
         path, _provider = service._transcript_for(binding)
-        if path is None:
-            continue
-        title = await asyncio.to_thread(find_ai_title, path)
-        if not title:
-            title = await generate_title(path)
-            if not title:
-                _failed[tid] = time.time()
-                continue
-        try:
-            await service.rename(bot, tid, title)
-            logger.info("webui: auto-titled session %d → %r", tid, title)
-        except Exception as exc:  # noqa: BLE001 — retry next tick
-            logger.info("webui: auto-title of %d failed: %s", tid, exc)
-            if _topic_gone(exc) and not binding.web_only:
-                # The rename is the first thing to notice the topic was
-                # deleted in Telegram: let the topic probe confirm it now.
-                # Lazy: topics handler graph only needed on this path.
-                from ..handlers.topics.topic_lifecycle import note_thread_gone
-
-                note_thread_gone(binding.chat_id, binding.thread_id)
-            _failed[tid] = time.time()
-            continue
-        _done.add(tid)
-        await asyncio.sleep(RENAME_GAP_S)
+        title = await _title_for(tid, path) if path else None
+        if title and await _rename(bot, tid, binding, title):
+            _done.add(tid)
+            await asyncio.sleep(RENAME_GAP_S)
 
 
 async def run(bot: Bot) -> None:

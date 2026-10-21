@@ -63,3 +63,46 @@ def test_topic_gone_detection():
     assert autotitle._topic_gone(Exception("Bad Request: Topic_id_invalid"))
     assert autotitle._topic_gone(Exception("Message thread not found"))
     assert not autotitle._topic_gone(Exception("Flood control exceeded"))
+
+
+async def test_tick_names_from_first_message_and_waits_quietly(tmp_path, monkeypatch):
+    import time as _time
+    from types import SimpleNamespace
+
+    from ccgram.webui import service
+
+    autotitle._done.clear()
+    autotitle._failed.clear()
+    path = tmp_path / "t.jsonl"
+    path.write_text("")
+    binding = SimpleNamespace(web_only=False, chat_id=-100, thread_id=5)
+    sessions = [
+        {"thread_id": 5, "name": "kara 10-22 02-27", "last_activity": _time.time()}
+    ]
+    renamed = []
+
+    async def fake_list():
+        return sessions
+
+    async def fake_rename(bot, tid, title):
+        renamed.append((tid, title))
+
+    async def fake_generate(p):
+        return "Проверка связи"
+
+    monkeypatch.setattr(service, "list_sessions", fake_list)
+    monkeypatch.setattr(service, "find_binding", lambda tid: binding)
+    monkeypatch.setattr(service, "_transcript_for", lambda b: (path, "claude"))
+    monkeypatch.setattr(service, "rename", fake_rename)
+    monkeypatch.setattr(autotitle, "generate_title", fake_generate)
+    monkeypatch.setattr(autotitle, "RENAME_GAP_S", 0)
+
+    await autotitle._tick(None)  # no message yet: nothing, and not a failure
+    assert renamed == [] and 5 not in autotitle._failed
+    path.write_text(
+        json.dumps({"type": "user", "uuid": "u", "message": {"content": "Test1"}})
+        + "\n"
+    )
+    await autotitle._tick(None)  # named right away, no reply needed
+    assert renamed == [(5, "Проверка связи")]
+    autotitle._done.clear()
