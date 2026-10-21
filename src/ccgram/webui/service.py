@@ -24,7 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from .. import window_query
+from .. import quiet_threads, window_query
 from ..config import config
 from ..multiplexer import multiplexer as tmux_manager
 from ..multiplexer.window_ops import send_to_window
@@ -250,6 +250,10 @@ async def list_sessions() -> list[dict[str, Any]]:
     # Lazy: registry is a leaf, but keep the import next to its only users.
     from . import registry
 
+    # Lazy: prefs is a leaf; keep it next to its only user.
+    from .prefs import pinned
+
+    pins = pinned()
     live = {w.window_id for w in await tmux_manager.list_windows()}
     targets = _bindings()
     bound_threads = {b.thread_id for b in targets}
@@ -284,6 +288,7 @@ async def list_sessions() -> list[dict[str, Any]]:
                 "cwd": cwd,
                 "last_activity": last_activity,
                 "web_only": b.web_only,
+                "pinned": b.thread_id in pins,
             }
         )
     sessions.sort(key=lambda s: s["last_activity"], reverse=True)
@@ -430,12 +435,19 @@ _UPLOAD_DIR = ".ccgram-uploads"  # same folder the Telegram file handler uses
 _SAFE_NAME = re.compile(r"[^\w.\-() ]+", re.UNICODE)
 
 
-def save_upload(thread_id: int, filename: str, data: bytes) -> dict[str, Any]:
+def save_upload(thread_id: int | None, filename: str, data: bytes) -> dict[str, Any]:
     """Store a browser upload in the session's cwd, like Telegram uploads."""
     if len(data) > MAX_UPLOAD:
         raise WebUIError("file too large (max 25 MB)", 413)
-    binding = find_binding(thread_id)
-    cwd = _cwd_for(binding)
+    if thread_id is None:
+        # A file attached before the session exists lands where quick-start
+        # sessions run.
+        # Lazy: quick-start defaults live in the topics handler layer.
+        from ..handlers.topics.directory_browser import QUICKSTART_DEFAULT_CWD
+
+        cwd = QUICKSTART_DEFAULT_CWD
+    else:
+        cwd = _cwd_for(find_binding(thread_id))
     if not cwd or not Path(cwd).is_dir():
         raise WebUIError("session folder is gone", 409)
     base = _SAFE_NAME.sub("_", Path(filename or "file").name).strip(" .") or "file"
@@ -553,6 +565,9 @@ async def send_text(bot: Bot, thread_id: int, text: str) -> dict[str, Any]:
     )
     if provider.capabilities.chat_first_command_path:
         raise WebUIError("shell sessions are Telegram-only for now", 409)
+    if not binding.web_only:
+        # Replies to web input reach the topic without a notification sound.
+        quiet_threads.mark_web(binding.chat_id, binding.thread_id)
     ok, err = await send_to_window(window_id, text)
     if not ok:
         raise WebUIError(err or "send failed", 502)
@@ -658,7 +673,7 @@ async def create_session(
     )
 
     provider = QUICKSTART_DEFAULT_PROVIDER
-    model_id = model
+    model_id = valid_model(model)
     if not model_id:
         remembered = recall_model(provider)
         model_id = remembered[0] if remembered else None
@@ -683,6 +698,7 @@ async def create_session(
     if not result.success or not result.window_id:
         raise WebUIError(result.error_message or "launch failed", 502)
     if text:
+        quiet_threads.mark_web(chat_id, thread_id)
         ok, err = await send_to_window(result.window_id, text)
         if not ok:
             raise WebUIError(f"session started, but sending failed: {err}", 502)
@@ -760,7 +776,7 @@ async def create_web_only_session(
     cwd = QUICKSTART_DEFAULT_CWD
     if not Path(cwd).is_dir():
         raise WebUIError("default directory missing", 500)
-    launch, provider_name, mode, provider = _web_only_launch(model)
+    launch, provider_name, mode, provider = _web_only_launch(valid_model(model))
     title = (name or "").strip()[:120] or "веб " + time.strftime("%m-%d %H-%M")
 
     ok, msg, _wname, wid = await tmux_manager.create_window(cwd, launch_command=launch)
@@ -798,3 +814,103 @@ async def create_web_only_session(
             raise WebUIError(f"session started, but sending failed: {err}", 502)
     logger.info("webui: started web-only session %d in window %s", web_id, wid)
     return {"thread_id": web_id, "window_id": wid, "name": title}
+
+
+# ── session management (the "…" menu) ────────────────────────────────────────
+
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}(\[1m\])?")
+
+
+def valid_model(model: Any) -> str | None:
+    """A model id safe to put on a command line, or None."""
+    if isinstance(model, str) and _MODEL_ID.fullmatch(model):
+        return model
+    return None
+
+
+async def list_models() -> dict[str, Any]:
+    # Lazy: keep the httpx-importing catalog off the import path.
+    from ..last_model import recall_model
+
+    # Lazy: same reason as the import above.
+    from ..model_catalog import list_models_for_provider
+
+    models = await list_models_for_provider("claude")
+    remembered = recall_model("claude")
+    return {
+        "models": [{"id": m.id, "name": m.display_name} for m in models],
+        "default": remembered[0] if remembered else (models[0].id if models else None),
+    }
+
+
+async def set_pin(thread_id: int, on: bool) -> dict[str, Any]:
+    # Lazy: prefs is a leaf; keep it next to its only users.
+    from .prefs import set_pinned
+
+    find_binding(thread_id)
+    set_pinned(thread_id, on)
+    return {"ok": True, "pinned": on}
+
+
+async def _drop_topic(bot: Bot, binding: Binding, *, window_alive: bool) -> None:
+    """Unbind a topic from its window and delete the topic in Telegram."""
+    # Lazy: cleanup / client wrappers pull the handler graph.
+    from ..handlers.cleanup import clear_topic_state
+
+    # Lazy: same reason as the import above.
+    from ..telegram_client import PTBTelegramClient
+
+    client = PTBTelegramClient(bot)
+    await clear_topic_state(
+        binding.user_id,
+        binding.thread_id,
+        client,
+        window_id=binding.window_id,
+        chat_id=binding.chat_id,
+        window_dead=not window_alive,
+    )
+    thread_router.unbind_thread(
+        binding.user_id,
+        binding.thread_id,
+        chat_id=binding.chat_id,
+        retirement_reason="remote_deleted",
+    )
+    try:
+        await bot.delete_forum_topic(
+            chat_id=binding.chat_id, message_thread_id=binding.thread_id
+        )
+    except Exception as exc:  # noqa: BLE001 — topic may already be gone
+        logger.info("webui: delete topic %d: %s", binding.thread_id, exc)
+
+
+async def remove_from_telegram(bot: Bot, thread_id: int) -> dict[str, Any]:
+    """Delete the session's topic but keep the session running, web-only."""
+    # Lazy: registry is a leaf, but keep the import next to its users.
+    from . import registry
+
+    binding = find_binding(thread_id)
+    if binding.web_only:
+        raise WebUIError("this session has no Telegram topic", 409)
+    if not registry.detach_from_topic(
+        binding.user_id, binding.chat_id, binding.thread_id, binding.window_id
+    ):
+        raise WebUIError("cannot keep this session without its topic", 409)
+    await _drop_topic(bot, binding, window_alive=True)
+    return {"ok": True}
+
+
+async def delete_session(bot: Bot, thread_id: int) -> dict[str, Any]:
+    """Stop the session for good: kill its window, delete its topic, forget it."""
+    # Lazy: prefs is a leaf; keep it next to its only users.
+    from .prefs import set_pinned
+
+    binding = find_binding(thread_id)
+    if binding.web_only:
+        result = await close_web_only(thread_id)
+    else:
+        if await _window_alive(binding.window_id):
+            await tmux_manager.kill_window(binding.window_id)
+        await _drop_topic(bot, binding, window_alive=False)
+        result = {"ok": True}
+    set_pinned(thread_id, False)
+    return result

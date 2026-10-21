@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 import time
 
+from .. import quiet_threads
 from ..multiplexer.window_ops import send_followup_to_window, send_to_window
 
 _PENDING_INJECTION_TTL_S = 30.0
@@ -114,6 +115,8 @@ async def send_telegram_to_window(
         return False, _AGENT_EXITED_MESSAGE
     if thread_id is None:
         return await send_to_window(window_id, text, raw=raw)
+    # CCGRAM-HOTFIX:webui — input typed in the topic: replies notify again.
+    quiet_threads.mark_telegram(chat_id, thread_id)
     injection = remember_telegram_injection(
         user_id, window_id, thread_id, text, chat_id
     )

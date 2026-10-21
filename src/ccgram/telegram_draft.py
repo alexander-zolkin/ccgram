@@ -18,6 +18,7 @@ import structlog
 from telegram import Bot, InlineKeyboardMarkup
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 
+from . import quiet_threads
 from .telegram_rate_limiter import retry_after_seconds
 from .utils import log_throttled
 
@@ -297,7 +298,8 @@ class DraftStream:
             kwargs["reply_to_message_id"] = self._reply_to
         if self._reply_markup is not None:
             kwargs["reply_markup"] = self._reply_markup
-        return kwargs
+        # CCGRAM-HOTFIX:webui — silent while the topic is driven from the web.
+        return quiet_threads.apply(self._chat_id, kwargs)
 
     def _draft_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {

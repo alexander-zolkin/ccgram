@@ -15,6 +15,11 @@ Routes (everything under ``/api`` except login requires the session cookie):
   ``before``/``after`` byte cursors)
 - ``POST /api/sessions/{tid}/rename``     rename session + its topic
 - ``POST /api/sessions/{tid}/upload``     multipart file into the session cwd
+- ``POST /api/sessions/{tid}/pin``        pin / unpin in the sidebar
+- ``POST /api/sessions/{tid}/detach``     delete the topic, keep the session
+- ``POST /api/sessions/{tid}/delete``     kill the session, delete its topic
+- ``POST /api/uploads``                   file for a session not created yet
+- ``GET  /api/models``                    Claude models for the picker
 - ``GET  /api/events``                    SSE: messages + session-list changes
 
 State-changing requests must carry ``X-CCGram: 1``; with no CORS headers
@@ -200,14 +205,17 @@ async def _sessions(_request: web.Request) -> web.Response:
 async def _create(request: web.Request) -> web.Response:
     body = await _json_body(request)
     name = body.get("name") if isinstance(body.get("name"), str) else None
+    model = service.valid_model(body.get("model"))
     if body.get("web_only"):
-        result = await service.create_web_only_session(str(body.get("text", "")), name)
+        result = await service.create_web_only_session(
+            str(body.get("text", "")), name, model
+        )
     else:
         result = await service.create_session(
             request.app[_BOT_KEY],  # type: ignore[arg-type]
             str(body.get("text", "")),
             name,
-            None,
+            model,
         )
     return web.json_response(result)
 
@@ -258,7 +266,10 @@ async def _rename(request: web.Request) -> web.Response:
 
 
 async def _upload(request: web.Request) -> web.Response:
-    tid = _thread_id(request)
+    return await _upload_into(request, _thread_id(request))
+
+
+async def _upload_into(request: web.Request, tid: int | None) -> web.Response:
     reader = await request.multipart()
     part = await reader.next()
     if part is None or getattr(part, "name", None) != "file":
@@ -267,6 +278,39 @@ async def _upload(request: web.Request) -> web.Response:
     filename = getattr(part, "filename", None) or "file"
     result = await asyncio.to_thread(service.save_upload, tid, filename, bytes(data))
     return web.json_response(result)
+
+
+async def _upload_new(request: web.Request) -> web.Response:
+    return await _upload_into(request, None)
+
+
+async def _models(_request: web.Request) -> web.Response:
+    return web.json_response(await service.list_models())
+
+
+async def _pin(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    return web.json_response(
+        await service.set_pin(_thread_id(request), bool(body.get("pinned")))
+    )
+
+
+async def _detach(request: web.Request) -> web.Response:
+    return web.json_response(
+        await service.remove_from_telegram(
+            request.app[_BOT_KEY],  # type: ignore[arg-type]
+            _thread_id(request),
+        )
+    )
+
+
+async def _delete(request: web.Request) -> web.Response:
+    return web.json_response(
+        await service.delete_session(
+            request.app[_BOT_KEY],  # type: ignore[arg-type]
+            _thread_id(request),
+        )
+    )
 
 
 async def _close(request: web.Request) -> web.Response:
@@ -362,12 +406,18 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_get("/api/sessions/{tid}/entries", _entries)
     r.add_post("/api/sessions/{tid}/rename", _rename)
     r.add_post("/api/sessions/{tid}/upload", _upload)
+    r.add_post("/api/sessions/{tid}/pin", _pin)
+    r.add_post("/api/sessions/{tid}/detach", _detach)
+    r.add_post("/api/sessions/{tid}/delete", _delete)
+    r.add_post("/api/uploads", _upload_new)
+    r.add_get("/api/models", _models)
     r.add_post("/api/sessions/{tid}/key", _key)
     r.add_get("/api/events", _events)
     return app
 
 
 _runner: web.AppRunner | None = None
+_autotitle_task: asyncio.Task[None] | None = None
 
 
 async def start_webui(bot: Bot | Any) -> None:
@@ -396,12 +446,20 @@ async def start_webui(bot: Bot | Any) -> None:
         ).start()
         _runner = runner
         logger.info("web UI listening on %s:%d", config.webui_host, config.webui_port)
+        # Lazy: only the running daemon names sessions.
+        from . import autotitle
+
+        global _autotitle_task
+        _autotitle_task = autotitle.start(bot)
     except OSError as exc:
         logger.error("web UI failed to bind: %s", exc)
 
 
 async def stop_webui() -> None:
-    global _runner
+    global _runner, _autotitle_task
+    if _autotitle_task is not None:
+        _autotitle_task.cancel()
+        _autotitle_task = None
     if _runner is None:
         return
     with contextlib.suppress(Exception):

@@ -291,3 +291,46 @@ def test_save_upload_sanitizes_and_stays_inside(tmp_path, monkeypatch):
 
     with _pytest.raises(service.WebUIError):
         service.save_upload(7, "big.bin", b"x" * (service.MAX_UPLOAD + 1))
+
+
+async def test_session_menu_routes(client, monkeypatch):
+    seen = []
+
+    async def rec(name, *args):
+        seen.append((name, *args))
+        return {"ok": True}
+
+    monkeypatch.setattr(service, "set_pin", lambda tid, on: rec("pin", tid, on))
+    monkeypatch.setattr(
+        service, "remove_from_telegram", lambda bot, tid: rec("detach", tid)
+    )
+    monkeypatch.setattr(service, "delete_session", lambda bot, tid: rec("delete", tid))
+
+    async def models():
+        return {"models": [{"id": "m1", "name": "M1"}], "default": "m1"}
+
+    monkeypatch.setattr(service, "list_models", models)
+    monkeypatch.setattr(
+        service, "save_upload", lambda tid, fn, data: {"path": f"x/{fn}", "tid": tid}
+    )
+    await _login(client)
+    for path, body in (("pin", {"pinned": True}), ("detach", {}), ("delete", {})):
+        resp = await client.post(
+            f"/api/sessions/7/{path}", json=body, headers=POST_HEADERS
+        )
+        assert resp.status == 200, path
+    assert seen == [("pin", 7, True), ("detach", 7), ("delete", 7)]
+    assert (await (await client.get("/api/models")).json())["default"] == "m1"
+    import aiohttp
+
+    form = aiohttp.FormData()
+    form.add_field("file", b"x", filename="n.txt")
+    resp = await client.post("/api/uploads", data=form, headers=POST_HEADERS)
+    assert (await resp.json())["tid"] is None
+
+
+def test_valid_model():
+    assert service.valid_model("claude-opus-5-5") == "claude-opus-5-5"
+    assert service.valid_model("claude-opus-5-5[1m]") == "claude-opus-5-5[1m]"
+    assert service.valid_model("x; rm -rf /") is None
+    assert service.valid_model(None) is None

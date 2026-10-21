@@ -31,6 +31,8 @@ from telegram._botcommandscope import BotCommandScope
 from telegram._files.inputmedia import InputMedia
 from telegram._reaction import ReactionType
 
+from . import quiet_threads
+
 
 @runtime_checkable
 class TelegramClient(Protocol):
@@ -199,7 +201,7 @@ class PTBTelegramClient:
         return await self._bot.send_message(
             chat_id=chat_id,
             text=text,
-            **kwargs,
+            **quiet_threads.apply(chat_id, kwargs),
         )
 
     async def edit_message_text(
@@ -247,7 +249,7 @@ class PTBTelegramClient:
         return await self._bot.send_photo(
             chat_id=chat_id,
             photo=photo,
-            **kwargs,
+            **quiet_threads.apply(chat_id, kwargs),
         )
 
     async def send_document(
@@ -256,7 +258,7 @@ class PTBTelegramClient:
         return await self._bot.send_document(
             chat_id=chat_id,
             document=document,
-            **kwargs,
+            **quiet_threads.apply(chat_id, kwargs),
         )
 
     async def send_chat_action(
@@ -272,7 +274,7 @@ class PTBTelegramClient:
         return await self._bot.send_voice(
             chat_id=chat_id,
             voice=voice,
-            **kwargs,
+            **quiet_threads.apply(chat_id, kwargs),
         )
 
     async def set_message_reaction(

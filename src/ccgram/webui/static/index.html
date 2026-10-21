@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta name="theme-color" content="#f5f4ef" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#1c1b19" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#faf9f5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#262624" media="(prefers-color-scheme: dark)">
 <title>Кара</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
@@ -28,33 +28,40 @@
 <div id="app" class="app" hidden>
   <aside class="sidebar">
     <div class="side-head">
-      <div class="brand"><img src="/static/icon.svg" alt=""><span>Кара</span></div>
-      <button id="collapse-btn" class="icon-btn mobile-only" title="Закрыть" aria-label="Закрыть">✕</button>
+      <a class="brand" href="#new"><img src="/static/icon.svg" alt=""><span>Кара</span></a>
+      <button id="collapse-btn" class="icon-btn" title="Свернуть" aria-label="Свернуть панель">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg>
+      </button>
     </div>
-    <button id="new-btn" class="btn new-btn"><span class="plus">+</span> Новая сессия</button>
-    <div class="search-wrap"><input id="filter" type="search" placeholder="Поиск" autocomplete="off"></div>
+    <a id="new-btn" class="new-chat" href="#new"><span class="new-ico">+</span><span>Новый чат</span></a>
+    <div class="search-wrap"><input id="filter" type="search" placeholder="Поиск по чатам" autocomplete="off"></div>
     <nav id="session-list" class="session-list"></nav>
     <div class="side-foot">
-      <span id="conn" class="conn" title="Нет связи"></span>
-      <button id="notify-btn" class="icon-btn" title="Включить уведомления" hidden>🔔</button>
-      <button id="theme-btn" class="icon-btn" title="Тема">◐</button>
-      <button id="logout-btn" class="icon-btn" title="Выйти">⎋</button>
+      <button id="profile-btn" class="profile">
+        <span class="initials">А</span>
+        <span class="who"><b>Александр</b><span class="muted" id="conn-text">на связи</span></span>
+        <span id="conn" class="conn"></span>
+      </button>
     </div>
   </aside>
   <div id="scrim" class="scrim"></div>
 
   <main class="main">
     <header class="topbar">
-      <button id="menu-btn" class="icon-btn mobile-only" aria-label="Сессии">☰</button>
-      <div class="title-wrap">
-        <div id="chat-name" class="chat-name" title="Нажми, чтобы переименовать">Кара</div>
-        <div id="chat-meta" class="chat-meta"></div>
-      </div>
-      <div class="top-actions">
-        <a id="tg-link" class="icon-btn" target="_blank" rel="noopener" title="Открыть топик в Telegram" hidden>✈</a>
-        <button id="pane-btn" class="icon-btn" title="Терминал" hidden>⌨</button>
-        <button id="close-btn" class="btn danger small" title="Остановить процесс и убрать сессию" hidden>Завершить</button>
-      </div>
+      <button id="menu-btn" class="icon-btn show-collapsed" aria-label="Чаты">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg>
+      </button>
+      <a class="icon-btn show-collapsed" href="#new" title="Новый чат" aria-label="Новый чат">+</a>
+      <button id="title-btn" class="title-btn" hidden>
+        <span id="chat-name">Кара</span>
+        <span id="chat-badge" class="badge" hidden>веб</span>
+        <svg class="chev-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <span class="spacer"></span>
+      <span id="chat-state" class="chat-state"></span>
+      <button id="pane-btn" class="icon-btn" title="Терминал" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>
+      </button>
     </header>
 
     <section id="pane" class="pane" hidden>
@@ -63,53 +70,63 @@
     </section>
 
     <section id="scroller" class="scroller">
-      <div id="thread" class="thread">
-        <div class="welcome">
-          <img src="/static/icon.svg" alt="">
-          <h2>Привет, Александр</h2>
-          <p class="muted">Выбери сессию слева или начни новую. Всё, что пишешь здесь, видно и в Telegram.</p>
-        </div>
+      <div id="thread" class="thread"></div>
+      <div id="home" class="home" hidden>
+        <div class="greet"><img src="/static/icon.svg" alt=""><h1 id="greet-text">Добрый вечер, Александр</h1></div>
       </div>
     </section>
-    <button id="jump-btn" class="jump-btn" hidden>↓</button>
+    <button id="jump-btn" class="jump-btn" hidden aria-label="Вниз">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+    </button>
 
-    <footer class="dock">
+    <footer id="dock" class="dock">
       <div id="prompt-card" class="prompt-card" hidden>
         <div class="prompt-head"><span class="pulse"></span><b id="prompt-title">Кара ждёт ответа</b></div>
         <pre id="prompt-text"></pre>
         <div class="keys" data-keys></div>
       </div>
       <div id="working" class="working" hidden>
-        <span class="spinner"></span><span id="working-text">Кара работает…</span>
+        <span class="spark"></span><span id="working-text">Кара работает…</span>
         <button id="stop-btn" class="btn small">Стоп</button>
       </div>
       <form id="composer" class="composer">
         <div id="attachments" class="attachments"></div>
-        <textarea id="input" rows="1" placeholder="Напиши Каре…" disabled></textarea>
+        <textarea id="input" rows="1" placeholder="Как я могу помочь?"></textarea>
         <div class="composer-bar">
-          <label class="icon-btn attach" title="Прикрепить файл">📎<input id="file-input" type="file" multiple hidden></label>
-          <span class="hint muted">Enter — отправить, Shift+Enter — новая строка</span>
-          <button id="send-btn" type="submit" class="send-btn" disabled aria-label="Отправить">↑</button>
+          <label class="tool-btn" title="Прикрепить файлы">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+            <input id="file-input" type="file" multiple hidden>
+          </label>
+          <button id="tg-toggle" type="button" class="tool-btn chip" title="Дублировать в Telegram" hidden>
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21.9 4.6l-3.1 14.7c-.2 1-.8 1.3-1.7.8l-4.7-3.5-2.3 2.2c-.3.3-.5.5-1 .5l.3-4.8 8.7-7.9c.4-.3-.1-.5-.6-.2L6.8 13.2 2.2 11.7c-1-.3-1-1 .2-1.5l18-6.9c.8-.3 1.6.2 1.5 1.3z"/></svg>
+            <span id="tg-toggle-text">Telegram</span>
+          </button>
+          <span class="spacer"></span>
+          <button id="model-btn" type="button" class="model-btn" hidden><span id="model-name">Модель</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+          </button>
+          <button id="send-btn" type="submit" class="send-btn" disabled aria-label="Отправить">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          </button>
         </div>
       </form>
+      <div id="disclaimer" class="disclaimer muted"></div>
     </footer>
   </main>
 </div>
 
-<dialog id="new-dialog" class="dialog">
-  <form id="new-form" method="dialog">
-    <h3>Новая сессия</h3>
-    <p class="muted" id="new-hint">Создам топик в группе «Кара» и запущу Claude с настройками по умолчанию.</p>
-    <input id="new-name" placeholder="Название (необязательно)" maxlength="120">
-    <textarea id="new-text" rows="4" placeholder="С чего начнём? (необязательно)"></textarea>
-    <label class="check"><input id="new-webonly" type="checkbox"> <span><b>Без Telegram</b> — сессия только в вебе, топик не создаётся</span></label>
+<div id="menu" class="menu" hidden></div>
+<dialog id="confirm" class="dialog">
+  <form method="dialog">
+    <h3 id="confirm-title"></h3>
+    <p id="confirm-text" class="muted"></p>
     <div class="dialog-actions">
-      <button value="cancel" class="btn" formnovalidate>Отмена</button>
-      <button id="new-submit" value="ok" class="btn primary">Создать</button>
+      <button value="cancel" class="btn">Отмена</button>
+      <button value="ok" id="confirm-ok" class="btn danger-fill">Удалить</button>
     </div>
-    <div id="new-error" class="error"></div>
   </form>
 </dialog>
+<div id="toast" class="toast" hidden></div>
 
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>
