@@ -46,7 +46,7 @@ def calls(monkeypatch):
             raise service.WebUIError("unknown session", 404)
         return {"messages": [{"role": "user", "text": "hi"}], "total": 1}
 
-    async def fake_create(bot, text, name, model):
+    async def fake_create(bot, text, name, model, provider="claude"):
         log.append(("create", text, name))
         return {"thread_id": 8, "window_id": "@4", "name": name or "kara"}
 

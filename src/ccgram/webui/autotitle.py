@@ -1,11 +1,13 @@
 """Adopt Claude Code's own session title, like claude.ai names a chat.
 
-Claude Code appends ``{"type": "ai-title", "aiTitle": …}`` entries to the
-transcript after the first exchange. A background task renames sessions that
-still carry a placeholder name (``kara MM-DD HH-MM``, ``веб …``, ``workspace-N``)
-— the Telegram topic too. Only sessions active since the daemon started are
-considered, so old topics are never mass-renamed, and renames are spaced out
-to stay clear of Telegram flood control.
+Claude Code sometimes appends ``{"type": "ai-title", "aiTitle": …}`` entries
+to the transcript — but not for every session. A background task renames
+sessions that still carry a placeholder name (``kara MM-DD HH-MM``, ``веб …``,
+``workspace-N``) — the Telegram topic too — using that title, or, when Claude
+Code wrote none, a short title Haiku makes from the first exchange
+(``CCGRAM_WEBUI_TITLE_CMD``, a headless ``claude -p`` wrapper). Only sessions
+active in the last few hours are considered, so old topics are never
+mass-renamed, and renames are spaced out to stay clear of flood control.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -31,8 +34,41 @@ INTERVAL_S = 15.0
 RENAME_GAP_S = 5.0
 _MARKER = b"ai-title"
 
-_started = time.time()
-_done: set[int] = set()  # sessions already renamed or found without a title source
+RECENT_S = 6 * 3600
+TITLE_MIN, TITLE_MAX, TITLE_RAW_MAX = 2, 60, 80
+_DANGLING = {
+    "и",
+    "в",
+    "на",
+    "по",
+    "для",
+    "с",
+    "о",
+    "от",
+    "к",
+    "у",
+    "а",
+    "или",
+    "and",
+    "of",
+    "the",
+    "to",
+}
+GEN_TIMEOUT_S = 90
+RETRY_S = 600
+_done: set[int] = set()  # sessions already renamed
+_failed: dict[int, float] = {}  # session → time of the last failed generation
+
+_TITLE_PROMPT = (
+    "Придумай название для чата, как это делает claude.ai: 2–5 слов, не длиннее "
+    "40 символов, по-русски "
+    "(английские термины можно оставить), без кавычек, точки и эмодзи.\n"
+    "Название — о сути ЗАПРОСА пользователя. Ответ ассистента дан только как "
+    "контекст: не бери из него темы, о которых пользователь не просил. Если "
+    "пользователь лишь проверяет связь или здоровается, так и назови "
+    "(например «Проверка связи»).\nОтветь ТОЛЬКО названием.\n\n"
+    "Сообщения пользователя:\n{user}\n\nНачало ответа ассистента:\n{reply}"
+)
 
 
 def is_placeholder(name: str) -> bool:
@@ -69,6 +105,63 @@ def find_ai_title(path: Path) -> str | None:
     return title[:120] if title else None
 
 
+def _clean_title(raw: str) -> str | None:
+    line = next((x.strip() for x in raw.splitlines() if x.strip()), "")
+    line = line.strip(" \"'«»“”`*#.").strip()
+    line = re.sub(r"^(Название|Title)\s*:\s*", "", line, flags=re.IGNORECASE)
+    if not TITLE_MIN <= len(line) <= TITLE_RAW_MAX:
+        return None
+    if len(line) > TITLE_MAX:  # cut on a word boundary
+        line = line[:TITLE_MAX].rsplit(" ", 1)[0].rstrip(" ,;:—-")
+        words = line.split()
+        while len(words) > 1 and words[-1].lower() in _DANGLING:
+            words.pop()
+        line = " ".join(words).rstrip(" ,;:—-")
+    return line
+
+
+async def generate_title(path: Path) -> str | None:
+    """Ask Haiku (through the headless wrapper) to name the chat."""
+    cmd = os.environ.get("CCGRAM_WEBUI_TITLE_CMD", "").strip()
+    if not cmd:
+        return None
+    # Lazy: transcript parser only needed when generating.
+    from .transcript import first_exchange
+
+    users, reply = await asyncio.to_thread(first_exchange, path)
+    if not users or not reply:
+        return None
+    user = "\n---\n".join(u[:700] for u in users)
+    prompt = _TITLE_PROMPT.format(user=user, reply=reply[:500])
+    env = {
+        **os.environ,
+        "CLAUDE_CALL_MODEL": "haiku",
+        "CLAUDE_CALL_PERSONA": "",
+        "CLAUDE_CALL_TOOLS": "",
+        "CLAUDE_CALL_BUDGET": "0.03",
+        "CLAUDE_CALL_TIMEOUT": str(GEN_TIMEOUT_S - 10),
+        "KARA_HEADLESS": "1",
+    }
+    proc = await asyncio.create_subprocess_exec(
+        cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=env,
+        cwd="/tmp",
+    )
+    try:
+        out, _ = await asyncio.wait_for(
+            proc.communicate(prompt.encode()), GEN_TIMEOUT_S
+        )
+    except TimeoutError:
+        proc.kill()
+        return None
+    if proc.returncode != 0:
+        return None
+    return _clean_title(out.decode(errors="replace"))
+
+
 async def _tick(bot: Bot) -> None:
     # Lazy: service pulls the handler graph; this module stays importable.
     from . import service
@@ -77,13 +170,20 @@ async def _tick(bot: Bot) -> None:
         tid = s["thread_id"]
         if tid in _done or not is_placeholder(s["name"]):
             continue
-        if s["last_activity"] < _started:
-            continue  # untouched since start: leave old topics alone
+        if s["last_activity"] < time.time() - RECENT_S:
+            continue  # leave old topics alone
+        if time.time() - _failed.get(tid, 0) < RETRY_S:
+            continue
         binding = service.find_binding(tid)
         path, _provider = service._transcript_for(binding)
-        title = await asyncio.to_thread(find_ai_title, path) if path else None
-        if not title:
+        if path is None:
             continue
+        title = await asyncio.to_thread(find_ai_title, path)
+        if not title:
+            title = await generate_title(path)
+            if not title:
+                _failed[tid] = time.time()
+                continue
         try:
             await service.rename(bot, tid, title)
             logger.info("webui: auto-titled session %d → %r", tid, title)

@@ -187,3 +187,56 @@ def test_new_web_id_is_negative_and_unique():
     assert registry.new_web_id() == -2
     registry.update(-1, session_id="s1")
     assert registry.get(-1)["session_id"] == "s1"
+
+
+def test_match_default_resolves_suffix_and_alias():
+    from ccgram.model_catalog import ModelChoice
+    from ccgram.webui.service import _match_default
+
+    models = [
+        ModelChoice("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+        ModelChoice("claude-opus-5-5", "Claude Opus 5.5"),
+    ]
+    assert _match_default(models, "claude-opus-5-5[1m]") == (
+        "claude-opus-5-5",
+        "Claude Opus 5.5",
+    )
+    assert _match_default(models, "opus[1m]") == ("claude-opus-5-5", "Claude Opus 5.5")
+    assert _match_default([], "grok-4.5") == ("grok-4.5", "grok-4.5")
+
+
+def test_codex_models_from_cache(tmp_path, monkeypatch):
+    import json as _json
+
+    from ccgram import model_catalog
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert model_catalog.list_codex_models() == []
+    (tmp_path / "models_cache.json").write_text(
+        _json.dumps(
+            {
+                "models": [
+                    {"slug": "hidden", "display_name": "H", "visibility": "hide"},
+                    {
+                        "slug": "gpt-6-luna",
+                        "display_name": "GPT-6-Luna",
+                        "visibility": "list",
+                    },
+                    {
+                        "slug": "gpt-5.6-terra",
+                        "display_name": "GPT-5.6-Terra",
+                        "visibility": "list",
+                    },
+                ]
+            }
+        )
+    )
+    assert [m.id for m in model_catalog.list_codex_models()] == [
+        "gpt-6-luna",
+        "gpt-5.6-terra",
+    ]
+    assert model_catalog.default_codex_model() == "gpt-6-luna"
+    (tmp_path / "config.toml").write_text(
+        'model = "gpt-5.6-terra"\n[profiles.x]\nmodel = "nope"\n'
+    )
+    assert model_catalog.default_codex_model() == "gpt-5.6-terra"

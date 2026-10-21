@@ -627,7 +627,11 @@ def _default_topic_name() -> str:
 
 
 async def create_session(
-    bot: Bot, text: str, name: str | None, model: str | None
+    bot: Bot,
+    text: str,
+    name: str | None,
+    model: str | None,
+    provider: str = "claude",
 ) -> dict[str, Any]:
     """Open a new forum topic and launch a quick-start session bound to it."""
     # Lazy: the launch service drags in the topics handler graph.
@@ -672,11 +676,20 @@ async def create_session(
         text="🌐 Starting a session from the web…",
     )
 
-    provider = QUICKSTART_DEFAULT_PROVIDER
+    provider = provider or QUICKSTART_DEFAULT_PROVIDER
     model_id = valid_model(model)
     if not model_id:
         remembered = recall_model(provider)
         model_id = remembered[0] if remembered else None
+    # Agents whose welcome screen swallows early keystrokes (grok) take the
+    # first message as a launch argument instead.
+    # Lazy: providers package heavy bootstrap.
+    from ..providers import registry as provider_registry
+
+    as_arg = (
+        bool(text)
+        and provider_registry.get(provider).capabilities.launch_accepts_initial_prompt
+    )
     context = SimpleNamespace(bot=bot, user_data={})
     # pending_text is NOT handed to launch_window: it would be injected with a
     # Telegram-origin marker and so never relayed into the topic. Send it
@@ -690,7 +703,7 @@ async def create_session(
             provider_name=provider,
             cwd=QUICKSTART_DEFAULT_CWD,
             mode=QUICKSTART_DEFAULT_MODE,
-            pending_text=None,
+            pending_text=text if as_arg else None,
             model=model_id,
             chat_id=chat_id,
         ),
@@ -699,13 +712,16 @@ async def create_session(
         raise WebUIError(result.error_message or "launch failed", 502)
     if text:
         quiet_threads.mark_web(chat_id, thread_id)
+    if text and not as_arg:
         ok, err = await send_to_window(result.window_id, text)
         if not ok:
             raise WebUIError(f"session started, but sending failed: {err}", 502)
     return {"thread_id": thread_id, "window_id": result.window_id, "name": title}
 
 
-def _web_only_launch(model: str | None) -> tuple[str, str, str, Any]:
+def _web_only_launch(
+    model: str | None, provider_name: str = "claude", text: str = ""
+) -> tuple[str, str, str, Any, bool]:
     """(launch command, provider name, approval mode, provider) for quick-start.
 
     Mirrors launch_window: fresh-session args (``--effort``), the remembered
@@ -729,7 +745,8 @@ def _web_only_launch(model: str | None) -> tuple[str, str, str, Any]:
     # Lazy: providers package heavy bootstrap.
     from ..providers import resolve_launch_command
 
-    provider_name, mode = QUICKSTART_DEFAULT_PROVIDER, QUICKSTART_DEFAULT_MODE
+    provider_name = provider_name or QUICKSTART_DEFAULT_PROVIDER
+    mode = QUICKSTART_DEFAULT_MODE
     provider = provider_registry.get(provider_name)
     args = provider.make_launch_args()
     args = args if isinstance(args, str) else ""
@@ -740,11 +757,15 @@ def _web_only_launch(model: str | None) -> tuple[str, str, str, Any]:
         # Quoted: ids like ``claude-opus-5-5[1m]`` are shell globs.
         args = f"{args} --model {shlex.quote(model_id)}".strip()
     launch = resolve_launch_command(provider_name, approval_mode=mode)
-    return (f"{launch} {args}" if args else launch), provider_name, mode, provider
+    launch = f"{launch} {args}" if args else launch
+    as_arg = bool(text) and provider.capabilities.launch_accepts_initial_prompt
+    if as_arg:
+        launch = f"{launch} {shlex.quote(text)}"
+    return launch, provider_name, mode, provider, as_arg
 
 
 async def create_web_only_session(
-    text: str, name: str | None, model: str | None = None
+    text: str, name: str | None, model: str | None = None, provider: str = "claude"
 ) -> dict[str, Any]:
     """Launch a quick-start session with no Telegram topic at all.
 
@@ -776,7 +797,9 @@ async def create_web_only_session(
     cwd = QUICKSTART_DEFAULT_CWD
     if not Path(cwd).is_dir():
         raise WebUIError("default directory missing", 500)
-    launch, provider_name, mode, provider = _web_only_launch(valid_model(model))
+    launch, provider_name, mode, provider, as_arg = _web_only_launch(
+        valid_model(model), provider, text
+    )
     title = (name or "").strip()[:120] or "веб " + time.strftime("%m-%d %H-%M")
 
     ok, msg, _wname, wid = await tmux_manager.create_window(cwd, launch_command=launch)
@@ -808,7 +831,7 @@ async def create_web_only_session(
             session_id=view.session_id or "",
             transcript_path=str(view.transcript_path or ""),
         )
-    if text:
+    if text and not as_arg:
         sent, err = await send_to_window(wid, text)
         if not sent:
             raise WebUIError(f"session started, but sending failed: {err}", 502)
@@ -828,19 +851,90 @@ def valid_model(model: Any) -> str | None:
     return None
 
 
+PROVIDER_LABELS = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "grok": "Grok",
+    "gemini": "Gemini",
+}
+
+
+def _provider_ready(name: str) -> bool:
+    """Installed AND usable: Gemini without any login would just fail."""
+    if name == "gemini":
+        home = Path.home() / ".gemini"
+        return bool(
+            os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+            or (home / "oauth_creds.json").is_file()
+        )
+    return True
+
+
+def web_providers() -> list[str]:
+    # Lazy: providers package heavy bootstrap.
+    from ..providers import available_provider_names
+
+    return [
+        p
+        for p in available_provider_names()
+        if p in PROVIDER_LABELS and _provider_ready(p)
+    ]
+
+
+def _match_default(models: list[Any], wanted: str) -> tuple[str, str]:
+    """(id, name) of the model a bare launch uses, resolved against the list.
+
+    Handles ``claude-opus-5-5[1m]`` (remembered with the 1M suffix) and CLI
+    aliases like ``opus[1m]`` from ~/.claude/settings.json.
+    """
+    bare = wanted.removesuffix("[1m]")
+    for m in models:
+        if m.id == bare:
+            return m.id, m.display_name
+    for m in models:  # alias such as "opus" → newest model containing it
+        if bare and bare in m.id:
+            return m.id, m.display_name
+    return bare, bare
+
+
 async def list_models() -> dict[str, Any]:
+    """Every usable agent with its models and the concrete default model."""
     # Lazy: keep the httpx-importing catalog off the import path.
     from ..last_model import recall_model
 
     # Lazy: same reason as the import above.
-    from ..model_catalog import list_models_for_provider
+    from ..model_catalog import (
+        default_model_label_for_provider,
+        list_models_for_provider,
+    )
 
-    models = await list_models_for_provider("claude")
-    remembered = recall_model("claude")
-    return {
-        "models": [{"id": m.id, "name": m.display_name} for m in models],
-        "default": remembered[0] if remembered else (models[0].id if models else None),
-    }
+    providers = []
+    for name in web_providers():
+        try:
+            models = await list_models_for_provider(name)
+        except Exception:  # noqa: BLE001 — one broken CLI must not hide the rest
+            models = []
+        remembered = recall_model(name)
+        wanted = remembered[0] if remembered else default_model_label_for_provider(name)
+        default_id, default_name = _match_default(models, wanted or "")
+        providers.append(
+            {
+                "id": name,
+                "name": PROVIDER_LABELS[name],
+                "models": [{"id": m.id, "name": m.display_name} for m in models],
+                "default": {"id": default_id, "name": default_name},
+            }
+        )
+    return {"providers": providers, "default_provider": "claude"}
+
+
+def valid_provider(provider: Any) -> str:
+    if provider in (None, ""):
+        return "claude"
+    if isinstance(provider, str) and provider in web_providers():
+        return provider
+    raise WebUIError("unknown or unavailable agent")
 
 
 async def set_pin(thread_id: int, on: bool) -> dict[str, Any]:

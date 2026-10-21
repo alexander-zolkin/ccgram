@@ -80,7 +80,7 @@ def default_model_label() -> str:
     try:
         settings = json.loads(Path(_SETTINGS_PATH).expanduser().read_text())
         model = settings.get("model")
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return _DEFAULT_MODEL_FALLBACK
     if isinstance(model, str) and model.strip():
         return model.strip()
@@ -95,7 +95,7 @@ def _resolve_auth_headers() -> dict[str, str] | None:
     try:
         creds = json.loads(Path(_CREDENTIALS_PATH).expanduser().read_text())
         token = creds.get("claudeAiOauth", {}).get("accessToken", "")
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     if not token:
         return None
@@ -202,7 +202,53 @@ async def list_models_for_provider(provider: str) -> list[ModelChoice]:
 
         pairs = await asyncio.to_thread(list_grok_models)
         return [ModelChoice(id=i, display_name=n) for i, n in pairs]
+    if provider == "codex":
+        return list_codex_models()
     return await list_models()
+
+
+_CODEX_HOME = "~/.codex"
+
+
+def _codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or _CODEX_HOME).expanduser()
+
+
+def list_codex_models() -> list[ModelChoice]:
+    """Models Codex itself offers, from its ``models_cache.json``. Never raises.
+
+    CCGRAM-HOTFIX:webui — Codex refreshes this cache on every run; entries
+    with ``visibility: "list"`` are the ones its own /model picker shows.
+    """
+    try:
+        data = json.loads((_codex_home() / "models_cache.json").read_text())
+    except OSError, ValueError:
+        return []
+    out = []
+    for m in data.get("models") or []:
+        if isinstance(m, dict) and m.get("visibility") == "list" and m.get("slug"):
+            out.append(
+                ModelChoice(
+                    id=m["slug"], display_name=m.get("display_name") or m["slug"]
+                )
+            )
+    return out
+
+
+def default_codex_model() -> str:
+    """The model a bare ``codex`` launch uses: config.toml ``model``, else
+    the first model Codex lists."""
+    try:
+        for line in (_codex_home() / "config.toml").read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "model" and value.strip():
+                return value.strip().strip('"').strip("'")
+            if line.lstrip().startswith("["):
+                break  # top-level keys only
+    except OSError:
+        pass
+    models = list_codex_models()
+    return models[0].id if models else "codex"
 
 
 def default_model_label_for_provider(provider: str) -> str:
@@ -212,4 +258,6 @@ def default_model_label_for_provider(provider: str) -> str:
         from ccgram.providers.grok_models import default_grok_model_label
 
         return default_grok_model_label()
+    if provider == "codex":
+        return default_codex_model()
     return default_model_label()

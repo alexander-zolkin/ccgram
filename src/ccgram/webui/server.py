@@ -206,9 +206,10 @@ async def _create(request: web.Request) -> web.Response:
     body = await _json_body(request)
     name = body.get("name") if isinstance(body.get("name"), str) else None
     model = service.valid_model(body.get("model"))
+    provider = service.valid_provider(body.get("provider"))
     if body.get("web_only"):
         result = await service.create_web_only_session(
-            str(body.get("text", "")), name, model
+            str(body.get("text", "")), name, model, provider
         )
     else:
         result = await service.create_session(
@@ -216,6 +217,7 @@ async def _create(request: web.Request) -> web.Response:
             str(body.get("text", "")),
             name,
             model,
+            provider,
         )
     return web.json_response(result)
 

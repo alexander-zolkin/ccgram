@@ -84,7 +84,10 @@ def test_current_provider_reads_pending() -> None:
 def test_provider_supports_model_picker() -> None:
     assert dc._provider_supports_model_picker("claude") is True
     assert dc._provider_supports_model_picker("grok") is True
-    assert dc._provider_supports_model_picker("codex") is False
+    # CCGRAM-HOTFIX:webui — codex gained a model picker (models_cache.json);
+    # gemini is the remaining picker-less provider.
+    assert dc._provider_supports_model_picker("codex") is True
+    assert dc._provider_supports_model_picker("gemini") is False
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────
@@ -157,7 +160,7 @@ async def test_defaults_yes_drops_model_for_non_picker_provider(
     # Codex has no model picker → a stray model id must not reach the launch.
     user_data = {
         PENDING_THREAD_ID: 42,
-        PENDING_PROVIDER: "codex",
+        PENDING_PROVIDER: "gemini",
         PENDING_MODEL_ID: "stale",
     }
     ctx = _context(user_data)
@@ -169,7 +172,7 @@ async def test_defaults_yes_drops_model_for_non_picker_provider(
     ):
         await dc._handle_defaults_yes(query, 100, MagicMock(), ctx)
     request = mock_launch.await_args.args[2]
-    assert request.provider_name == "codex"
+    assert request.provider_name == "gemini"
     assert request.model is None
 
 

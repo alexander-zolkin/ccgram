@@ -315,7 +315,8 @@ const state = {
   paneTimer: null,
   attachments: [],
   pending: new Map(),     // session id → text shown until the transcript has it
-  models: null,
+  providers: null,          // [{id, name, models, default}]
+  provider: store.get("kara-provider") || "claude",
   model: store.get("kara-model") || "",
   telegram: store.get("kara-telegram") !== "0",
 };
@@ -802,7 +803,8 @@ async function send() {
     if (state.current == null) {
       $("working").hidden = false;
       $("working-text").textContent = state.telegram ? "Создаю чат и топик…" : "Создаю чат…";
-      const res = await api("/api/sessions", { body: { text: message, web_only: !state.telegram, model: state.model || undefined } });
+      const c = currentChoice();
+      const res = await api("/api/sessions", { body: { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined } });
       clearComposer();
       state.pending.set(res.thread_id, message);
       await refreshSessions();
@@ -836,16 +838,37 @@ function renderToggle() {
   $("disclaimer").textContent = state.telegram ? "Создам топик в группе «Кара» — переписка будет видна и там." : "Чат будет только в вебе, в Telegram ничего не появится.";
 }
 
+function currentChoice() {
+  const providers = state.providers || [];
+  const p = providers.find((x) => x.id === state.provider) || providers[0];
+  if (!p) return null;
+  const m = p.models.find((x) => x.id === state.model) || p.default;
+  return { provider: p, model: m };
+}
+
+function choiceLabel(c) {
+  if (!c) return "Модель";
+  const name = c.model?.name || c.model?.id || c.provider.name;
+  return name.toLowerCase().includes(c.provider.name.toLowerCase()) ? name : `${c.provider.name} · ${name}`;
+}
+
 async function loadModels() {
-  if (!state.models) {
+  if (!state.providers) {
     try {
-      const data = await api("/api/models");
-      state.models = data.models;
-      if (!state.model) state.model = data.default || "";
-    } catch (_) { state.models = []; }
+      state.providers = (await api("/api/models")).providers;
+    } catch (_) { state.providers = []; }
   }
-  const m = (state.models || []).find((x) => x.id === state.model);
-  $("model-name").textContent = m ? m.name : "Модель по умолчанию";
+  const c = currentChoice();
+  if (c && c.provider.id !== state.provider) { state.provider = c.provider.id; state.model = ""; }
+  $("model-name").textContent = choiceLabel(c);
+}
+
+function pickModel(provider, model) {
+  state.provider = provider;
+  state.model = model;
+  store.set("kara-provider", provider);
+  store.set("kara-model", model);
+  loadModels();
 }
 
 // ═══ live events ════════════════════════════════════════════════════════════
@@ -983,11 +1006,23 @@ $("profile-btn").onclick = () => {
 $("tg-toggle").onclick = () => { state.telegram = !state.telegram; store.set("kara-telegram", state.telegram ? "1" : "0"); renderToggle(); };
 $("model-btn").onclick = async () => {
   await loadModels();
-  const items = [{ heading: "Модель" }, ...(state.models || []).map((m) => ({
-    label: m.name, check: m.id === state.model,
-    action: () => { state.model = m.id; store.set("kara-model", m.id); loadModels(); },
-  }))];
-  if (items.length === 1) items.push({ label: "Список моделей недоступен" });
+  const c = currentChoice();
+  const items = [];
+  for (const p of state.providers || []) {
+    if (items.length) items.push("sep");
+    items.push({ heading: p.name });
+    const models = p.models.length ? p.models : [p.default];
+    for (const m of models) {
+      const isDefault = m.id === p.default.id;
+      items.push({
+        label: m.name || m.id,
+        sub: isDefault ? "по умолчанию" : "",
+        check: c && c.provider.id === p.id && c.model?.id === m.id,
+        action: () => pickModel(p.id, m.id),
+      });
+    }
+  }
+  if (!items.length) items.push({ label: "Агенты недоступны" });
   openMenu(items, menuBelow($("model-btn")));
 };
 $("jump-btn").onclick = () => { toBottom(); $("jump-btn").hidden = true; };

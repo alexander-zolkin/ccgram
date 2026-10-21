@@ -278,3 +278,31 @@ def file_size(path: Path) -> int:
         return os.stat(path).st_size
     except OSError:
         return 0
+
+
+def first_exchange(
+    path: Path, scan: int = 2 * 1024 * 1024, max_user: int = 3
+) -> tuple[list[str], str]:
+    """(first ``max_user`` user texts, first assistant reply) from the head."""
+    users: list[str] = []
+    reply = ""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(scan)
+    except OSError:
+        return [], ""
+    for line in data.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        for item in parse_entry(entry):
+            if item["kind"] == "user" and item.get("text") and len(users) < max_user:
+                users.append(item["text"])
+            elif item["kind"] == "assistant" and users and not reply:
+                reply = item["text"]
+        if len(users) >= max_user and reply:
+            break
+    return users, reply
