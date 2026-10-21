@@ -28,6 +28,7 @@ from ..callback_tokens import revoke_window_tokens
 from ..cleanup import clear_topic_state
 from ...telegram_rate_limiter import NO_RETRY_RATE_LIMIT_ARGS, retry_after_seconds
 from ..messaging_pipeline.message_sender import is_thread_gone
+from .topic_probe import probe_topic_exists
 from ..polling.polling_state import (
     lifecycle_strategy,
     terminal_poll_state,
@@ -366,6 +367,25 @@ async def _unbind_deleted_topic(
     )
 
 
+async def _probe_suspected(
+    client: TelegramClient, user_id: int, chat_id: int, thread_id: int, wid: str
+) -> bool:
+    """Send-probe a topic a failed send reported gone; True when it handled it.
+
+    CCGRAM-HOTFIX:webui — Telegram now answers unpinAllForumTopicMessages (and
+    other no-op topic calls) with ok for DELETED topics, so the unpin probe
+    can't see a deletion. Only a real send fails ("message thread not found"),
+    so use the send+delete probe — but only for topics a send already reported
+    gone, to keep it rare.
+    """
+    if (chat_id, thread_id) not in _suspected_gone:
+        return False
+    _suspected_gone.discard((chat_id, thread_id))
+    if await probe_topic_exists(client, chat_id, thread_id) is False:
+        await _unbind_deleted_topic(client, user_id, chat_id, thread_id, wid)
+    return True
+
+
 async def probe_topic_existence(client: TelegramClient) -> None:
     """Probe a slice of bound topics via Telegram API; detect deleted topics."""
     now = time.monotonic()
@@ -383,7 +403,8 @@ async def probe_topic_existence(client: TelegramClient) -> None:
             chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         probe_key = (user_id, chat_id, thread_id)
         _probe_last_ts[probe_key] = time.monotonic()
-        _suspected_gone.discard((chat_id, thread_id))
+        if await _probe_suspected(client, user_id, chat_id, thread_id, wid):
+            continue
         try:
             await client.unpin_all_forum_topic_messages(
                 chat_id=chat_id,

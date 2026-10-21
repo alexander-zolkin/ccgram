@@ -138,3 +138,25 @@ def test_thread_gone_send_jumps_the_probe_queue():
     tl.note_thread_gone(-100, 42)
     assert tl._due_probe_targets(bindings, now) == [(1, -100, 42, "@42")]
     tl.reset_probe_schedule()
+
+
+async def test_suspected_topic_uses_send_probe(monkeypatch):
+    from ccgram.handlers.topics import topic_lifecycle as tl
+
+    tl.reset_probe_schedule()
+    calls = []
+
+    async def fake_exists(client, chat_id, thread_id):
+        calls.append(("probe", chat_id, thread_id))
+        return False
+
+    async def fake_unbind(client, user_id, chat_id, thread_id, wid):
+        calls.append(("unbind", thread_id, wid))
+
+    monkeypatch.setattr(tl, "probe_topic_exists", fake_exists)
+    monkeypatch.setattr(tl, "_unbind_deleted_topic", fake_unbind)
+    assert await tl._probe_suspected(object(), 1, -100, 42, "@42") is False
+    tl.note_thread_gone(-100, 42)
+    assert await tl._probe_suspected(object(), 1, -100, 42, "@42") is True
+    assert calls == [("probe", -100, 42), ("unbind", 42, "@42")]
+    assert (-100, 42) not in tl._suspected_gone
