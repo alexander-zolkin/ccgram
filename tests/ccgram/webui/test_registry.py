@@ -240,3 +240,14 @@ def test_codex_models_from_cache(tmp_path, monkeypatch):
         'model = "gpt-5.6-terra"\n[profiles.x]\nmodel = "nope"\n'
     )
     assert model_catalog.default_codex_model() == "gpt-5.6-terra"
+
+
+def test_detach_records_origin(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    _stub_lookups(monkeypatch, _view(str(tmp_path)))
+    assert registry.detach_from_topic(1, -100, 42, "@7") is True
+    assert registry.get(42)["origin"] == "telegram"
+    assert registry.detach_from_topic(1, -100, 43, "@8", origin="web") is True
+    assert registry.get(43)["origin"] == "web"
+    registry.update(42, origin="kept")
+    assert registry.get(42)["origin"] == "kept"

@@ -80,6 +80,13 @@
     </button>
 
     <footer id="dock" class="dock">
+      <div id="gone-card" class="gone-card" hidden>
+        <span>Топик этого чата удалён в Telegram. Удалить чат и здесь?</span>
+        <span class="gone-actions">
+          <button id="gone-keep" type="button" class="btn small">Оставить в вебе</button>
+          <button id="gone-delete" type="button" class="btn small danger-fill">Удалить и здесь</button>
+        </span>
+      </div>
       <div id="prompt-card" class="prompt-card" hidden>
         <div class="prompt-head"><span class="pulse"></span><b id="prompt-title">Кара ждёт ответа</b></div>
         <pre id="prompt-text"></pre>

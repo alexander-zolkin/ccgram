@@ -474,6 +474,7 @@ function greeting() {
 
 function showHome() {
   state.current = null;
+  $("gone-card").hidden = true;
   clearTimeout(state.paneTimer);
   $("app").classList.add("home-mode");
   $("app").classList.remove("drawer");
@@ -690,6 +691,7 @@ function renderHeader() {
   $("chat-state").innerHTML = label ? `<span class="dot ${esc(s.state)}"></span><span>${esc(label)}</span>` : "";
   const working = s.state === "active";
   $("working").hidden = !working;
+  $("gone-card").hidden = !s.topic_deleted;
   $("disclaimer").textContent = s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
   document.title = `${working ? "⏳ " : ""}${s.name} — Кара`;
 }
@@ -995,6 +997,26 @@ $("session-list").addEventListener("click", (ev) => { if (ev.target.closest(".s-
 $("new-btn").onclick = () => { if (isMobile()) $("app").classList.remove("drawer"); };
 $("pane-btn").onclick = () => { $("pane").hidden = !$("pane").hidden; pollPane(); };
 $("stop-btn").onclick = () => sendKey("Escape");
+$("gone-keep").onclick = async () => {
+  const s = currentSession();
+  if (!s) return;
+  try {
+    await api(`/api/sessions/${s.thread_id}/keep`, { body: {} });
+    s.topic_deleted = false;
+    renderHeader();
+    toast("Чат остаётся в вебе");
+  } catch (e) { toast(e.message); }
+};
+$("gone-delete").onclick = async () => {
+  const s = currentSession();
+  if (!s) return;
+  try {
+    await api(`/api/sessions/${s.thread_id}/delete`, { body: {} });
+    toast("Чат удалён");
+    location.hash = "#new";
+    await refreshSessions();
+  } catch (e) { toast(e.message); }
+};
 $("title-btn").onclick = () => {
   const s = currentSession();
   if (s) openMenu(sessionMenu(s, null), menuBelow($("title-btn")), $("title-btn"));

@@ -17,6 +17,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/sessions/{tid}/upload``     multipart file into the session cwd
 - ``POST /api/sessions/{tid}/pin``        pin / unpin in the sidebar
 - ``POST /api/sessions/{tid}/detach``     delete the topic, keep the session
+- ``POST /api/sessions/{tid}/keep``       keep a session whose topic was deleted
 - ``POST /api/sessions/{tid}/delete``     kill the session, delete its topic
 - ``POST /api/uploads``                   file for a session not created yet
 - ``GET  /api/models``                    Claude models for the picker
@@ -297,6 +298,10 @@ async def _pin(request: web.Request) -> web.Response:
     )
 
 
+async def _keep(request: web.Request) -> web.Response:
+    return web.json_response(await service.keep_web_only(_thread_id(request)))
+
+
 async def _detach(request: web.Request) -> web.Response:
     return web.json_response(
         await service.remove_from_telegram(
@@ -410,6 +415,7 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/upload", _upload)
     r.add_post("/api/sessions/{tid}/pin", _pin)
     r.add_post("/api/sessions/{tid}/detach", _detach)
+    r.add_post("/api/sessions/{tid}/keep", _keep)
     r.add_post("/api/sessions/{tid}/delete", _delete)
     r.add_post("/api/uploads", _upload_new)
     r.add_get("/api/models", _models)

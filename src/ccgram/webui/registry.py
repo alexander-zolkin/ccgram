@@ -92,7 +92,15 @@ def detach(
     approval_mode: str,
     session_id: str,
     transcript_path: str,
+    origin: str = "telegram",
 ) -> None:
+    """Record a web-only session.
+
+    ``origin`` says how it became web-only: ``telegram`` (its topic was
+    deleted or closed there — the web UI asks whether to delete it too),
+    ``web`` (removed from Telegram or born web-only in the browser) or
+    ``kept`` (a ``telegram`` one the person chose to keep).
+    """
     _load()[thread_id] = {
         "window_id": window_id,
         "name": name,
@@ -102,6 +110,7 @@ def detach(
         "session_id": session_id,
         "transcript_path": transcript_path,
         "detached_at": time.time(),
+        "origin": origin,
     }
     _save()
     logger.info(
@@ -143,7 +152,11 @@ def remove(session_id: int) -> dict[str, Any] | None:
 
 
 def detach_from_topic(
-    user_id: int, chat_id: int | None, thread_id: int, window_id: str
+    user_id: int,
+    chat_id: int | None,
+    thread_id: int,
+    window_id: str,
+    origin: str = "telegram",
 ) -> bool:
     """Keep a topic's session web-only instead of tearing it down.
 
@@ -196,6 +209,7 @@ def detach_from_topic(
             approval_mode=(view.approval_mode if view else "") or "normal",
             session_id=sid,
             transcript_path=tx,
+            origin=origin,
         )
         return True
     except Exception:  # noqa: BLE001 — never break topic teardown

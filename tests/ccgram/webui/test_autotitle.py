@@ -57,3 +57,9 @@ def test_first_exchange(tmp_path):
     ]
     p.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
     assert transcript.first_exchange(p) == (["Test!!!", "второй"], "ok")
+
+
+def test_topic_gone_detection():
+    assert autotitle._topic_gone(Exception("Bad Request: Topic_id_invalid"))
+    assert autotitle._topic_gone(Exception("Message thread not found"))
+    assert not autotitle._topic_gone(Exception("Flood control exceeded"))

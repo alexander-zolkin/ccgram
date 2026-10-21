@@ -288,6 +288,14 @@ async def list_sessions() -> list[dict[str, Any]]:
                 "cwd": cwd,
                 "last_activity": last_activity,
                 "web_only": b.web_only,
+                # Entries from before "origin" existed: negative ids were
+                # born web-only, the rest lost their topic in Telegram.
+                "topic_deleted": b.web_only
+                and (
+                    _entry(b).get("origin")
+                    or ("web" if b.thread_id < 0 else "telegram")
+                )
+                == "telegram",
                 "pinned": b.thread_id in pins,
             }
         )
@@ -815,6 +823,7 @@ async def create_web_only_session(
         approval_mode=mode,
         session_id="",
         transcript_path="",
+        origin="web",
     )
     session_manager.set_window_origin(wid, CCGRAM_CREATED_WINDOW_ORIGIN)
     session_manager.set_window_cwd(wid, cwd)
@@ -937,6 +946,18 @@ def valid_provider(provider: Any) -> str:
     raise WebUIError("unknown or unavailable agent")
 
 
+async def keep_web_only(thread_id: int) -> dict[str, Any]:
+    """Answer "keep it" to the topic-deleted-in-Telegram question."""
+    # Lazy: registry is a leaf, but keep the import next to its users.
+    from . import registry
+
+    binding = find_binding(thread_id)
+    if not binding.web_only:
+        raise WebUIError("this session still has its topic", 409)
+    registry.update(thread_id, origin="kept")
+    return {"ok": True}
+
+
 async def set_pin(thread_id: int, on: bool) -> dict[str, Any]:
     # Lazy: prefs is a leaf; keep it next to its only users.
     from .prefs import set_pinned
@@ -986,7 +1007,11 @@ async def remove_from_telegram(bot: Bot, thread_id: int) -> dict[str, Any]:
     if binding.web_only:
         raise WebUIError("this session has no Telegram topic", 409)
     if not registry.detach_from_topic(
-        binding.user_id, binding.chat_id, binding.thread_id, binding.window_id
+        binding.user_id,
+        binding.chat_id,
+        binding.thread_id,
+        binding.window_id,
+        origin="web",
     ):
         raise WebUIError("cannot keep this session without its topic", 409)
     await _drop_topic(bot, binding, window_alive=True)

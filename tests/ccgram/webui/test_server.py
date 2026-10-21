@@ -334,3 +334,13 @@ def test_valid_model():
     assert service.valid_model("claude-opus-5-5[1m]") == "claude-opus-5-5[1m]"
     assert service.valid_model("x; rm -rf /") is None
     assert service.valid_model(None) is None
+
+
+async def test_keep_route(client, monkeypatch):
+    async def keep(tid):
+        return {"ok": True, "tid": tid}
+
+    monkeypatch.setattr(service, "keep_web_only", keep)
+    await _login(client)
+    resp = await client.post("/api/sessions/42/keep", json={}, headers=POST_HEADERS)
+    assert (await resp.json())["tid"] == 42

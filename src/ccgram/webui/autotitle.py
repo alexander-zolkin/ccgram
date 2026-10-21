@@ -71,6 +71,11 @@ _TITLE_PROMPT = (
 )
 
 
+def _topic_gone(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "topic_id_invalid" in msg or "thread not found" in msg
+
+
 def is_placeholder(name: str) -> bool:
     return bool(PLACEHOLDER.match(name.strip()))
 
@@ -189,6 +194,14 @@ async def _tick(bot: Bot) -> None:
             logger.info("webui: auto-titled session %d → %r", tid, title)
         except Exception as exc:  # noqa: BLE001 — retry next tick
             logger.info("webui: auto-title of %d failed: %s", tid, exc)
+            if _topic_gone(exc) and not binding.web_only:
+                # The rename is the first thing to notice the topic was
+                # deleted in Telegram: let the topic probe confirm it now.
+                # Lazy: topics handler graph only needed on this path.
+                from ..handlers.topics.topic_lifecycle import note_thread_gone
+
+                note_thread_gone(binding.chat_id, binding.thread_id)
+            _failed[tid] = time.time()
             continue
         _done.add(tid)
         await asyncio.sleep(RENAME_GAP_S)
