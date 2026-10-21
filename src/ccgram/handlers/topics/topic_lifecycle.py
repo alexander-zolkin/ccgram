@@ -152,6 +152,11 @@ async def check_unbound_window_ttl(
     bound_ids: set[str] = set()
     for _, _, wid in thread_router.iter_thread_bindings():
         bound_ids.add(wid)
+    # CCGRAM-HOTFIX:webui — web-only sessions are owned by the browser.
+    # Lazy: webui is an optional surface; keep it off the topics import path.
+    from ...webui.registry import web_only_window_ids
+
+    bound_ids |= web_only_window_ids()
 
     if live_windows is None:
         live_windows = await tmux_manager.list_windows()
@@ -313,14 +318,23 @@ async def _unbind_deleted_topic(
     wid: str,
 ) -> None:
     """Tear down a window whose Telegram topic no longer exists."""
+    # CCGRAM-HOTFIX:webui — with the web UI on, the session outlives its topic.
+    # Lazy: webui is an optional surface; keep it off the topics import path.
+    from ...webui.registry import detach_from_topic
+
+    kept = detach_from_topic(user_id, chat_id, thread_id, wid)
     w = await tmux_manager.find_window_by_id(wid)
     view = window_query.view_window(wid)
     killed = False
-    if w and view and view.origin == CCGRAM_CREATED_WINDOW_ORIGIN:
+    if not kept and w and view and view.origin == CCGRAM_CREATED_WINDOW_ORIGIN:
         await tmux_manager.kill_window(w.window_id)
         killed = True
     terminal_poll_state.reset_probe_failures(wid)
-    await clear_topic_state(user_id, thread_id, client, window_id=wid, chat_id=chat_id)
+    # A kept web-only window is alive: skip the dead-window state scrub.
+    cleanup_kwargs = {"window_dead": False} if kept else {}
+    await clear_topic_state(
+        user_id, thread_id, client, window_id=wid, chat_id=chat_id, **cleanup_kwargs
+    )
     thread_router.unbind_thread(
         user_id,
         thread_id,
@@ -430,6 +444,11 @@ async def topic_closed_handler(
         else thread_router.get_window_for_thread(user.id, thread_id)
     )
     if window_id:
+        # CCGRAM-HOTFIX:webui — a closed topic's session stays reachable on the web.
+        # Lazy: webui is an optional surface; keep it off the topics import path.
+        from ...webui.registry import detach_from_topic
+
+        detach_from_topic(user.id, chat_id, thread_id, window_id)
         display = thread_router.get_display_name(window_id)
         cleanup_kwargs = {"window_id": window_id, "window_dead": False}
         if chat_id is not None:

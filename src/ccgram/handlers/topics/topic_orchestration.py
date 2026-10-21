@@ -509,6 +509,14 @@ async def _handle_new_window_locked(
         )
         return True
 
+    # CCGRAM-HOTFIX:webui — a web-only session must not grow a new topic.
+    # Lazy: webui is an optional surface; keep it off the topics import path.
+    from ...webui.registry import is_web_only
+
+    if is_web_only(event.window_id):
+        logger.debug("New window %s is web-only, no topic", event.window_id)
+        return False
+
     if _is_pending_user_creation(event.window_id):
         logger.debug(
             "New window %s creation pending in directory flow — "

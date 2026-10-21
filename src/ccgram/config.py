@@ -264,6 +264,18 @@ class Config:
         self.miniapp_base_url: str = os.getenv("CCGRAM_MINIAPP_BASE_URL", "").strip()
         self.miniapp_host: str = os.getenv("CCGRAM_MINIAPP_HOST", "127.0.0.1")
         self.miniapp_port: int = _parse_int_env("CCGRAM_MINIAPP_PORT", 8765)
+        self._init_webui()
+
+    def _init_webui(self) -> None:
+        # CCGRAM-HOTFIX:webui — standalone browser UI over the same sessions.
+        # Disabled unless both a port and a password are set; binds loopback by
+        # default and expects a reverse proxy (Caddy) in front of it.
+        self.webui_port: int = _parse_int_env("CCGRAM_WEBUI_PORT", 0)
+        self.webui_host: str = os.getenv("CCGRAM_WEBUI_HOST", "127.0.0.1")
+        self.webui_password: str = os.getenv("CCGRAM_WEBUI_PASSWORD", "")
+        self.webui_show_private: bool = os.getenv(
+            "CCGRAM_WEBUI_SHOW_PRIVATE", ""
+        ).lower() in ("1", "true", "yes")
 
     def is_user_allowed(self, user_id: int) -> bool:
         """Check if a user is in the allowed list."""

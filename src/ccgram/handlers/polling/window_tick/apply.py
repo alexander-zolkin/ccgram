@@ -418,6 +418,11 @@ async def _probe_topic_after_death(
             or "topic_id_invalid" in probe_err.message.lower()
         ):
             ps.reset_probe_failures(wid)
+            # CCGRAM-HOTFIX:webui — keep the (hibernated) session wakeable on the web.
+            # Lazy: webui is an optional surface; keep it off the polling path.
+            from ....webui.registry import detach_from_topic
+
+            detach_from_topic(user_id, chat_id, thread_id, wid)
             await clear_topic_state(
                 user_id,
                 thread_id,

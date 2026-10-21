@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16161a">
+<title>Кара</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icon.svg">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="login" class="login" hidden>
+  <form id="login-form" class="login-card">
+    <div class="brand"><img src="/static/icon.svg" alt=""> Кара</div>
+    <input id="password" type="password" autocomplete="current-password" placeholder="Пароль" required>
+    <button type="submit">Войти</button>
+    <div id="login-error" class="error"></div>
+  </form>
+</div>
+
+<div id="app" class="app" hidden>
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-head">
+      <div class="brand"><img src="/static/icon.svg" alt=""> Кара</div>
+      <button id="new-btn" class="primary" title="Новая сессия">＋ Новая</button>
+    </div>
+    <input id="filter" class="filter" type="search" placeholder="Поиск сессий">
+    <ul id="session-list" class="session-list"></ul>
+    <div class="sidebar-foot">
+      <span id="conn" class="conn" title="Связь с сервером">●</span>
+      <button id="notify-btn" class="ghost" hidden>🔔 Уведомления</button>
+      <button id="logout-btn" class="ghost">Выйти</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="chat-head">
+      <button id="menu-btn" class="ghost menu-btn" aria-label="Сессии">☰</button>
+      <div class="chat-title">
+        <div id="chat-name">Выбери сессию</div>
+        <div id="chat-meta" class="meta"></div>
+      </div>
+      <button id="close-btn" class="ghost danger" title="Завершить сессию (её топика в Telegram уже нет)" hidden>Завершить</button>
+      <button id="pane-btn" class="ghost" title="Терминал" hidden>⌨</button>
+    </header>
+
+    <section id="pane" class="pane" hidden>
+      <pre id="pane-text"></pre>
+      <div class="keys">
+        <button data-key="1">1</button><button data-key="2">2</button><button data-key="3">3</button>
+        <button data-key="Up">↑</button><button data-key="Down">↓</button>
+        <button data-key="Enter">⏎</button><button data-key="Escape">Esc</button>
+        <button data-key="Tab">Tab</button><button data-key="C-c">^C</button>
+      </div>
+    </section>
+
+    <section id="messages" class="messages">
+      <div class="empty">Сессии — это топики в Telegram. Всё, что пишешь здесь, видно и там.</div>
+    </section>
+
+    <form id="composer" class="composer">
+      <textarea id="input" rows="1" placeholder="Сообщение…" disabled></textarea>
+      <button id="send-btn" type="submit" class="primary" disabled>➤</button>
+    </form>
+  </main>
+</div>
+
+<dialog id="new-dialog" class="dialog">
+  <form id="new-form" method="dialog">
+    <h3>Новая сессия</h3>
+    <p class="meta">Создам топик в группе «Кара» и запущу Claude с настройками по умолчанию.</p>
+    <input id="new-name" placeholder="Название (необязательно)" maxlength="120">
+    <textarea id="new-text" rows="4" placeholder="Первое сообщение (необязательно)"></textarea>
+    <div class="dialog-actions">
+      <button value="cancel" class="ghost" formnovalidate>Отмена</button>
+      <button id="new-submit" value="ok" class="primary">Создать</button>
+    </div>
+    <div id="new-error" class="error"></div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

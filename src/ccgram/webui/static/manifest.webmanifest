@@ -1,0 +1,12 @@
+{
+  "name": "Кара",
+  "short_name": "Кара",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#111114",
+  "theme_color": "#16161a",
+  "icons": [
+    { "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

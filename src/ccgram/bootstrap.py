@@ -359,6 +359,12 @@ async def bootstrap_application(application: Application) -> None:
 
     await start_miniapp_if_enabled()
 
+    # CCGRAM-HOTFIX:webui — browser front-end over the same sessions.
+    # Lazy: aiohttp app + handler graph only when the daemon actually boots.
+    from .webui import start_webui
+
+    await start_webui(application.bot)
+
 
 async def stop_delivery_runtime() -> None:
     """Phase 1 (post_stop): stop producers and drain pending deliveries.
@@ -411,6 +417,11 @@ async def shutdown_runtime() -> None:
     from .main import stop_miniapp_if_enabled
 
     await stop_miniapp_if_enabled()
+
+    # Lazy: symmetric with start_webui above.
+    from .webui import stop_webui
+
+    await stop_webui()
 
     session_manager.flush_state()
 
