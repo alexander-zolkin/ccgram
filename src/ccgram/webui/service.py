@@ -218,11 +218,12 @@ def _topic_state(chat_id: int, thread_id: int) -> str:
     return get_topic_state(chat_id, thread_id) or "unknown"
 
 
-def _session_state(binding: Binding) -> str:
+def _session_state(binding: Binding, live: set[str]) -> str:
     state = _topic_state(binding.chat_id, binding.thread_id)
-    if state == "unknown" and window_query.view_window(binding.window_id) is None:
-        # Never painted and no live window state: a hibernated topic.
-        return "dead"
+    if state == "unknown":
+        # The status poller only paints topics whose state changed since the
+        # daemon started; fall back to whether the window is running.
+        return "idle" if binding.window_id in live else "dead"
     return state
 
 
@@ -268,7 +269,7 @@ async def list_sessions() -> list[dict[str, Any]]:
             # No topic poller paints these; liveness is all we know.
             state = "idle" if b.window_id in live else "dead"
         else:
-            state = _session_state(b)
+            state = _session_state(b, live)
         sessions.append(
             {
                 "thread_id": b.thread_id,

@@ -246,12 +246,23 @@ _NEVER_PROBED = float("-inf")
 _probe_last_ts: dict[tuple[int, int, int], float] = {}
 # Set on RetryAfter: flood control is chat-wide, so pause probes for that chat.
 _probe_backoff_until: dict[int, float] = {}
+# CCGRAM-HOTFIX:webui — topics a send just reported as gone ("thread not
+# found"). Probed ahead of the round-robin so a topic deleted in Telegram is
+# detected within one cycle instead of after every other topic (~1/min each).
+_suspected_gone: set[tuple[int, int]] = set()
+
+
+def note_thread_gone(chat_id: int, thread_id: int | None) -> None:
+    """Record that a send to (chat, thread) failed because the topic is gone."""
+    if isinstance(chat_id, int) and isinstance(thread_id, int):
+        _suspected_gone.add((chat_id, thread_id))
 
 
 def reset_probe_schedule() -> None:
     """Clear probe scheduling state (restart/testing)."""
     _probe_last_ts.clear()
     _probe_backoff_until.clear()
+    _suspected_gone.clear()
 
 
 def _due_probe_targets(
@@ -281,6 +292,8 @@ def _due_probe_targets(
         del _probe_last_ts[key]
 
     def last_probe(binding: tuple[int, int | None, int, str]) -> float:
+        if (binding_chat_id(binding), binding[2]) in _suspected_gone:
+            return _NEVER_PROBED  # due now, and sorts ahead of everything
         return _probe_last_ts.get(probe_key(binding), _NEVER_PROBED)
 
     active_chat_ids = {binding_chat_id(binding) for binding in bindings}
@@ -295,7 +308,10 @@ def _due_probe_targets(
         and now - last_probe(b) >= PROBE_INTERVAL
         and now >= _probe_backoff_until.get(binding_chat_id(b), 0.0)
     ]
-    due.sort(key=last_probe)
+    due.sort(
+        key=lambda b: ((binding_chat_id(b), b[2]) not in _suspected_gone, last_probe(b))
+    )
+    _suspected_gone.intersection_update((binding_chat_id(b), b[2]) for b in bindings)
 
     selected: list[tuple[int, int | None, int, str]] = []
     selected_chat_ids: set[int] = set()
@@ -367,6 +383,7 @@ async def probe_topic_existence(client: TelegramClient) -> None:
             chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         probe_key = (user_id, chat_id, thread_id)
         _probe_last_ts[probe_key] = time.monotonic()
+        _suspected_gone.discard((chat_id, thread_id))
         try:
             await client.unpin_all_forum_topic_messages(
                 chat_id=chat_id,

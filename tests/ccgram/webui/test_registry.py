@@ -123,3 +123,18 @@ async def test_new_window_for_web_only_session_gets_no_topic(monkeypatch):
     monkeypatch.setattr(topic_orchestration, "create_topic_in_chat", boom)
     event = NewWindowEvent(window_id="@7", session_id="s", window_name="n", cwd="/w")
     assert await topic_orchestration.handle_new_window(event, object()) is False
+
+
+def test_thread_gone_send_jumps_the_probe_queue():
+    from ccgram.handlers.topics import topic_lifecycle as tl
+
+    tl.reset_probe_schedule()
+    bindings = [(1, -100, tid, f"@{tid}") for tid in range(1, 50)]
+    # every topic probed recently except none due -> nothing selected
+    now = 10_000.0
+    for _u, c, t, _w in bindings:
+        tl._probe_last_ts[(1, c, t)] = now - 1
+    assert tl._due_probe_targets(bindings, now) == []
+    tl.note_thread_gone(-100, 42)
+    assert tl._due_probe_targets(bindings, now) == [(1, -100, 42, "@42")]
+    tl.reset_probe_schedule()

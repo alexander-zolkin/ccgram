@@ -65,6 +65,14 @@ __all__ = [
 logger = structlog.get_logger()
 
 
+def _note_thread_gone(chat_id: Any, thread_id: Any) -> None:
+    """CCGRAM-HOTFIX:webui — let the topic probe check this topic next."""
+    # Lazy: topic_lifecycle imports this module; a top-level import would cycle.
+    from ..topics.topic_lifecycle import note_thread_gone
+
+    note_thread_gone(chat_id, thread_id)
+
+
 def is_thread_gone(exc: TelegramError) -> bool:
     """Check if error indicates the Telegram topic/thread no longer exists."""
     if isinstance(exc, BadRequest):
@@ -135,6 +143,8 @@ async def _with_entity_fallback(
     send_fn: Callable[..., Awaitable[Any]],
     text: str,
     context_label: str,
+    *,
+    gone_chat_id: int | None = None,
     **kwargs: Any,
 ) -> Message | None:
     """Convert to entities, send, fall back to plain text on error.
@@ -174,6 +184,10 @@ async def _with_entity_fallback(
             raise
         except TelegramError as e:
             if is_thread_gone(e):
+                if gone_chat_id is not None:
+                    _note_thread_gone(
+                        gone_chat_id, send_kwargs.get("message_thread_id")
+                    )
                 return None
             last_error = e
 
@@ -229,6 +243,7 @@ async def _send_formatted_with_fallback(
             raise
         except TelegramError as exc:
             if is_thread_gone(exc):
+                _note_thread_gone(chat_id, send_kwargs.get("message_thread_id"))
                 return None
             last_error = exc
 
@@ -318,7 +333,7 @@ async def safe_send(
         return await client.send_message(chat_id=chat_id, text=text, **kw)
 
     return await _with_entity_fallback(
-        _send, text, f"send message to {chat_id}", **kwargs
+        _send, text, f"send message to {chat_id}", gone_chat_id=chat_id, **kwargs
     )
 
 
