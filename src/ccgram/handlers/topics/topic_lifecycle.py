@@ -256,6 +256,8 @@ _suspected_gone: set[tuple[int, int]] = set()
 def note_thread_gone(chat_id: int, thread_id: int | None) -> None:
     """Record that a send to (chat, thread) failed because the topic is gone."""
     if isinstance(chat_id, int) and isinstance(thread_id, int):
+        if (chat_id, thread_id) not in _suspected_gone:
+            logger.info("Send reports topic gone, probing next: thread=%d", thread_id)
         _suspected_gone.add((chat_id, thread_id))
 
 
@@ -381,7 +383,9 @@ async def _probe_suspected(
     if (chat_id, thread_id) not in _suspected_gone:
         return False
     _suspected_gone.discard((chat_id, thread_id))
-    if await probe_topic_exists(client, chat_id, thread_id) is False:
+    exists = await probe_topic_exists(client, chat_id, thread_id)
+    logger.info("Send-probe thread=%d window=%s exists=%s", thread_id, wid, exists)
+    if exists is False:
         await _unbind_deleted_topic(client, user_id, chat_id, thread_id, wid)
     return True
 

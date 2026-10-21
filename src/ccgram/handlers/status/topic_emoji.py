@@ -154,7 +154,7 @@ def _load_topic_names() -> None:
     try:
         with open(_topic_names_path(), encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return
     for k, v in data.items():
         c, _, t = k.partition(":")

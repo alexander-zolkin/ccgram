@@ -849,6 +849,11 @@ async def _process_content_task(
         else:
             # The sender exhausted its entity/plain fallback without raising.
             # A transcript watermark must treat that as a terminal failure.
+            logger.info(
+                "Content delivery failed: window=%s thread=%s",
+                task.window_id,
+                task.thread_id,
+            )
             return DeliveryOutcome.FAILED
 
     if _should_send_tts(task) and (tts_text := prepare_tts_text(task.parts)):

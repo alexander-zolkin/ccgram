@@ -71,7 +71,7 @@ class _PersistentStatusMap(dict):
                 ccgram_dir() / _STATUS_STORE_NAME,
                 {f"{uid}:{tk}": list(v) for (uid, tk), v in self.items()},
             )
-        except (OSError, ValueError, TypeError):
+        except OSError, ValueError, TypeError:
             logger.debug("status_msg_info persist failed", exc_info=True)
 
     def __setitem__(self, key, value) -> None:
@@ -100,7 +100,7 @@ def _load_status_msg_info() -> _PersistentStatusMap:
         if not path.is_file():
             return m
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         logger.debug("status_msg_info load failed", exc_info=True)
         return m
     if not isinstance(raw, dict):
@@ -115,7 +115,7 @@ def _load_status_msg_info() -> _PersistentStatusMap:
                 (int(uid_s), int(tkey_s)),
                 (int(msg_id), str(window_id), str(last_text), int(chat_id)),
             )
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             continue
     return m
 

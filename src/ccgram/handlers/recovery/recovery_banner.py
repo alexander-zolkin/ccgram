@@ -306,6 +306,7 @@ async def _create_and_bind_window(
     # and auto-creates a DUPLICATE topic named after the tmux window
     # ("workspace-3") before bind_thread() runs. Cleared right after the bind.
     from ..topics import topic_orchestration
+
     topic_orchestration.register_pending_creation(created_wid)
 
     if provider.capabilities.supports_hook:
@@ -559,9 +560,9 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
             own_sid, old_window_id
         )
         candidate_sid = candidates[0].session_id
-        cwd_contended = bool(candidate_sid) and await _session_held_by_other_live_window(
-            candidate_sid, old_window_id
-        )
+        cwd_contended = bool(
+            candidate_sid
+        ) and await _session_held_by_other_live_window(candidate_sid, old_window_id)
 
         launch_args, arm_synthetic = decide_launch_args(
             provider,
