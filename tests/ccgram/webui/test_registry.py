@@ -160,3 +160,30 @@ async def test_suspected_topic_uses_send_probe(monkeypatch):
     assert await tl._probe_suspected(object(), 1, -100, 42, "@42") is True
     assert calls == [("probe", -100, 42), ("unbind", 42, "@42")]
     assert (-100, 42) not in tl._suspected_gone
+
+
+def test_new_web_id_is_negative_and_unique():
+    assert registry.new_web_id() == -1
+    registry.detach(
+        -1,
+        "@9",
+        name="n",
+        cwd="/w",
+        provider="claude",
+        approval_mode="yolo",
+        session_id="",
+        transcript_path="",
+    )
+    registry.detach(
+        42,
+        "@7",
+        name="n",
+        cwd="/w",
+        provider="claude",
+        approval_mode="yolo",
+        session_id="",
+        transcript_path="",
+    )
+    assert registry.new_web_id() == -2
+    registry.update(-1, session_id="s1")
+    assert registry.get(-1)["session_id"] == "s1"

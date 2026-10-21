@@ -16,6 +16,8 @@ import contextlib
 import json
 import logging
 import os
+import re
+import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +30,7 @@ from ..multiplexer import multiplexer as tmux_manager
 from ..multiplexer.window_ops import send_to_window
 from ..providers import get_provider_for_window
 from ..thread_router import thread_router
+from . import transcript
 
 if TYPE_CHECKING:
     from telegram import Bot
@@ -332,10 +335,118 @@ async def history(thread_id: int, limit: int = DEFAULT_HISTORY) -> dict[str, Any
     return {"messages": messages[-limit:], "total": len(messages)}
 
 
+async def entries(
+    thread_id: int,
+    *,
+    limit: int = DEFAULT_HISTORY,
+    before: int | None = None,
+    after: int | None = None,
+) -> dict[str, Any]:
+    """Structured transcript items (Claude) with byte cursors for paging.
+
+    Other providers fall back to ccgram's flattened messages, mapped onto the
+    same item shapes without cursors.
+    """
+    binding = find_binding(thread_id)
+    path, provider = _transcript_for(binding)
+    if path is None or not path.is_file():
+        return {"items": [], "start": 0, "end": 0, "structured": False}
+    limit = max(1, min(limit, MAX_HISTORY))
+    if (provider or "claude") == "claude":
+        if after is not None:
+            result = await asyncio.to_thread(transcript.read_after, path, after)
+        else:
+            result = await asyncio.to_thread(transcript.read_tail, path, limit, before)
+        return {**result, "structured": True}
+    if after is not None or before is not None:
+        return {"items": [], "start": 0, "end": 0, "structured": False}
+    messages = await asyncio.to_thread(_read_transcript, path, provider)
+    items = [
+        {
+            "kind": "tool"
+            if m["content_type"] in ("tool_use", "tool_result")
+            else m["role"],
+            "name": m.get("tool_name") or "",
+            "id": m.get("tool_use_id") or "",
+            "input": {"text": m["text"]} if m["content_type"] == "tool_use" else {},
+            "text": m["text"],
+            "ts": m.get("timestamp"),
+        }
+        for m in messages[-limit:]
+        if m["content_type"] != "thinking"
+    ]
+    return {"items": items, "start": 0, "end": 0, "structured": False}
+
+
 async def pane(thread_id: int) -> dict[str, Any]:
+    # Lazy: terminal parser is only needed when a pane is inspected.
+    from ..terminal_parser import extract_interactive_content
+
     binding = find_binding(thread_id)
     text = await tmux_manager.capture_pane(binding.window_id)
-    return {"alive": text is not None, "text": text or ""}
+    interactive = extract_interactive_content(text) if text else None
+    return {
+        "alive": text is not None,
+        "text": text or "",
+        "interactive": (
+            {"name": interactive.name, "content": interactive.content}
+            if interactive
+            else None
+        ),
+    }
+
+
+async def rename(bot: Bot, thread_id: int, name: str) -> dict[str, Any]:
+    """Rename a session — and its Telegram topic, keeping the status emoji."""
+    # Lazy: registry is a leaf, but keep the import next to its only users.
+    from . import registry
+
+    # Lazy: topic_emoji imports the handler layer.
+    from ..handlers.status.topic_emoji import (
+        format_topic_name_for_mode,
+        update_stored_topic_name,
+    )
+
+    name = " ".join(name.split())[:120]
+    if not name:
+        raise WebUIError("empty name")
+    binding = find_binding(thread_id)
+    if binding.web_only:
+        registry.set_name(thread_id, name)
+        return {"ok": True, "name": name}
+    view = window_query.view_window(binding.window_id)
+    mode = (view.approval_mode if view else "") or "normal"
+    await bot.edit_forum_topic(
+        chat_id=binding.chat_id,
+        message_thread_id=binding.thread_id,
+        name=format_topic_name_for_mode(name, mode),
+    )
+    update_stored_topic_name(binding.chat_id, binding.thread_id, name)
+    return {"ok": True, "name": name}
+
+
+MAX_UPLOAD = 25 * 1024 * 1024
+_UPLOAD_DIR = ".ccgram-uploads"  # same folder the Telegram file handler uses
+_SAFE_NAME = re.compile(r"[^\w.\-() ]+", re.UNICODE)
+
+
+def save_upload(thread_id: int, filename: str, data: bytes) -> dict[str, Any]:
+    """Store a browser upload in the session's cwd, like Telegram uploads."""
+    if len(data) > MAX_UPLOAD:
+        raise WebUIError("file too large (max 25 MB)", 413)
+    binding = find_binding(thread_id)
+    cwd = _cwd_for(binding)
+    if not cwd or not Path(cwd).is_dir():
+        raise WebUIError("session folder is gone", 409)
+    base = _SAFE_NAME.sub("_", Path(filename or "file").name).strip(" .") or "file"
+    folder = Path(cwd) / _UPLOAD_DIR
+    folder.mkdir(exist_ok=True)
+    dest = folder / f"{time.strftime('%Y%m%d-%H%M%S')}-{base[:120]}"
+    if not dest.resolve().is_relative_to(folder.resolve()):
+        raise WebUIError("invalid file name")
+    dest.write_bytes(data)
+    is_image = dest.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    return {"path": f"{_UPLOAD_DIR}/{dest.name}", "name": base, "image": is_image}
 
 
 # ── actions ──────────────────────────────────────────────────────────────────
@@ -576,3 +687,114 @@ async def create_session(
         if not ok:
             raise WebUIError(f"session started, but sending failed: {err}", 502)
     return {"thread_id": thread_id, "window_id": result.window_id, "name": title}
+
+
+def _web_only_launch(model: str | None) -> tuple[str, str, str, Any]:
+    """(launch command, provider name, approval mode, provider) for quick-start.
+
+    Mirrors launch_window: fresh-session args (``--effort``), the remembered
+    model, and the 1M window for claude.
+    """
+    # Lazy: quick-start defaults live in the topics handler layer.
+    from ..handlers.topics.directory_browser import (
+        QUICKSTART_DEFAULT_MODE,
+        QUICKSTART_DEFAULT_PROVIDER,
+    )
+
+    # Lazy: only needed when creating a session.
+    from ..last_model import recall_model
+
+    # Lazy: keep the httpx-importing catalog off the import path.
+    from ..model_catalog import with_1m_context
+
+    # Lazy: providers package heavy bootstrap.
+    from ..providers import registry as provider_registry
+
+    # Lazy: providers package heavy bootstrap.
+    from ..providers import resolve_launch_command
+
+    provider_name, mode = QUICKSTART_DEFAULT_PROVIDER, QUICKSTART_DEFAULT_MODE
+    provider = provider_registry.get(provider_name)
+    args = provider.make_launch_args()
+    args = args if isinstance(args, str) else ""
+    model_id = model or (recall_model(provider_name) or (None,))[0]
+    if model_id and provider.capabilities.supports_model_picker:
+        if provider_name == "claude":
+            model_id = with_1m_context(model_id)
+        # Quoted: ids like ``claude-opus-5-5[1m]`` are shell globs.
+        args = f"{args} --model {shlex.quote(model_id)}".strip()
+    launch = resolve_launch_command(provider_name, approval_mode=mode)
+    return (f"{launch} {args}" if args else launch), provider_name, mode, provider
+
+
+async def create_web_only_session(
+    text: str, name: str | None, model: str | None = None
+) -> dict[str, Any]:
+    """Launch a quick-start session with no Telegram topic at all.
+
+    The window is registered web-only the moment it exists (no await in
+    between), so the monitor never adopts it into a topic, the unbound TTL
+    and the hibernator's orphan reap skip it, and the web UI owns it.
+    """
+    # Lazy: quick-start defaults live in the topics handler layer.
+    from ..handlers.topics.directory_browser import QUICKSTART_DEFAULT_CWD
+
+    # Lazy: launch helpers live in the topics handler layer.
+    from ..handlers.topics.window_launch_service import _accept_yolo_confirmation
+
+    # Lazy: session state wiring is only needed when creating.
+    from ..session import session_manager
+
+    # Lazy: session_map wiring is only needed when creating.
+    from ..session_map import session_map_sync
+
+    # Lazy: only needed when creating a session.
+    from ..window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
+
+    # Lazy: registry is a leaf, but keep the import next to its users.
+    from . import registry
+
+    text = text.strip()
+    if len(text) > MAX_TEXT_LEN:
+        raise WebUIError("message too long")
+    cwd = QUICKSTART_DEFAULT_CWD
+    if not Path(cwd).is_dir():
+        raise WebUIError("default directory missing", 500)
+    launch, provider_name, mode, provider = _web_only_launch(model)
+    title = (name or "").strip()[:120] or "веб " + time.strftime("%m-%d %H-%M")
+
+    ok, msg, _wname, wid = await tmux_manager.create_window(cwd, launch_command=launch)
+    if not ok:
+        raise WebUIError(f"could not start the session: {msg}", 502)
+    web_id = registry.new_web_id()
+    registry.detach(
+        web_id,
+        wid,
+        name=title,
+        cwd=cwd,
+        provider=provider_name,
+        approval_mode=mode,
+        session_id="",
+        transcript_path="",
+    )
+    session_manager.set_window_origin(wid, CCGRAM_CREATED_WINDOW_ORIGIN)
+    session_manager.set_window_cwd(wid, cwd)
+    session_manager.set_window_provider(wid, provider_name)
+    session_manager.set_window_approval_mode(wid, mode)
+    if mode == "yolo" and provider.capabilities.has_yolo_confirmation:
+        await _accept_yolo_confirmation(wid)
+    if provider.capabilities.supports_hook:
+        await session_map_sync.wait_for_session_map_entry(wid)
+    view = window_query.view_window(wid)
+    if view is not None:
+        registry.update(
+            web_id,
+            session_id=view.session_id or "",
+            transcript_path=str(view.transcript_path or ""),
+        )
+    if text:
+        sent, err = await send_to_window(wid, text)
+        if not sent:
+            raise WebUIError(f"session started, but sending failed: {err}", 502)
+    logger.info("webui: started web-only session %d in window %s", web_id, wid)
+    return {"thread_id": web_id, "window_id": wid, "name": title}

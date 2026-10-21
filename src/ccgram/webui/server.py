@@ -11,6 +11,10 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``GET  /api/sessions/{tid}/pane``       current pane snapshot
 - ``POST /api/sessions/{tid}/key``        one whitelisted key into the pane
 - ``POST /api/sessions/{tid}/close``      end a web-only session
+- ``GET  /api/sessions/{tid}/entries``    structured transcript (``limit``,
+  ``before``/``after`` byte cursors)
+- ``POST /api/sessions/{tid}/rename``     rename session + its topic
+- ``POST /api/sessions/{tid}/upload``     multipart file into the session cwd
 - ``GET  /api/events``                    SSE: messages + session-list changes
 
 State-changing requests must carry ``X-CCGram: 1``; with no CORS headers
@@ -24,6 +28,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -42,7 +47,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_STATIC_DIR = Path(__file__).parent / "static"
+# CCGRAM_WEBUI_STATIC_DIR lets the front-end be updated without reinstalling
+# (and restarting) the daemon; it falls back to the packaged copy.
+_STATIC_DIR = Path(
+    os.environ.get("CCGRAM_WEBUI_STATIC_DIR") or Path(__file__).parent / "static"
+)
 
 _BOT_KEY = web.AppKey("webui_bot", object)
 _TOKEN_KEY = web.AppKey("webui_bot_token", str)
@@ -190,12 +199,16 @@ async def _sessions(_request: web.Request) -> web.Response:
 
 async def _create(request: web.Request) -> web.Response:
     body = await _json_body(request)
-    result = await service.create_session(
-        request.app[_BOT_KEY],  # type: ignore[arg-type]
-        str(body.get("text", "")),
-        body.get("name") if isinstance(body.get("name"), str) else None,
-        None,
-    )
+    name = body.get("name") if isinstance(body.get("name"), str) else None
+    if body.get("web_only"):
+        result = await service.create_web_only_session(str(body.get("text", "")), name)
+    else:
+        result = await service.create_session(
+            request.app[_BOT_KEY],  # type: ignore[arg-type]
+            str(body.get("text", "")),
+            name,
+            None,
+        )
     return web.json_response(result)
 
 
@@ -214,6 +227,45 @@ async def _send(request: web.Request) -> web.Response:
         _thread_id(request),
         str(body.get("text", "")),
     )
+    return web.json_response(result)
+
+
+async def _entries(request: web.Request) -> web.Response:
+    def _int(name: str) -> int | None:
+        raw = request.query.get(name)
+        try:
+            return int(raw) if raw is not None else None
+        except ValueError:
+            raise service.WebUIError(f"bad {name}") from None
+
+    limit = _int("limit") or service.DEFAULT_HISTORY
+    return web.json_response(
+        await service.entries(
+            _thread_id(request), limit=limit, before=_int("before"), after=_int("after")
+        )
+    )
+
+
+async def _rename(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    return web.json_response(
+        await service.rename(
+            request.app[_BOT_KEY],  # type: ignore[arg-type]
+            _thread_id(request),
+            str(body.get("name", "")),
+        )
+    )
+
+
+async def _upload(request: web.Request) -> web.Response:
+    tid = _thread_id(request)
+    reader = await request.multipart()
+    part = await reader.next()
+    if part is None or getattr(part, "name", None) != "file":
+        raise service.WebUIError("no file")
+    data = await part.read(decode=False)  # type: ignore[union-attr]
+    filename = getattr(part, "filename", None) or "file"
+    result = await asyncio.to_thread(service.save_upload, tid, filename, bytes(data))
     return web.json_response(result)
 
 
@@ -286,7 +338,9 @@ async def _events(request: web.Request) -> web.StreamResponse:
 
 
 def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Application:
-    app = web.Application(middlewares=[_middleware], client_max_size=256 * 1024)
+    app = web.Application(
+        middlewares=[_middleware], client_max_size=service.MAX_UPLOAD + 1024 * 1024
+    )
     app[_BOT_KEY] = bot
     app[_TOKEN_KEY] = bot_token
     app[_PASSWORD_KEY] = password
@@ -305,6 +359,9 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/send", _send)
     r.add_get("/api/sessions/{tid}/pane", _pane)
     r.add_post("/api/sessions/{tid}/close", _close)
+    r.add_get("/api/sessions/{tid}/entries", _entries)
+    r.add_post("/api/sessions/{tid}/rename", _rename)
+    r.add_post("/api/sessions/{tid}/upload", _upload)
     r.add_post("/api/sessions/{tid}/key", _key)
     r.add_get("/api/events", _events)
     return app

@@ -109,10 +109,29 @@ def detach(
     )
 
 
+def new_web_id() -> int:
+    """Id for a session born web-only: negative, so it never meets a thread id."""
+    return min([0, *_load().keys()]) - 1
+
+
+def update(web_id: int, /, **fields: Any) -> None:
+    entry = _load().get(web_id)
+    if entry is not None:
+        entry.update(fields)
+        _save()
+
+
 def set_window(session_id: int, window_id: str) -> None:
     entry = _load().get(session_id)
     if entry is not None:
         entry["window_id"] = window_id
+        _save()
+
+
+def set_name(session_id: int, name: str) -> None:
+    entry = _load().get(session_id)
+    if entry is not None:
+        entry["name"] = name
         _save()
 
 

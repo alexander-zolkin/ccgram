@@ -239,3 +239,55 @@ def test_key_whitelist():
     assert "Enter" in service.ALLOWED_KEYS
     assert "1" in service.ALLOWED_KEYS
     assert "rm -rf" not in service.ALLOWED_KEYS
+
+
+async def test_entries_rename_upload_routes(client, monkeypatch):
+    seen = {}
+
+    async def fake_entries(tid, *, limit, before, after):
+        seen["entries"] = (tid, limit, before, after)
+        return {"items": [], "start": 0, "end": 10, "structured": True}
+
+    async def fake_rename(bot, tid, name):
+        seen["rename"] = (tid, name)
+        return {"ok": True, "name": name}
+
+    def fake_save(tid, filename, data):
+        seen["upload"] = (tid, filename, data)
+        return {"path": ".ccgram-uploads/x", "name": filename, "image": False}
+
+    monkeypatch.setattr(service, "entries", fake_entries)
+    monkeypatch.setattr(service, "rename", fake_rename)
+    monkeypatch.setattr(service, "save_upload", fake_save)
+    await _login(client)
+    resp = await client.get("/api/sessions/7/entries?limit=20&after=5")
+    assert (await resp.json())["end"] == 10
+    assert seen["entries"] == (7, 20, None, 5)
+    resp = await client.get("/api/sessions/7/entries?before=abc")
+    assert resp.status == 400
+    resp = await client.post(
+        "/api/sessions/7/rename", json={"name": "Новое"}, headers=POST_HEADERS
+    )
+    assert seen["rename"] == (7, "Новое")
+    import aiohttp
+
+    form = aiohttp.FormData()
+    form.add_field("file", b"hello", filename="a.txt")
+    resp = await client.post("/api/sessions/7/upload", data=form, headers=POST_HEADERS)
+    assert resp.status == 200
+    assert seen["upload"] == (7, "a.txt", b"hello")
+
+
+def test_save_upload_sanitizes_and_stays_inside(tmp_path, monkeypatch):
+    b = service.Binding(1, -100, 7, "@3")
+    monkeypatch.setattr(service, "find_binding", lambda tid: b)
+    monkeypatch.setattr(service, "_cwd_for", lambda binding: str(tmp_path))
+    res = service.save_upload(7, "../../etc/pass wd?.png", b"data")
+    saved = tmp_path / res["path"]
+    assert saved.read_bytes() == b"data"
+    assert saved.parent == tmp_path / ".ccgram-uploads"
+    assert res["image"] is True
+    import pytest as _pytest
+
+    with _pytest.raises(service.WebUIError):
+        service.save_upload(7, "big.bin", b"x" * (service.MAX_UPLOAD + 1))
