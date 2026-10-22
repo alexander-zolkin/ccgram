@@ -654,6 +654,7 @@ async function openSession(tid) {
   $("home").hidden = true;
   $("tg-toggle").hidden = true;
   $("model-btn").hidden = true;
+  $("effort-btn").hidden = true;
   $("input").placeholder = "Ответить Каре…";
   state.current = tid;
   state.unread.delete(tid);
@@ -1189,7 +1190,17 @@ async function loadModels() {
   }
   const c = currentChoice();
   if (c && c.provider.id !== state.provider) { state.provider = c.provider.id; state.model = ""; }
-  $("model-name").textContent = choiceLabel(c) + (c?.provider.id === "claude" && state.effort ? ` · ${state.effort}` : "");
+  $("model-name").textContent = choiceLabel(c);
+  renderEffort();
+}
+
+// Effort is its own chip next to the model (claude only; others ignore it).
+function renderEffort() {
+  const isClaude = currentChoice()?.provider.id === "claude";
+  $("effort-btn").hidden = !isClaude || state.current != null;
+  const e = EFFORTS.find(([id]) => id === state.effort) || EFFORTS[0];
+  $("effort-name").innerHTML = e[0] ? `<span class="lbl-long">Усилие: </span>${esc(e[1].toLowerCase())}` : '<span class="lbl-long">Усилие</span>';
+  $("effort-btn").classList.toggle("set", Boolean(e[0]));
 }
 
 function pickModel(provider, model) {
@@ -1630,6 +1641,12 @@ $("profile-btn").onclick = () => {
   openMenu(profileMenu(), { x: r.left, y: r.top - 8, top: r.top });
 };
 $("tg-toggle").onclick = () => { state.telegram = !state.telegram; store.set("kara-telegram", state.telegram ? "1" : "0"); renderToggle(); };
+$("effort-btn").onclick = () => {
+  openMenu([{ heading: "Усилие для нового чата" }, ...EFFORTS.map(([id, label, sub]) => ({
+    label, sub, check: state.effort === id,
+    action: () => { state.effort = id; store.set("kara-effort", id); renderEffort(); },
+  }))], menuBelow($("effort-btn")));
+};
 $("model-btn").onclick = async () => {
   await loadModels();
   const c = currentChoice();
@@ -1649,12 +1666,6 @@ $("model-btn").onclick = async () => {
     }
   }
   if (!items.length) items.push({ label: "Агенты недоступны" });
-  if (c?.provider.id === "claude") {
-    items.push("sep", { heading: "Усилие" });
-    for (const [id, label, sub] of EFFORTS) {
-      items.push({ label, sub, check: state.effort === id, action: () => { state.effort = id; store.set("kara-effort", id); loadModels(); } });
-    }
-  }
   openMenu(items, menuBelow($("model-btn")));
 };
 $("jump-btn").onclick = () => { toBottom(); $("jump-btn").hidden = true; };

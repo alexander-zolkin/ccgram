@@ -328,6 +328,8 @@ input:focus { border-color: var(--accent); }
 .model-btn:hover { background: var(--hover); color: var(--text); }
 .model-btn svg { width: 14px; height: 14px; flex: none; }
 #model-name { overflow: hidden; text-overflow: ellipsis; }
+#effort-btn.set { color: var(--accent); }
+#effort-btn .effort-ico { width: 15px; height: 15px; }
 .send-btn { width: 32px; height: 32px; border-radius: 9px; border: 0; background: var(--accent); color: #fff; cursor: pointer; display: grid; place-items: center; }
 .send-btn svg { width: 17px; height: 17px; }
 .send-btn:hover { background: var(--accent-hover); }
@@ -385,6 +387,10 @@ input:focus { border-color: var(--accent); }
   .chat-state span:last-child { display: none; }
   .chat-meta .m-name { display: none; }
   .chat-meta .ctx-bar { display: none; }
+  .composer-bar #tg-toggle-text, #effort-btn .lbl-long, #effort-btn > svg:last-child { display: none; }
+  .composer-bar { gap: 4px; }
+  #effort-btn { flex: none; overflow: visible; padding-left: 4px; padding-right: 4px; }
+  #model-btn { flex: 0 1 auto; }
   .chat-meta { padding: 4px; margin: 0; }
   .topbar { gap: 0; padding-left: 6px; padding-right: 6px; }
   .topbar .spacer { flex: 0 0 4px; }
