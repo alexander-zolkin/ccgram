@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -348,6 +349,61 @@ def current_turn(path: Path) -> dict[str, Any]:
     """The turn in progress: when its prompt was sent, tokens produced so far."""
     turn = _turn_back(path, file_size(path))
     return {"start": turn.start, "out": turn.tokens}
+
+
+DAY_BACK = 32 * 1024 * 1024
+_TS = re.compile(rb'"timestamp":\s*"([^"]+)"')
+
+
+def _epoch(stamp: bytes) -> float | None:
+    try:
+        return datetime.fromisoformat(stamp.decode().replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def day_stats(path: Path, since: float) -> dict[str, int]:
+    """Output tokens, finished turns and their total time since epoch ``since``.
+
+    Reads backwards and stops at the first entry older than ``since``.
+    """
+    turn = _Turn()
+    turns = work_ms = 0
+    size = file_size(path)
+    try:
+        fh = path.open("rb")
+    except OSError:
+        return {"out": 0, "turns": 0, "ms": 0}
+    with fh:
+        carry = b""
+        pos = size
+        while pos > 0 and size - pos < DAY_BACK:
+            new = max(0, pos - CHUNK)
+            fh.seek(new)
+            lines = (fh.read(pos - new) + carry).split(b"\n")
+            pos = new
+            carry = lines.pop(0) if new > 0 else b""
+            for raw in reversed(lines):
+                stamp = _TS.search(raw)
+                when = _epoch(stamp.group(1)) if stamp else None
+                if when is None:
+                    continue
+                if when < since:
+                    pos = 0
+                    break
+                if b'"usage"' not in raw and b"turn_duration" not in raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if _turn_end(entry):
+                    turns += 1
+                    work_ms += int(entry.get("durationMs") or 0)
+                turn.add(entry)
+    return {"out": turn.tokens, "turns": turns, "ms": work_ms}
 
 
 def _merge_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

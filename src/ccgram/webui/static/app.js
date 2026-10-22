@@ -672,6 +672,7 @@ function showHome() {
   updateLed();
   renderToggle();
   renderSessions();
+  loadHub();
   loadModels();
   if (!isMobile()) $("input").focus();
 }
@@ -684,6 +685,7 @@ async function openSession(tid) {
   $("effort-btn").hidden = true;
   $("cwd-btn").hidden = true;
   $("home-actions").hidden = true;
+  hideHub();
   $("live").hidden = true;
   $("mode-btn").hidden = true;
   $("mode-btn").dataset.mode = "";
@@ -2255,6 +2257,241 @@ function refreshMsgStatus() {
   const label = last.querySelector(".u-status") || last.querySelector(".u-meta").insertBefore(el("span", "u-status"), last.querySelector(".u-meta").firstChild);
   label.textContent = { sending: "отправляется", sent: "доставлено", read: "прочитано", working: "прочитано · в работе" }[st];
   last.querySelector(".tick").dataset.tip = MSG_STATUS[st];
+}
+
+// ═══ home: Kara's own page — now / reach / pending / memory ═════════════════
+// /api/hub answers only when <CCGRAM_DIR>/hub.toml exists; otherwise the home
+// screen stays a plain greeting.
+const HUB_ICON = {
+  now: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>',
+  reach: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="19" r="2.5"/><circle cx="19" cy="19" r="2.5"/><path d="M12 7.5v4m0 0l-5.3 5.3M12 11.5l5.3 5.3"/></svg>',
+  pending: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 6h10M10 12h10M10 18h10M3.5 6l1.5 1.5L8 4.5M3.5 12l1.5 1.5L8 10.5"/><circle cx="5.5" cy="18" r="1.2"/></svg>',
+  memory: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5z"/><path d="M5 19.5A1.5 1.5 0 0 0 6.5 21H19v-3M9 7h6"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.4-5.7L20 8.5M20 3.5v5h-5"/></svg>',
+  map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2z"/><path d="M9 4v14M15 6v14"/></svg>',
+  done: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L19.5 7"/></svg>',
+  later: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="13" r="7.5"/><path d="M12 9.5V13l2.5 1.5M5 4L2.5 6.5M19 4l2.5 2.5"/></svg>',
+};
+
+const pluralRu = (n, one, few, many) => {
+  const a = Math.abs(n) % 10, b = Math.abs(n) % 100;
+  return a === 1 && b !== 11 ? one : a >= 2 && a <= 4 && (b < 10 || b >= 20) ? few : many;
+};
+const agoRu = (ts) => {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  return s < 90 ? "только что" : s < 3600 ? `${Math.round(s / 60)} мин назад` : s < 86400 ? `${Math.round(s / 3600)} ч назад` : `${Math.round(s / 86400)} дн. назад`;
+};
+const dueRu = (n) => (n < 0 ? `просрочено ${-n} ${pluralRu(-n, "день", "дня", "дней")}` : n === 0 ? "сегодня" : n === 1 ? "завтра" : `через ${n} ${pluralRu(n, "день", "дня", "дней")}`);
+// Pending items are one-line markdown; [[wiki-links]] point into memory.
+const inlineMd = (text) => DOMPurify.sanitize(marked.parseInline(String(text).replace(/\[\[([^\]]+)\]\]/g, "`$1`")));
+
+async function loadHub() {
+  clearTimeout(state.hubTimer);
+  if (state.current != null) return;
+  state.hubTimer = setTimeout(loadHub, 60000);
+  if (document.hidden && $("hub").dataset.built) return;
+  let data;
+  try { data = await api("/api/hub"); } catch (_) { return; }
+  if (state.current != null) return;
+  const on = Boolean(data.enabled);
+  $("app").classList.toggle("has-hub", on);
+  $("hub").hidden = !on;
+  if (!on) return;
+  hubSkeleton();
+  renderNow(data.now);
+  renderReach(data.reach);
+  renderPending(data.pending);
+  if (data.memory) renderMemory(data.memory, data.map);
+  $("hub-memory").hidden = !data.memory;
+  $("hub-pending").hidden = !data.pending;
+}
+
+function hideHub() {
+  clearTimeout(state.hubTimer);
+  $("hub").hidden = true;
+  $("app").classList.remove("has-hub");
+}
+
+function hubSkeleton() {
+  const hub = $("hub");
+  if (hub.dataset.built) return;
+  hub.dataset.built = "1";
+  hub.innerHTML = `
+    <div class="hub-grid"><article id="hub-now" class="hub-card"></article><article id="hub-reach" class="hub-card"></article></div>
+    <article id="hub-pending" class="hub-card"></article>
+    <article id="hub-memory" class="hub-card">
+      <header class="hub-head">${HUB_ICON.memory}<h2>Что я помню</h2><span id="hub-mem-count" class="hub-sub"></span><span class="spacer"></span>
+        <button id="hub-map-btn" type="button" class="btn small" hidden>${HUB_ICON.map}Карта</button></header>
+      <label class="hub-search">${SVG.search}<input id="hub-mem-q" type="search" placeholder="Найти в памяти…" autocomplete="off" enterkeyhint="search"></label>
+      <div id="hub-mem-list"></div>
+    </article>`;
+  $("hub-mem-q").oninput = () => { clearTimeout(state.memTimer); state.memTimer = setTimeout(memSearch, 250); };
+  $("hub-map-btn").onclick = () => openMap();
+}
+
+function renderNow(now) {
+  const t = now.today;
+  const w = now.working;
+  $("hub-now").innerHTML = `
+    <header class="hub-head">${HUB_ICON.now}<h2>Сейчас</h2></header>
+    <div class="hub-lead">${w.length ? `${w.length} ${pluralRu(w.length, "чат работает", "чата работают", "чатов работают")}` : "Все чаты ждут тебя"}</div>
+    ${w.length ? `<div class="hub-chips">${w.map((c) => `<a class="hub-chip" href="#${c.thread_id}"><span class="dot active"></span>${esc(c.name)}</a>`).join("")}</div>` : ""}
+    <div class="hub-stats">
+      <div><b>${tokRu(t.out)}</b><span>токенов сегодня</span></div>
+      <div><b>${t.turns}</b><span>${pluralRu(t.turns, "ход", "хода", "ходов")}</span></div>
+      <div><b>${t.ms ? secsRu(Math.round(t.ms / 1000)) : "—"}</b><span>в работе</span></div>
+    </div>
+    <div class="hub-foot">Сегодня ${now.chats_today} ${pluralRu(now.chats_today, "чат", "чата", "чатов")} · не спят: ${now.alive}</div>`;
+  $("hub-now").querySelector(".hub-stats").dataset.tip = "Токены — то, что модель написала (с размышлениями), как ↓ в Claude Code. Время — сумма ходов.";
+}
+
+function reachStatus(r) {
+  if (!r.ok) return `${r.why}${r.last_ok ? ` · был ${agoRu(r.last_ok)}` : ""}`;
+  const d = r.local && r.detail;
+  return d ? `нагрузка ${String(d.load).replace(".", ",")} · свободно ${(d.mem_avail_mb / 1024).toFixed(1).replace(".", ",")} ГБ` : "на связи";
+}
+
+function renderReach(reach) {
+  const rows = reach.targets.map((r) => `
+    <li><span class="rdot ${r.ok ? "ok" : "off"}"></span><span class="rmain"><b>${esc(r.name)}</b><span>${esc(r.access)}</span></span><span class="rstat">${esc(reachStatus(r))}</span></li>`);
+  for (const g of reach.groups) {
+    const bad = g.items.filter((i) => !i.ok);
+    const open = state.reachOpen?.has(g.name) ? " open" : "";
+    rows.push(`<li class="grp"><details data-group="${esc(g.name)}"${open}><summary><span class="rdot ${bad.length ? "warn" : "ok"}"></span><span class="rmain"><b>${esc(g.name)}</b><span>${g.ok} из ${g.items.length} на связи</span></span><span class="rstat">${bad.length ? `нет: ${esc(bad.map((i) => i.name).join(", "))}` : "все на связи"}</span></summary>
+      <ul class="reach-sub">${g.items.map((i) => `<li><span class="rdot ${i.ok ? "ok" : "off"}"></span>${esc(i.name)}${i.ok ? "" : `<span class="muted"> — ${esc(reachStatus(i))}</span>`}</li>`).join("")}</ul></details></li>`);
+  }
+  const checked = Math.max(0, ...reach.targets.map((r) => r.checked));
+  $("hub-reach").innerHTML = `
+    <header class="hub-head">${HUB_ICON.reach}<h2>Куда дотягиваюсь</h2><span class="spacer"></span>
+      <button id="hub-reach-btn" type="button" class="icon-btn small" data-tip="Проверить сейчас">${HUB_ICON.refresh}</button></header>
+    <ul class="reach-list">${rows.join("")}</ul>
+    <div class="hub-foot">Проверено ${checked ? agoRu(checked) : "—"} · сама проверяю раз в 5 минут</div>`;
+  $("hub-reach").querySelectorAll("details").forEach((d) => {
+    d.ontoggle = () => { state.reachOpen = state.reachOpen || new Set(); state.reachOpen[d.open ? "add" : "delete"](d.dataset.group); };
+  });
+  $("hub-reach-btn").onclick = async (ev) => {
+    const btn = ev.currentTarget;
+    btn.classList.add("spinning");
+    try { renderReach(await api("/api/hub/reach", { body: {} })); } catch (e) { toast(e.message); btn.classList.remove("spinning"); }
+  };
+}
+
+function renderPending(p) {
+  const items = (p && p.items) || [];
+  const card = $("hub-pending");
+  card.innerHTML = `
+    <header class="hub-head">${HUB_ICON.pending}<h2>Мои дела</h2><span class="hub-sub">${items.length || ""}</span></header>
+    ${items.length ? `<ul class="pend-list">${items.map((it) => {
+      const [, m, d] = it.date.split("-");
+      const cls = it.days < 0 ? "late" : it.days === 0 ? "today" : "";
+      return `<li class="pend ${cls}" data-id="${it.id}"><span class="pdate"><b>${d}.${m}</b><span>${dueRu(it.days)}</span></span>
+        <span class="ptext">${inlineMd(it.text)}</span>
+        <span class="pacts"><button type="button" class="icon-btn small" data-act="done" data-tip="Сделано — убрать в архив">${HUB_ICON.done}</button><button type="button" class="icon-btn small" data-act="later" data-tip="Отложить">${HUB_ICON.later}</button></span></li>`;
+    }).join("")}</ul>` : '<div class="hub-empty">Обещанных дел нет — всё закрыто.</div>'}`;
+  card.querySelectorAll(".ptext").forEach((t) => { t.onclick = (ev) => { if (!ev.target.closest("a")) t.classList.toggle("open"); }; });
+  card.querySelectorAll(".pend").forEach((row) => {
+    const it = items.find((x) => x.id === row.dataset.id);
+    row.querySelector('[data-act="done"]').onclick = () => closePending(it);
+    row.querySelector('[data-act="later"]').onclick = (ev) => {
+      const btn = ev.currentTarget;
+      openMenu([{ heading: "Напомнить" }, ...[[1, "завтра"], [3, "через 3 дня"], [7, "через неделю"], [30, "через месяц"]].map(([days, label]) => ({ label, action: () => snoozePending(it, days) }))], menuBelow(btn), btn);
+    };
+  });
+}
+
+async function closePending(it) {
+  const short = it.text.replace(/\s+/g, " ").slice(0, 180);
+  if (!(await confirmDialog("Дело сделано?", `${short}${it.text.length > 180 ? "…" : ""}\n\nУберу его в архив закрытых дел.`, "Закрыть"))) return;
+  try { renderPending(await api(`/api/hub/pending/${it.id}/close`, { body: {} })); toast("Закрыто — дело в архиве"); } catch (e) { toast(e.message); loadHub(); }
+}
+
+async function snoozePending(it, days) {
+  try {
+    const p = await api(`/api/hub/pending/${it.id}/snooze`, { body: { days } });
+    renderPending(p);
+    const moved = p.items.find((x) => x.text === it.text);
+    toast(moved ? `Напомню ${moved.date.split("-").reverse().slice(0, 2).join(".")}` : "Отложено");
+  } catch (e) { toast(e.message); loadHub(); }
+}
+
+function renderMemory(mem, hasMap) {
+  state.memToday = mem.today;
+  state.hubMap = hasMap;
+  $("hub-map-btn").hidden = !hasMap;
+  $("hub-mem-count").textContent = `${mem.total} ${pluralRu(mem.total, "запись", "записи", "записей")} · ${mem.domains} ${pluralRu(mem.domains, "раздел", "раздела", "разделов")}`;
+  if (!$("hub-mem-q").value.trim()) showToday();
+}
+
+function showToday() {
+  const items = state.memToday || [];
+  const fresh = items.filter((d) => d.change === "new").length;
+  const label = items.length
+    ? `Сегодня: ${fresh ? `${fresh} ${pluralRu(fresh, "новая", "новые", "новых")}` : ""}${fresh && items.length > fresh ? ", " : ""}${items.length > fresh ? `${items.length - fresh} ${pluralRu(items.length - fresh, "обновлена", "обновлены", "обновлено")}` : ""}`
+    : "Сегодня в памяти ничего не менялось";
+  renderMemList(items, label);
+}
+
+function renderMemList(items, label, all = false) {
+  const list = $("hub-mem-list");
+  const shown = all ? items : items.slice(0, 6);
+  list.innerHTML = `<div class="mem-label">${esc(label)}</div>${shown.map((d) => `
+    <button type="button" class="mem-item" data-path="${esc(d.path)}"><span class="mem-dom">${esc(d.domain)}</span>
+      <span class="mem-title">${esc(d.title)}${d.change === "new" ? '<span class="mem-new">новое</span>' : ""}</span>
+      <span class="mem-desc">${esc(d.description)}</span></button>`).join("")}
+    ${items.length > shown.length ? `<button type="button" class="link-btn mem-more">Показать ещё ${items.length - shown.length}</button>` : ""}`;
+  list.querySelectorAll(".mem-item").forEach((b) => { b.onclick = () => openMemory(b.dataset.path); });
+  const more = list.querySelector(".mem-more");
+  if (more) more.onclick = () => renderMemList(items, label, true);
+}
+
+async function memSearch() {
+  const q = $("hub-mem-q").value.trim();
+  if (!q) { showToday(); return; }
+  try {
+    const r = await api(`/api/hub/memory/search?q=${encodeURIComponent(q)}`);
+    if ($("hub-mem-q").value.trim() !== q) return;
+    renderMemList(r.results, r.results.length ? `Нашлось ${r.results.length}${r.results.length === 20 ? "+" : ""} — самые подходящие сверху` : "Ничего не нашлось");
+  } catch (e) { toast(e.message); }
+}
+
+// ═══ sheet: the memory map (or one memory) over the page ═══════════════════
+function openSheet(title) {
+  $("sheet-title").textContent = title;
+  $("sheet").hidden = false;
+  document.body.classList.add("sheet-open");
+}
+function closeSheet() {
+  $("sheet").hidden = true;
+  document.body.classList.remove("sheet-open");
+}
+$("sheet-close").onclick = closeSheet;
+$("sheet").addEventListener("mousedown", (ev) => { if (ev.target === $("sheet")) closeSheet(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("sheet").hidden && $("menu").hidden) closeSheet(); });
+
+// The map is a 4 MB single page: load it once, then jump by hash.
+function openMap(path) {
+  const frame = $("sheet-frame");
+  const hash = path ? `#file:${encodeURIComponent(path)}` : "";
+  $("sheet-body").hidden = true;
+  frame.hidden = false;
+  openSheet("Карта памяти");
+  const win = frame.src ? frame.contentWindow : null;
+  if (!win || typeof win.fromHash !== "function") { frame.src = `/hub/map/index.html${hash}`; return; }
+  if (!hash) return;
+  win.history.replaceState(null, "", hash);
+  win.fromHash();
+}
+
+async function openMemory(path) {
+  if (state.hubMap) { openMap(path); return; }
+  try {
+    const d = await api(`/api/hub/memory/file?path=${encodeURIComponent(path)}`);
+    $("sheet-frame").hidden = true;
+    const body = $("sheet-body");
+    body.hidden = false;
+    body.replaceChildren(renderMarkdown(d.body));
+    openSheet(d.title);
+  } catch (e) { toast(e.message); }
 }
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});

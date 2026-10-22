@@ -35,6 +35,11 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/uploads``                   file for a session not created yet
 - ``GET  /api/models``                    Claude models for the picker
 - ``GET  /api/events``                    SSE: messages + session-list changes
+- ``GET  /api/hub``                       home page: now / reach / pending / memory
+- ``POST /api/hub/reach``                 probe every reach target now
+- ``POST /api/hub/pending/{id}/close|snooze``  close (to the done log) / postpone
+- ``GET  /api/hub/memory/search?q=``, ``/api/hub/memory/file?path=``
+- ``GET  /hub/map/…``                     memory map site for the home-page iframe
 
 State-changing requests must carry ``X-CCGram: 1``; with no CORS headers
 served, a foreign page can't attach it, which together with the SameSite
@@ -55,7 +60,7 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from . import extras, push, service
+from . import extras, hub, push, service
 from ..providers.claude import EFFORT_LEVELS
 from .auth import COOKIE_NAME, SESSION_TTL_S, LoginThrottle, check_password
 from .auth import issue_cookie, verify_cookie
@@ -133,7 +138,8 @@ async def _middleware(
     except service.WebUIError as exc:
         response = web.json_response({"error": str(exc)}, status=exc.status)
     if isinstance(response, web.StreamResponse) and not response.prepared:
-        response.headers.update(_SECURITY_HEADERS)
+        for name, value in _SECURITY_HEADERS.items():
+            response.headers.setdefault(name, value)
     return response
 
 
@@ -367,6 +373,55 @@ async def _settings(request: web.Request) -> web.Response:
             "stt": bool(os.getenv("CCGRAM_WHISPER_PROVIDER")),
         }
     )
+
+
+async def _hub(_request: web.Request) -> web.Response:
+    return web.json_response(await hub.overview())
+
+
+async def _hub_reach(_request: web.Request) -> web.Response:
+    return web.json_response(await hub.reach(refresh=True))
+
+
+async def _hub_pending(request: web.Request) -> web.Response:
+    item, action = request.match_info["id"], request.match_info["action"]
+    if action == "close":
+        return web.json_response(await asyncio.to_thread(hub.close_pending, item))
+    body = await _json_body(request)
+    days = body.get("days")
+    if action != "snooze" or not isinstance(days, int):
+        raise service.WebUIError("unknown action")
+    return web.json_response(await asyncio.to_thread(hub.snooze_pending, item, days))
+
+
+# The memory map is a generated single-page site with inline scripts; it may
+# only be framed by this origin's home page.
+_MAP_CSP = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline';"
+    " style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;"
+    " frame-ancestors 'self'; base-uri 'none'; form-action 'none'"
+)
+
+
+async def _hub_map(request: web.Request) -> web.StreamResponse:
+    if not _authed(request):
+        return web.Response(status=401, text="login required")
+    path = await asyncio.to_thread(hub.map_file, request.match_info["tail"])
+    response = web.FileResponse(path)
+    response.headers["Content-Security-Policy"] = _MAP_CSP
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+async def _hub_memory_search(request: web.Request) -> web.Response:
+    query = request.query.get("q", "")[:200]
+    return web.json_response(await asyncio.to_thread(hub.memory_search, query))
+
+
+async def _hub_memory_file(request: web.Request) -> web.Response:
+    rel = request.query.get("path", "")
+    return web.json_response(await asyncio.to_thread(hub.memory_file, rel))
 
 
 async def _probe(request: web.Request) -> web.Response:
@@ -613,11 +668,18 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_get("/api/models", _models)
     r.add_post("/api/sessions/{tid}/key", _key)
     r.add_get("/api/events", _events)
+    r.add_get("/api/hub", _hub)
+    r.add_post("/api/hub/reach", _hub_reach)
+    r.add_post("/api/hub/pending/{id}/{action}", _hub_pending)
+    r.add_get("/api/hub/memory/search", _hub_memory_search)
+    r.add_get("/api/hub/memory/file", _hub_memory_file)
+    r.add_get("/hub/map/{tail:.*}", _hub_map)
     return app
 
 
 _runner: web.AppRunner | None = None
 _autotitle_task: asyncio.Task[None] | None = None
+_hub_task: asyncio.Task[None] | None = None
 
 
 async def start_webui(bot: Bot | Any) -> None:
@@ -660,17 +722,19 @@ async def start_webui(bot: Bot | Any) -> None:
         # Lazy: only the running daemon names sessions.
         from . import autotitle
 
-        global _autotitle_task
+        global _autotitle_task, _hub_task
         _autotitle_task = autotitle.start(bot)
+        _hub_task = hub.start()
     except OSError as exc:
         logger.error("web UI failed to bind: %s", exc)
 
 
 async def stop_webui() -> None:
-    global _runner, _autotitle_task
-    if _autotitle_task is not None:
-        _autotitle_task.cancel()
-        _autotitle_task = None
+    global _runner, _autotitle_task, _hub_task
+    for task in (_autotitle_task, _hub_task):
+        if task is not None:
+            task.cancel()
+    _autotitle_task = _hub_task = None
     if _runner is None:
         return
     with contextlib.suppress(Exception):
