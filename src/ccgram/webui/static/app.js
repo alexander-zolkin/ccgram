@@ -335,7 +335,7 @@ function userNode(it) {
     if (it.images) att.appendChild(el("span", "", `🖼 ${it.images}`));
     n.appendChild(att);
   }
-  n.appendChild(document.createTextNode(text));
+  if (text) { const md = renderMarkdown(text); md.className = "u-md"; n.appendChild(md); }
   return n;
 }
 
@@ -566,16 +566,33 @@ function tgLink(s) {
   return `https://t.me/c/${String(s.chat_id).replace(/^-100/, "")}/${s.thread_id}`;
 }
 
+function groupOf(ts) {
+  if (!ts) return "Раньше";
+  const d = new Date(ts * 1000);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = (today - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000;
+  if (diff <= 0) return "Сегодня";
+  if (diff === 1) return "Вчера";
+  if (diff < 7) return "На этой неделе";
+  if (diff < 31) return "В этом месяце";
+  return "Раньше";
+}
+
 function renderSessions() {
   const nav = $("session-list");
   const f = state.filter.trim().toLowerCase();
   nav.innerHTML = "";
   const list = state.sessions.filter((s) => !f || s.name.toLowerCase().includes(f));
-  const groups = [["Закреплённые", list.filter((s) => s.pinned)], ["Недавние", list.filter((s) => !s.pinned)]];
-  for (const [label, items] of groups) {
-    if (!items.length) continue;
-    nav.appendChild(el("div", "group-label", esc(label)));
-    for (const s of items) nav.appendChild(sessionItem(s));
+  const pinned = list.filter((s) => s.pinned);
+  if (pinned.length) {
+    nav.appendChild(el("div", "group-label", "Закреплённые"));
+    for (const s of pinned) nav.appendChild(sessionItem(s));
+  }
+  let group = null;
+  for (const s of list.filter((s) => !s.pinned)) {
+    const g = groupOf(s.last_activity);
+    if (g !== group) { nav.appendChild(el("div", "group-label", esc(g))); group = g; }
+    nav.appendChild(sessionItem(s));
   }
   if (!list.length) nav.appendChild(el("div", "group-label", f ? "Ничего не нашлось" : "Чатов пока нет"));
   renderHeader();

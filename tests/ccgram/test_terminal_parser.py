@@ -171,6 +171,21 @@ class TestParseStatusLine:
         )
         assert parse_status_line(pane) == "Working hard"
 
+    def test_right_aligned_update_notice_is_not_status(self):
+        # Idle pane after a Claude Code auto-update: the ✔ notice must not
+        # read as a spinner, nor may the finished "· done" line above it.
+        pane = (
+            "output\n"
+            "✻ Worked for 8s · done 12:58 AM\n"
+            "                                        ✔ Update installed · Restart to update\n"
+            f"{_SEPARATOR}\n"
+            "❯ \n"
+            f"{_SEPARATOR}\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+        assert parse_status_line(pane) is None
+        assert parse_status_block(pane) is None
+
     def test_uses_fixture(self, sample_pane_status_line: str):
         assert parse_status_line(sample_pane_status_line) == "Reading file src/main.py"
 

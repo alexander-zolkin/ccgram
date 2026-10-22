@@ -410,6 +410,7 @@ _NON_SPINNER_CHARS = frozenset("─│┌┐└┘├┤┬┴┼═║╔╗╚
 # like !, #, %, @, *, / that would cause false positives.
 _SPINNER_CATEGORIES = frozenset({"So", "Sm"})
 _MAX_STATUS_PROGRESS_LINES = 8
+_PROGRESS_MARKS = frozenset("✔◼◻◔")
 _STATUS_PROGRESS_RE = re.compile(r"^\s*(?:⎿\s*)?[✔◼◻◔]\s+\S")
 
 
@@ -533,6 +534,12 @@ def _find_status_line_index(lines: list[str], scan_start: int) -> int | None:
             candidate = lines[j].strip()
             if not candidate:
                 continue
+            # CCGRAM-HOTFIX:checkmark-not-spinner — ✔/◼/◻/◔ head checklist
+            # lines and Claude Code's "✔ Update installed · Restart to update"
+            # notice, never the spinner line. Reading one as a spinner kept
+            # idle topics "active" (🔄 updating…) indefinitely.
+            if candidate[0] in _PROGRESS_MARKS:
+                break
             if is_likely_spinner(candidate[0]):
                 return j
             break

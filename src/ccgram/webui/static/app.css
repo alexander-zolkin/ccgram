@@ -150,6 +150,16 @@ input:focus { border-color: var(--accent); }
 
 .u-msg { align-self: flex-end; max-width: 80%; background: var(--user-bg); border-radius: 18px; padding: 10px 16px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; }
 .u-msg.pending { opacity: .6; }
+.u-md { white-space: normal; }
+.u-md > :last-child { margin-bottom: 0; }
+.u-md p, .u-md ul, .u-md ol, .u-md blockquote { margin: 0 0 8px; }
+.u-md ul, .u-md ol { padding-left: 22px; }
+.u-md blockquote { padding: 0 10px; border-left: 3px solid var(--border-strong); color: var(--muted); }
+.u-md a { color: inherit; text-decoration: underline; }
+.u-md h1, .u-md h2, .u-md h3, .u-md h4 { font-size: 1.05em; font-weight: 600; margin: 0 0 6px; }
+.u-md table { border-collapse: collapse; margin: 0 0 8px; display: block; overflow-x: auto; max-width: 100%; font-size: 14px; }
+.u-md th, .u-md td { border-bottom: 1px solid var(--border); padding: 4px 10px; text-align: left; }
+.u-md .codebox { margin: 4px 0 8px; }
 .u-msg .att { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .u-msg .att span { font-size: 12.5px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 2px 8px; }
 .a-msg { font: 16.5px/1.65 var(--serif); overflow-wrap: anywhere; padding: 0 2px; }
@@ -165,7 +175,7 @@ input:focus { border-color: var(--accent); }
 .a-msg table { border-collapse: collapse; margin: 0 0 14px; display: block; overflow-x: auto; max-width: 100%; font: 14px/1.5 var(--sans); }
 .a-msg th, .a-msg td { border-bottom: 1px solid var(--border); padding: 7px 12px; text-align: left; vertical-align: top; }
 .a-msg th { font-weight: 600; border-bottom-color: var(--border-strong); }
-.a-msg code { font-family: var(--mono); font-size: .82em; background: var(--code-bg); border: .5px solid var(--border-strong); border-radius: 5px; padding: 1px 5px; color: var(--del-fg); }
+.a-msg code, .u-md code { font-family: var(--mono); font-size: .82em; background: var(--code-bg); border: .5px solid var(--border-strong); border-radius: 5px; padding: 1px 5px; color: var(--del-fg); }
 .codebox { border: .5px solid var(--border-strong); border-radius: 10px; overflow: hidden; margin: 0 0 14px; background: var(--code-bg); font-family: var(--sans); }
 .codebox-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--muted); padding: 6px 8px 6px 14px; }
 .codebox pre { margin: 0; padding: 4px 14px 14px; overflow-x: auto; }
