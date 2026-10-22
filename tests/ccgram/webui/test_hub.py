@@ -143,16 +143,16 @@ def test_alerts_latest_per_alert_with_the_verdict(tmp_path, monkeypatch):
             "instance": "nl2",
             "disposition": "serial-flapper-suppressed",
         },
+        {  # the triage logs its message just before the escalation line
+            "ts": stamp(30),
+            "disposition": "tg-delivery-failed",
+            "intended_text": "🚨 Down @ nl2\nVERDICT: CRITICAL",
+        },
         {
             "ts": stamp(30),
             "alertname": "Down",
             "instance": "nl2",
             "disposition": "escalated",
-        },
-        {
-            "ts": stamp(30),
-            "disposition": "tg-delivery-failed",
-            "intended_text": "🚨 Down @ nl2\nVERDICT: CRITICAL",
         },
         "not json",
     ]

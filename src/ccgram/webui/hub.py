@@ -616,6 +616,7 @@ def map_file(tail: str) -> Path:
 ALERT_WINDOW_S = 86400
 ALERT_TAIL = 512 * 1024
 ALERT_ITEMS = 6
+VERDICT_GAP_S = 120
 CALENDAR_TTL_S = 600
 _ALERT_RU = {
     "escalated": "важно — разобрала и написала тебе",
@@ -661,10 +662,16 @@ def alerts() -> dict[str, Any] | None:
         important += kind == "escalated"
         noise += kind in _NOISE
         verdict = ""
-        if kind == "escalated":  # the message it sent follows within seconds
-            for nxt in rows[i + 1 : i + 6]:
-                if nxt.get("intended_text"):
-                    verdict = str(nxt["intended_text"])
+        if kind == "escalated":  # the message it sent, logged seconds apart
+            when = _epoch(str(row.get("ts", "")))
+            for near in rows[max(0, i - 5) : i + 6]:
+                text = str(near.get("intended_text") or "")
+                if (
+                    text
+                    and str(row.get("alertname", "")) in text
+                    and abs(_epoch(str(near.get("ts", ""))) - when) <= VERDICT_GAP_S
+                ):
+                    verdict = text
                     break
         key = (str(row.get("alertname", "")), str(row.get("instance", "")))
         prev = latest.get(key)
