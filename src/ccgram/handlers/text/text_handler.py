@@ -18,6 +18,7 @@ from telegram import Message, Update
 from telegram.constants import ChatAction
 from ...config import config
 from ...telegram_client import PTBTelegramClient, TelegramClient
+from ...tg_markdown import entities_to_markdown
 from ..callback_helpers import get_thread_id as _get_thread_id
 from ..commands import sync_scoped_menu_for_text_context
 from ..topics.directory_browser import (
@@ -582,6 +583,12 @@ async def handle_text_message(
 
     text = message.text
     thread_id = _get_thread_id(update)
+    # CCGRAM-HOTFIX:tg-entities-markdown — the agent gets the formatting
+    # (bold, code, links…) as Markdown; UI/command matching keeps plain text.
+    # "!cmd" stays raw: it is a shell command, not prose.
+    agent_text = (
+        text if text.startswith("!") else entities_to_markdown(text, message.entities)
+    )
 
     # Store group chat_id for forum topic message routing
     chat = message.chat
@@ -616,7 +623,7 @@ async def handle_text_message(
 
     # Unbound topic — show picker or browser
     if await _handle_unbound_topic(
-        user.id, thread_id, text, context.user_data, message
+        user.id, thread_id, agent_text, context.user_data, message
     ):
         return
 
@@ -625,7 +632,7 @@ async def handle_text_message(
     assert window_id is not None  # _handle_unbound_topic returned False
 
     if await _handle_dead_window(
-        window_id, user.id, thread_id, text, context.user_data, message
+        window_id, user.id, thread_id, agent_text, context.user_data, message
     ):
         return
 
@@ -652,7 +659,7 @@ async def handle_text_message(
         window_id,
         user.id,
         thread_id,
-        text,
+        agent_text,
         PTBTelegramClient(context.bot),
         message,
     )
