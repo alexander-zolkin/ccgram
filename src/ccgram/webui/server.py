@@ -17,6 +17,8 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/sessions/{tid}/upload``     multipart file into the session cwd
 - ``POST /api/sessions/{tid}/pin``        pin / unpin in the sidebar
 - ``POST /api/sessions/{tid}/sound``      Telegram sound for the topic: auto / on / off
+- ``GET  /api/sessions/{tid}/file?path=`` an upload of the session (.ccgram-uploads only)
+- ``GET  /api/search?q=``                  full-text search over all transcripts
 - ``POST /api/sessions/{tid}/detach``     delete the topic, keep the session
 - ``POST /api/sessions/{tid}/keep``       keep a session whose topic was deleted
 - ``POST /api/sessions/{tid}/delete``     kill the session, delete its topic
@@ -43,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 
 from . import service
+from ..providers.claude import EFFORT_LEVELS
 from .auth import COOKIE_NAME, SESSION_TTL_S, LoginThrottle, check_password
 from .auth import issue_cookie, verify_cookie
 from .bus import bus
@@ -209,9 +212,10 @@ async def _create(request: web.Request) -> web.Response:
     name = body.get("name") if isinstance(body.get("name"), str) else None
     model = service.valid_model(body.get("model"))
     provider = service.valid_provider(body.get("provider"))
+    effort = body.get("effort") if body.get("effort") in EFFORT_LEVELS else None
     if body.get("web_only"):
         result = await service.create_web_only_session(
-            str(body.get("text", "")), name, model, provider
+            str(body.get("text", "")), name, model, provider, effort
         )
     else:
         result = await service.create_session(
@@ -220,6 +224,7 @@ async def _create(request: web.Request) -> web.Response:
             name,
             model,
             provider,
+            effort,
         )
     return web.json_response(result)
 
@@ -332,6 +337,15 @@ async def _close(request: web.Request) -> web.Response:
     return web.json_response(await service.close_web_only(_thread_id(request)))
 
 
+async def _search(request: web.Request) -> web.Response:
+    return web.json_response(await service.search(request.query.get("q", "")))
+
+
+async def _file(request: web.Request) -> web.StreamResponse:
+    path = service.upload_file(_thread_id(request), request.query.get("path", ""))
+    return web.FileResponse(path, headers={"Cache-Control": "private, max-age=86400"})
+
+
 async def _pane(request: web.Request) -> web.Response:
     return web.json_response(await service.pane(_thread_id(request)))
 
@@ -423,6 +437,8 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/upload", _upload)
     r.add_post("/api/sessions/{tid}/pin", _pin)
     r.add_post("/api/sessions/{tid}/sound", _sound)
+    r.add_get("/api/sessions/{tid}/file", _file)
+    r.add_get("/api/search", _search)
     r.add_post("/api/sessions/{tid}/detach", _detach)
     r.add_post("/api/sessions/{tid}/keep", _keep)
     r.add_post("/api/sessions/{tid}/delete", _delete)

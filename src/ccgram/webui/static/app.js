@@ -339,19 +339,39 @@ const state = {
   provider: store.get("kara-provider") || "claude",
   model: store.get("kara-model") || "",
   telegram: store.get("kara-telegram") !== "0",
+  effort: store.get("kara-effort") || "",   // "" = ccgram default (xhigh)
 };
+
+const EFFORTS = [
+  ["", "По умолчанию", "xhigh — как в Telegram"],
+  ["low", "Низкое", "быстро и дёшево"],
+  ["medium", "Среднее", ""],
+  ["high", "Высокое", ""],
+  ["xhigh", "Очень высокое", ""],
+  ["max", "Максимальное", "дольше всех думает"],
+];
 
 // ═══ thread rendering ═══════════════════════════════════════════════════════
 function userNode(it) {
   const n = el("div", "u-msg");
   const files = [];
   const text = String(it.text || "").replace(/^I've uploaded (?:an image to (\S+) — please take a look\.|(.+?) to (\S+))\s*$/gm, (_, img, name, path) => {
-    files.push(img ? img.split("/").pop().replace(/^\d{8}-\d{6}-/, "") : name);
+    files.push(img ? { name: img.split("/").pop().replace(/^\d{8}-\d{6}-/, ""), path: img } : { name, path });
     return "";
   }).trim();
   if (files.length || it.images) {
     const att = el("div", "att");
-    for (const f of files) att.appendChild(el("span", "", `📄 ${esc(f)}`));
+    for (const f of files) {
+      if (f.path && state.current != null && /\.(png|jpe?g|gif|webp)$/i.test(f.path)) {
+        const img = el("img", "att-img");
+        img.loading = "lazy";
+        img.alt = f.name;
+        img.src = `/api/sessions/${state.current}/file?path=${encodeURIComponent(f.path)}`;
+        img.onerror = () => img.replaceWith(el("span", "", `🖼 ${esc(f.name)}`));
+        img.onclick = () => window.open(img.src, "_blank");
+        att.appendChild(img);
+      } else att.appendChild(el("span", "", `📄 ${esc(f.name)}`));
+    }
     if (it.images) att.appendChild(el("span", "", `🖼 ${it.images}`));
     n.appendChild(att);
   }
@@ -404,6 +424,55 @@ function assistantNode(it) {
   return n;
 }
 
+// "!cmd" typed in Claude Code (or sent from here / Telegram) — a terminal card.
+function bashNode(it) {
+  const n = el("div", "bash-card");
+  const head = el("div", "bash-head");
+  head.innerHTML = `<span class="bash-prompt">$</span><code class="bash-cmd">${esc(it.command || "")}</code>`;
+  const copy = el("button", "copy-btn", "Копировать");
+  copy.type = "button";
+  copy.onclick = () => copyText(it.command || "", copy);
+  head.appendChild(copy);
+  const body = el("div", "bash-body", '<div class="bash-wait"><span class="spin"></span> выполняется…</div>');
+  n.append(head, body);
+  n._fill = (r) => {
+    const out = String(r.stdout || "");
+    const err = String(r.stderr || "");
+    body.innerHTML = "";
+    if (out.trim()) body.appendChild(el("pre", "bash-out", esc(out)));
+    if (err.trim()) body.appendChild(el("pre", "bash-out err", esc(err)));
+    if (!out.trim() && !err.trim()) body.appendChild(el("div", "bash-empty", "без вывода"));
+    const lines = out.split("\n").length + err.split("\n").length;
+    if (lines > 18) {
+      n.classList.add("long");
+      const more = el("button", "bash-more", `Показать всё · ${lines} строк`);
+      more.type = "button";
+      more.onclick = () => { n.classList.toggle("expanded"); more.textContent = n.classList.contains("expanded") ? "Свернуть" : `Показать всё · ${lines} строк`; };
+      body.appendChild(more);
+    }
+    n.querySelector(".bash-head").classList.toggle("failed", Boolean(err.trim()) && !out.trim());
+  };
+  if (it.kind === "bash_result") { head.querySelector(".bash-cmd").textContent = "(команда выше)"; n._fill(it); n._filled = true; }
+  return n;
+}
+
+function commandNode(it) {
+  const n = el("div", "cmd-chip");
+  n.innerHTML = `<code>${esc(it.kind === "command" ? it.text : "")}</code>`;
+  n._fill = (r) => { if (r.text) n.appendChild(el("span", "cmd-out", esc(r.text.split("\n")[0].slice(0, 160)))); };
+  if (it.kind === "command_result") { n.innerHTML = ""; n._fill(it); n._filled = true; }
+  return n;
+}
+
+function summaryNode(it) {
+  const n = el("details", "summary-card");
+  n.innerHTML = '<summary>Контекст сжат — краткое содержание предыдущей части</summary>';
+  const body = renderMarkdown(String(it.text || "").replace(/^This session is being continued[^\n]*\n+/, ""));
+  body.className = "summary-body";
+  n.appendChild(body);
+  return n;
+}
+
 function itemKey(it) {
   if (it.kind === "tool") return "t:" + it.id;
   if (it.kind === "tool_result") return null;
@@ -440,10 +509,17 @@ function buildBlocks(items, continueFrom, live = false) {
       refreshStepsHead(steps);
       continue;
     }
+    if (it.kind === "bash_result" || it.kind === "command_result") {
+      // Output lands in the card of the command just above it.
+      // Appending live: the command may already be in the thread.
+      const pool = [...frag.children].reverse().concat(live ? [...$("thread").children].slice(-6).reverse() : []);
+      const host = pool.find((n) => n.classList.contains(it.kind === "bash_result" ? "bash-card" : "cmd-chip"));
+      if (host && !host._filled) { host._fill(it); host._filled = true; continue; }
+    }
     steps = null;
-    const node = it.kind === "user" ? userNode(it) : assistantNode(it);
+    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode }[it.kind]?.(it) || assistantNode(it);
     // The transcript copy replaces the pending bubble in place: no re-entry.
-    if (it.kind === "user" && clearPending()) node.classList.add("swap");
+    if ((it.kind === "user" || it.kind === "bash" || it.kind === "command") && clearPending()) node.classList.add("swap");
     frag.appendChild(node);
   }
   return frag;
@@ -476,7 +552,13 @@ function appendItems(items) {
   const thread = $("thread");
   const stick = nearBottom();
   const frag = buildBlocks(items, thread.lastElementChild, true);
-  for (const n of frag.children) if (!n.classList.contains("swap")) n.classList.add("enter");
+  for (const n of frag.children) {
+    if (n.classList.contains("swap")) continue;
+    n.classList.add("enter");
+    if (n.classList.contains("a-msg")) {
+      [...n.firstElementChild.children].slice(0, 12).forEach((p, i) => { p.style.animationDelay = `${i * 70}ms`; p.classList.add("reveal"); });
+    }
+  }
   thread.appendChild(frag);
   markLast();
   autoOpenLive();
@@ -548,6 +630,7 @@ function showHome() {
   $("title-btn").hidden = true;
   $("pane-btn").hidden = true;
   $("sound-btn").hidden = true;
+  $("chat-meta").hidden = true;
   $("pane").hidden = true;
   $("chat-state").innerHTML = "";
   $("working").hidden = true;
@@ -574,6 +657,7 @@ async function openSession(tid) {
   if (location.hash !== `#${tid}`) history.replaceState(null, "", `#${tid}`);
   $("pane-btn").hidden = false;
   $("prompt-card").hidden = true;
+  $("chat-meta").hidden = true;
   renderSessions();
   resetThread('<div class="loader-row">Загружаю…</div>');
   try {
@@ -661,7 +745,9 @@ function renderSessions() {
     if (g !== group) { nav.appendChild(el("div", "group-label", esc(g))); group = g; }
     nav.appendChild(sessionItem(s));
   }
-  if (!list.length) nav.appendChild(el("div", "group-label", f ? "Ничего не нашлось" : "Чатов пока нет"));
+  const hits = state.hits && state.hits.q === state.filter.trim() ? state.hits.results : [];
+  if (hits.length) nav.appendChild(hitsBox(state.hits.q, hits));
+  else if (!list.length) nav.appendChild(el("div", "group-label", f ? "Ничего не нашлось" : "Чатов пока нет"));
   renderHeader();
 }
 
@@ -836,6 +922,20 @@ function soundMenu(s) {
   ];
 }
 
+function effortMenu(s) {
+  return [
+    { heading: "Усилие этой сессии" },
+    ...EFFORTS.filter(([id]) => id).map(([id, label, sub]) => ({
+      label, sub, action: async () => {
+        try {
+          await api(`/api/sessions/${s.thread_id}/send`, { body: { text: `/effort ${id}` } });
+          toast(`Усилие: ${label.toLowerCase()}`);
+        } catch (e) { toast(e.message); }
+      },
+    })),
+  ];
+}
+
 // ═══ pane / prompts ═════════════════════════════════════════════════════════
 const KEYS = [["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"], ["Up", "↑"], ["Down", "↓"], ["Enter", "⏎ Enter"], ["Escape", "Esc"], ["Tab", "Tab"]];
 document.querySelectorAll("[data-keys]").forEach((box) => {
@@ -851,6 +951,58 @@ async function sendKey(key) {
   if (state.current == null) return;
   try { await api(`/api/sessions/${state.current}/key`, { body: { key } }); } catch (e) { toast(e.message); }
   setTimeout(pollPane, 350);
+}
+
+// Numbered choices of a Claude Code prompt ("❯ 1. Yes") become buttons.
+function promptOptions(text) {
+  const opts = [];
+  for (const line of String(text).split("\n")) {
+    const m = line.match(/^\s*(?:[❯›>]\s*)?(\d)\.\s+(.+?)\s*$/);
+    if (m) opts.push({ key: m[1], label: m[2].replace(/\s*\((?:esc|tab)\)\s*$/i, ""), current: /^\s*[❯›>]/.test(line) });
+  }
+  return opts;
+}
+
+function renderPrompt(inter) {
+  $("prompt-title").textContent = inter.name === "AskUserQuestion" ? "Кара задаёт вопрос" : /Permission/i.test(inter.name) ? "Кара просит разрешения" : "Кара ждёт выбора";
+  const opts = promptOptions(inter.content);
+  // Without the option lines the question reads cleaner; the buttons carry them.
+  $("prompt-text").textContent = opts.length
+    ? inter.content.split("\n").filter((l) => !/^\s*(?:[❯›>]\s*)?\d\.\s/.test(l) && !/^\s*Esc to cancel/i.test(l)).join("\n").trim()
+    : inter.content;
+  const sig = opts.map((o) => o.key + o.label).join("|");
+  const box = $("prompt-options");
+  if (box.dataset.sig !== sig) {
+    box.dataset.sig = sig;
+    box.innerHTML = "";
+    for (const o of opts) {
+      const b = el("button", `opt${/^(no|нет)\b/i.test(o.label) ? " no" : o.key === "1" ? " yes" : ""}`, `<span class="k">${o.key}</span><span>${esc(o.label)}</span>`);
+      b.type = "button";
+      b.onclick = () => { box.querySelectorAll("button").forEach((x) => { x.disabled = true; }); sendKey(o.key); };
+      box.appendChild(b);
+    }
+  }
+  $("prompt-keys").open = !opts.length;
+}
+
+const MODEL_NAMES = [[/opus[-_ ]?(\d)[-.](\d)/i, "Opus $1.$2"], [/sonnet[-_ ]?(\d)[-.](\d)/i, "Sonnet $1.$2"], [/haiku[-_ ]?(\d)[-.](\d)/i, "Haiku $1.$2"], [/fable[-_ ]?(\d)[-.](\d)/i, "Fable $1.$2"]];
+function prettyModel(id) {
+  for (const [re, name] of MODEL_NAMES) {
+    const m = id.match(re);
+    if (m) return name.replace("$1", m[1]).replace("$2", m[2]);
+  }
+  return id.replace(/^claude-/, "");
+}
+const kTokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1000)}k`);
+
+function renderMeta(meta) {
+  const box = $("chat-meta");
+  if (!meta || !meta.context) { box.hidden = true; return; }
+  const cap = meta.context > 200000 || /1m/i.test(meta.model) ? 1000000 : 200000;
+  const pct = Math.min(100, Math.round((meta.context / cap) * 100));
+  box.hidden = false;
+  box.title = `${meta.model} · контекст ${meta.context.toLocaleString("ru-RU")} из ${kTokens(cap)} токенов`;
+  box.innerHTML = `<span class="m-name">${esc(prettyModel(meta.model))}</span><span class="ctx${pct >= 80 ? " hot" : ""}"><span class="ctx-bar"><i style="width:${pct}%"></i></span>${kTokens(meta.context)}</span>`;
 }
 
 async function pollPane() {
@@ -869,10 +1021,8 @@ async function pollPane() {
         }
         const inter = data.interactive;
         $("prompt-card").hidden = !inter;
-        if (inter) {
-          $("prompt-title").textContent = inter.name === "AskUserQuestion" ? "Кара задаёт вопрос" : /Permission/i.test(inter.name) ? "Кара просит разрешения" : "Кара ждёт выбора";
-          $("prompt-text").textContent = inter.content;
-        }
+        if (inter) renderPrompt(inter);
+        renderMeta(data.meta);
       }
     } catch (_) { /* transient */ }
   }
@@ -984,7 +1134,8 @@ async function send() {
       $("working").hidden = false;
       $("working-text").textContent = state.telegram ? "Создаю чат и топик…" : "Создаю чат…";
       const c = currentChoice();
-      const res = await api("/api/sessions", { body: { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined } });
+      const effort = c?.provider.id === "claude" && state.effort ? state.effort : undefined;
+      const res = await api("/api/sessions", { body: { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort } });
       clearComposer();
       state.pending.set(res.thread_id, message);
       await refreshSessions();
@@ -1033,7 +1184,7 @@ async function loadModels() {
   }
   const c = currentChoice();
   if (c && c.provider.id !== state.provider) { state.provider = c.provider.id; state.model = ""; }
-  $("model-name").textContent = choiceLabel(c);
+  $("model-name").textContent = choiceLabel(c) + (c?.provider.id === "claude" && state.effort ? ` · ${state.effort}` : "");
 }
 
 function pickModel(provider, model) {
@@ -1050,8 +1201,14 @@ function notify(s, e) {
   if (s && s.sound === "off") return;
   if (!document.hidden && e.thread_id === state.current) return;
   if (e.role !== "assistant" || e.content_type !== "text" || !e.is_complete) return;
-  const n = new Notification(s ? s.name : "Кара", { body: String(e.text).slice(0, 180), tag: `t${e.thread_id}`, icon: "/static/icon.svg" });
-  n.onclick = () => { window.focus(); location.hash = `#${e.thread_id}`; n.close(); };
+  const title = s ? s.name : "Кара";
+  const opts = { body: String(e.text).slice(0, 180), tag: `t${e.thread_id}`, icon: "/static/icon.svg", data: { url: `/#${e.thread_id}` } };
+  navigator.serviceWorker?.ready
+    .then((reg) => reg.showNotification(title, opts))
+    .catch(() => {
+      const n = new Notification(title, opts);
+      n.onclick = () => { window.focus(); location.hash = `#${e.thread_id}`; n.close(); };
+    });
 }
 
 function connect() {
@@ -1254,15 +1411,100 @@ document.addEventListener("drop", (ev) => {
 });
 void dropZone;
 
-$("filter").addEventListener("input", (ev) => { state.filter = ev.target.value; renderSessions(); });
+$("filter").addEventListener("input", (ev) => {
+  state.filter = ev.target.value;
+  renderSessions();
+  clearTimeout(state.searchTimer);
+  state.searchTimer = setTimeout(searchContent, 350);
+});
+
+// Full-text hits below the name matches ("В переписке").
+async function searchContent() {
+  const q = state.filter.trim();
+  if (q.length < 3) return;
+  let data;
+  try { data = await api(`/api/search?q=${encodeURIComponent(q)}`); } catch (_) { return; }
+  if (state.filter.trim() !== q) return;
+  state.hits = { q, results: data.results };
+  renderSessions();
+}
+
+function hitsBox(q, results) {
+  const box = el("div", "search-hits");
+  box.appendChild(el("div", "group-label", "В переписке"));
+  const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "ig");
+  for (const r of data.results) {
+    for (const h of r.hits.slice(0, 2)) {
+      const a = el("a", "hit");
+      a.href = `#${r.thread_id}`;
+      a.innerHTML = `<span class="hit-name">${esc(r.name)}</span><span class="hit-snip">${esc(h.snippet).replace(re, (m) => `<mark>${m}</mark>`)}</span>`;
+      box.appendChild(a);
+    }
+  }
+  return box;
+}
+
+function openSwitcher() {
+  const dlg = $("switcher");
+  const input = $("switcher-input");
+  let sel = 0;
+  const draw = () => {
+    const q = input.value.trim().toLowerCase();
+    const list = state.sessions.filter((s) => !q || s.name.toLowerCase().includes(q)).slice(0, 12);
+    sel = Math.min(sel, Math.max(0, list.length - 1));
+    const box = $("switcher-list");
+    box.innerHTML = "";
+    list.forEach((s, i) => {
+      const a = el("a", `sw-item${i === sel ? " sel" : ""}`, `<span class="dot ${esc(s.state)}"></span><span>${esc(s.name)}</span><span class="muted">${esc(groupOf(s.last_activity))}</span>`);
+      a.href = `#${s.thread_id}`;
+      a.onclick = () => dlg.close();
+      box.appendChild(a);
+    });
+    if (!list.length) box.appendChild(el("div", "sw-empty muted", "Ничего не нашлось"));
+    return list;
+  };
+  input.value = "";
+  let list = draw();
+  input.oninput = () => { sel = 0; list = draw(); };
+  input.onkeydown = (ev) => {
+    if (ev.key === "ArrowDown") { ev.preventDefault(); sel = Math.min(sel + 1, list.length - 1); list = draw(); }
+    else if (ev.key === "ArrowUp") { ev.preventDefault(); sel = Math.max(sel - 1, 0); list = draw(); }
+    else if (ev.key === "Enter" && list[sel]) { ev.preventDefault(); location.hash = `#${list[sel].thread_id}`; dlg.close(); }
+  };
+  dlg.showModal();
+  input.focus();
+}
+$("switcher").addEventListener("click", (ev) => { if (ev.target === $("switcher")) $("switcher").close(); });
 $("collapse-btn").onclick = () => { $("app").classList.add("collapsed"); store.set("kara-collapsed", "1"); };
 $("menu-btn").onclick = () => {
   if (isMobile()) $("app").classList.add("drawer");
   else { $("app").classList.remove("collapsed"); store.set("kara-collapsed", ""); }
 };
 $("scrim").onclick = () => $("app").classList.remove("drawer");
+// Phone: swipe right from the left edge opens the chat list, swipe left closes it.
+(() => {
+  let x0 = null;
+  let y0 = 0;
+  document.addEventListener("touchstart", (ev) => {
+    const t = ev.touches[0];
+    const open = $("app").classList.contains("drawer");
+    x0 = isMobile() && (open || t.clientX < 28) ? t.clientX : null;
+    y0 = t.clientY;
+  }, { passive: true });
+  document.addEventListener("touchend", (ev) => {
+    if (x0 == null) return;
+    const t = ev.changedTouches[0];
+    const dx = t.clientX - x0;
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(t.clientY - y0) * 1.5) $("app").classList.toggle("drawer", dx > 0);
+    x0 = null;
+  }, { passive: true });
+})();
 $("session-list").addEventListener("click", (ev) => { if (ev.target.closest(".s-item") && isMobile()) $("app").classList.remove("drawer"); });
 $("new-btn").onclick = () => { if (isMobile()) $("app").classList.remove("drawer"); };
+$("chat-meta").onclick = () => {
+  const s = currentSession();
+  if (s && s.provider === "claude") openMenu(effortMenu(s), menuBelow($("chat-meta")), $("chat-meta"));
+};
 $("sound-btn").onclick = () => {
   const s = currentSession();
   if (!s) return;
@@ -1319,6 +1561,12 @@ $("model-btn").onclick = async () => {
     }
   }
   if (!items.length) items.push({ label: "Агенты недоступны" });
+  if (c?.provider.id === "claude") {
+    items.push("sep", { heading: "Усилие" });
+    for (const [id, label, sub] of EFFORTS) {
+      items.push({ label, sub, check: state.effort === id, action: () => { state.effort = id; store.set("kara-effort", id); loadModels(); } });
+    }
+  }
   openMenu(items, menuBelow($("model-btn")));
 };
 $("jump-btn").onclick = () => { toBottom(); $("jump-btn").hidden = true; };
@@ -1331,6 +1579,7 @@ $("scroller").addEventListener("scroll", () => {
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { pollPane(); if (state.current != null) scheduleFetch(); } });
 document.addEventListener("keydown", (ev) => {
   if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.code === "KeyO") { ev.preventDefault(); location.hash = "#new"; }
+  if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey && ev.code === "KeyP") { ev.preventDefault(); openSwitcher(); }
 });
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});

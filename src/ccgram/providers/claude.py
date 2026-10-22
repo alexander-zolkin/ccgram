@@ -374,3 +374,18 @@ class ClaudeProvider:
         from ccgram.claude_task_state import claude_task_state
 
         claude_task_state.apply_entries(window_id, session_id, entries)
+
+
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def with_effort(args: str, effort: str | None) -> str:
+    """CCGRAM-HOTFIX:webui-effort — swap the ``--effort`` level in launch args."""
+    if effort not in EFFORT_LEVELS:
+        return args
+    # Lazy: re only needed when an effort is picked.
+    import re
+
+    if re.search(r"--effort\s+\S+", args):
+        return re.sub(r"--effort\s+\S+", f"--effort {effort}", args)
+    return f"{args} --effort {effort}".strip()

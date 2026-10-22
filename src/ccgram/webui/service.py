@@ -401,8 +401,11 @@ async def pane(thread_id: int) -> dict[str, Any]:
     binding = find_binding(thread_id)
     text = await tmux_manager.capture_pane(binding.window_id)
     interactive = extract_interactive_content(text) if text else None
+    tx, _provider = _transcript_for(binding)
+    meta = await asyncio.to_thread(transcript.last_usage, tx) if tx else None
     return {
         "alive": text is not None,
+        "meta": meta,
         "text": text or "",
         "interactive": (
             {"name": interactive.name, "content": interactive.content}
@@ -410,6 +413,44 @@ async def pane(thread_id: int) -> dict[str, Any]:
             else None
         ),
     }
+
+
+SEARCH_MIN_LEN = 3
+SEARCH_MAX_SESSIONS = 20
+
+
+async def search(query: str) -> dict[str, Any]:
+    """Full-text search over the transcripts of every listed session."""
+    needle = " ".join(query.split()).lower()
+    if len(needle) < SEARCH_MIN_LEN:
+        return {"results": []}
+    results: list[dict[str, Any]] = []
+    for s in await list_sessions():
+        binding = find_binding(s["thread_id"])
+        tx, _provider = _transcript_for(binding)
+        if not tx:
+            continue
+        hits = await asyncio.to_thread(transcript.search, tx, needle)
+        if hits:
+            results.append(
+                {"thread_id": s["thread_id"], "name": s["name"], "hits": hits}
+            )
+        if len(results) >= SEARCH_MAX_SESSIONS:
+            break
+    return {"results": results}
+
+
+def upload_file(thread_id: int, rel: str) -> Path:
+    """An uploaded file of a session, only from its ``.ccgram-uploads`` folder."""
+    binding = find_binding(thread_id)
+    cwd = _cwd_for(binding)
+    if not cwd:
+        raise WebUIError("no folder for this session", 404)
+    folder = (Path(cwd) / _UPLOAD_DIR).resolve()
+    path = (Path(cwd) / rel).resolve()
+    if folder not in path.parents or not path.is_file():
+        raise WebUIError("file not found", 404)
+    return path
 
 
 async def rename(bot: Bot, thread_id: int, name: str) -> dict[str, Any]:
@@ -643,6 +684,7 @@ async def create_session(
     name: str | None,
     model: str | None,
     provider: str = "claude",
+    effort: str | None = None,
 ) -> dict[str, Any]:
     """Open a new forum topic and launch a quick-start session bound to it."""
     # Lazy: the launch service drags in the topics handler graph.
@@ -716,6 +758,7 @@ async def create_session(
             mode=QUICKSTART_DEFAULT_MODE,
             pending_text=text if as_arg else None,
             model=model_id,
+            effort=effort,
             chat_id=chat_id,
         ),
     )
@@ -731,7 +774,10 @@ async def create_session(
 
 
 def _web_only_launch(
-    model: str | None, provider_name: str = "claude", text: str = ""
+    model: str | None,
+    provider_name: str = "claude",
+    text: str = "",
+    effort: str | None = None,
 ) -> tuple[str, str, str, Any, bool]:
     """(launch command, provider name, approval mode, provider) for quick-start.
 
@@ -767,6 +813,11 @@ def _web_only_launch(
             model_id = with_1m_context(model_id)
         # Quoted: ids like ``claude-opus-5-5[1m]`` are shell globs.
         args = f"{args} --model {shlex.quote(model_id)}".strip()
+    if effort and provider_name == "claude":
+        # Lazy: provider module is already loaded by the registry above.
+        from ..providers.claude import with_effort
+
+        args = with_effort(args, effort)
     launch = resolve_launch_command(provider_name, approval_mode=mode)
     launch = f"{launch} {args}" if args else launch
     as_arg = bool(text) and provider.capabilities.launch_accepts_initial_prompt
@@ -776,7 +827,11 @@ def _web_only_launch(
 
 
 async def create_web_only_session(
-    text: str, name: str | None, model: str | None = None, provider: str = "claude"
+    text: str,
+    name: str | None,
+    model: str | None = None,
+    provider: str = "claude",
+    effort: str | None = None,
 ) -> dict[str, Any]:
     """Launch a quick-start session with no Telegram topic at all.
 
@@ -809,7 +864,7 @@ async def create_web_only_session(
     if not Path(cwd).is_dir():
         raise WebUIError("default directory missing", 500)
     launch, provider_name, mode, provider, as_arg = _web_only_launch(
-        valid_model(model), provider, text
+        valid_model(model), provider, text, effort
     )
     title = (name or "").strip()[:120] or "веб " + time.strftime("%m-%d %H-%M")
 

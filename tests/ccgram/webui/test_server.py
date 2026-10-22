@@ -46,8 +46,8 @@ def calls(monkeypatch):
             raise service.WebUIError("unknown session", 404)
         return {"messages": [{"role": "user", "text": "hi"}], "total": 1}
 
-    async def fake_create(bot, text, name, model, provider="claude"):
-        log.append(("create", text, name))
+    async def fake_create(bot, text, name, model, provider="claude", effort=None):
+        log.append(("create", text, name) + ((effort,) if effort else ()))
         return {"thread_id": 8, "window_id": "@4", "name": name or "kara"}
 
     async def fake_list():
@@ -165,6 +165,14 @@ async def test_send_and_create(client, calls):
     )
     assert (await resp.json())["thread_id"] == 8
     assert calls == [("send", 7, "hello"), ("create", "go", "demo")]
+    for effort, want in (
+        ("low", ("create", "x", None, "low")),
+        ("bogus", ("create", "x", None)),
+    ):
+        await client.post(
+            "/api/sessions", json={"text": "x", "effort": effort}, headers=POST_HEADERS
+        )
+        assert calls[-1] == want
 
 
 async def test_invalid_json_is_400(client):

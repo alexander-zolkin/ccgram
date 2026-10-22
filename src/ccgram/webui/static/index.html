@@ -58,6 +58,7 @@
         <svg class="chev-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
       </button>
       <span class="spacer"></span>
+      <span id="chat-meta" class="chat-meta" hidden></span>
       <span id="chat-state" class="chat-state"></span>
       <button id="sound-btn" class="icon-btn" title="Уведомления" hidden></button>
       <button id="pane-btn" class="icon-btn" title="Терминал" hidden>
@@ -91,7 +92,8 @@
       <div id="prompt-card" class="prompt-card" hidden>
         <div class="prompt-head"><span class="pulse"></span><b id="prompt-title">Кара ждёт ответа</b></div>
         <pre id="prompt-text"></pre>
-        <div class="keys" data-keys></div>
+        <div id="prompt-options" class="prompt-options"></div>
+        <details id="prompt-keys" class="prompt-keys"><summary>Клавиши</summary><div class="keys" data-keys></div></details>
       </div>
       <div id="working" class="working" hidden>
         <span class="spark"></span><span id="working-text">Кара работает…</span>
@@ -135,6 +137,10 @@
   </form>
 </dialog>
 <div id="toast" class="toast" hidden></div>
+<dialog id="switcher" class="dialog switcher">
+  <input id="switcher-input" type="search" placeholder="Перейти к чату…" autocomplete="off">
+  <div id="switcher-list" class="switcher-list"></div>
+</dialog>
 
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>

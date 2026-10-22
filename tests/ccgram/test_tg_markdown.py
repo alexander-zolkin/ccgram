@@ -75,3 +75,12 @@ def test_partial_overlap_is_ignored_not_corrupted():
     text = "abcdef"
     ents = [E("bold", 0, 4), E("italic", 2, 4)]
     assert md(text, ents) == "**abcd**ef"
+
+
+def test_with_effort_swaps_or_appends():
+    from ccgram.providers.claude import with_effort
+
+    assert with_effort("--effort xhigh --model x", "low") == "--effort low --model x"
+    assert with_effort("", "max") == "--effort max"
+    assert with_effort("--effort xhigh", "bogus") == "--effort xhigh"
+    assert with_effort("--effort xhigh", None) == "--effort xhigh"

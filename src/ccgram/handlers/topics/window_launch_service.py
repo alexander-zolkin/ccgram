@@ -66,6 +66,8 @@ class WindowLaunchRequest:
     # CCGRAM-HOTFIX:model-picker — optional model override for the fresh
     # session; appended as `--model <id>` (claude provider only).
     model: str | None = None
+    # CCGRAM-HOTFIX:webui-effort — reasoning effort for a fresh claude session.
+    effort: str | None = None
     # CCGRAM-HOTFIX:private-session — when True (grok only), the session runs in
     # an isolated private folder with a private GROK_HOME so its files + history
     # stay out of the assistant's scan paths. ``cwd`` is expected to already be
@@ -331,6 +333,11 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         import shlex
 
         fresh_args = f"{fresh_args} --model {shlex.quote(model_id)}".strip()
+    if request.effort and provider_name == "claude":
+        # Lazy: provider module is already loaded by the registry above.
+        from ccgram.providers.claude import with_effort
+
+        fresh_args = with_effort(fresh_args, request.effort)
     if fresh_args:
         launch_command = f"{launch_command} {fresh_args}"
 

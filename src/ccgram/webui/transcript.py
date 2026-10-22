@@ -36,6 +36,58 @@ _PLUMBING = re.compile(
     r"bash-stdout|bash-stderr|user-memory-input)\b"
 )
 _SYNTHETIC_CONTINUE = "Continue from where you left off."
+_TAG = re.compile(
+    r"<(bash-input|bash-stdout|bash-stderr|command-name|command-args|local-command-stdout)>(.*?)</\1>",
+    re.S,
+)
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _tags(text: str) -> dict[str, str]:
+    return {m.group(1): _ANSI.sub("", m.group(2)) for m in _TAG.finditer(text)}
+
+
+def _special_user(text: str, ts: Any, uuid: str) -> list[dict[str, Any]] | None:
+    """``!`` shell runs and slash commands as their own items (None = not one)."""
+    tags = _tags(text)
+    if "bash-input" in tags:
+        return [
+            {
+                "kind": "bash",
+                "command": tags["bash-input"].strip(),
+                "ts": ts,
+                "uuid": uuid,
+            }
+        ]
+    if "bash-stdout" in tags or "bash-stderr" in tags:
+        return [
+            {
+                "kind": "bash_result",
+                "stdout": _clip(tags.get("bash-stdout", "").rstrip(), MAX_FIELD * 3),
+                "stderr": _clip(tags.get("bash-stderr", "").rstrip(), MAX_FIELD),
+                "ts": ts,
+                "uuid": uuid,
+            }
+        ]
+    if "command-name" in tags:
+        name = tags["command-name"].strip()
+        args = tags.get("command-args", "").strip()
+        return [
+            {
+                "kind": "command",
+                "text": f"{name} {args}".strip(),
+                "ts": ts,
+                "uuid": uuid,
+            }
+        ]
+    if "local-command-stdout" in tags:
+        out = tags["local-command-stdout"].strip()
+        return (
+            [{"kind": "command_result", "text": _clip(out), "ts": ts, "uuid": uuid}]
+            if out
+            else []
+        )
+    return None
 
 
 def _clip(text: Any, limit: int = MAX_FIELD) -> str:
@@ -120,13 +172,25 @@ def _result_item(block: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]
     return item
 
 
+def _parse_user_text(
+    entry: dict[str, Any], content: str, ts: Any, uuid: str
+) -> list[dict[str, Any]]:
+    if entry.get("isCompactSummary"):
+        text = _clip(content, MAX_FIELD * 4)
+        return [{"kind": "summary", "text": text, "ts": ts, "uuid": uuid}]
+    if _PLUMBING.match(content):
+        special = _special_user(content, ts, uuid)
+        return special if special is not None else []
+    if content.strip() == _SYNTHETIC_CONTINUE:
+        return []
+    return [{"kind": "user", "text": content, "ts": ts, "uuid": uuid}]
+
+
 def _parse_user(entry: dict[str, Any], content: Any, ts: Any, uuid: str) -> list:
     if entry.get("isMeta"):
         return []
     if isinstance(content, str):
-        if _PLUMBING.match(content) or content.strip() == _SYNTHETIC_CONTINUE:
-            return []
-        return [{"kind": "user", "text": content, "ts": ts, "uuid": uuid}]
+        return _parse_user_text(entry, content, ts, uuid)
     if not isinstance(content, list):
         return []
     items: list[dict[str, Any]] = []
@@ -271,6 +335,78 @@ def read_tail(path: Path, limit: int, before: int | None = None) -> dict[str, An
             items = _parse_lines(body.splitlines()) + items
     merged = _merge_results(items)
     return {"items": merged[-limit:] if limit else merged, "start": start, "end": end}
+
+
+def last_usage(path: Path, window: int = 512 * 1024) -> dict[str, Any] | None:
+    """Model and context size from the newest assistant entry with usage."""
+    try:
+        with path.open("rb") as fh:
+            size = fh.seek(0, 2)
+            fh.seek(max(0, size - window))
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    for raw in reversed(lines):
+        if b'"usage"' not in raw or b'"assistant"' not in raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        msg = entry.get("message") or {}
+        usage = msg.get("usage") or {}
+        if entry.get("type") != "assistant" or entry.get("isSidechain") or not usage:
+            continue
+        context = sum(
+            int(usage.get(k) or 0)
+            for k in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "output_tokens",
+            )
+        )
+        return {"model": msg.get("model") or "", "context": context}
+    return None
+
+
+def search(path: Path, needle: str, limit: int = 3) -> list[dict[str, Any]]:
+    """Up to ``limit`` user/assistant messages containing ``needle`` (lowercase)."""
+    hits: list[dict[str, Any]] = []
+    try:
+        with path.open("rb") as fh:
+            for raw in fh:
+                # Cheap prefilter on the raw line before parsing JSON.
+                if needle not in raw.decode("utf-8", "replace").lower():
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                for it in parse_entry(entry):
+                    text = (
+                        it.get("text") if it["kind"] in ("user", "assistant") else None
+                    )
+                    if not text:
+                        continue
+                    low = text.lower()
+                    at = low.find(needle)
+                    if at < 0:
+                        continue
+                    start = max(0, at - 60)
+                    snippet = text[start : at + len(needle) + 90].replace("\n", " ")
+                    hits.append(
+                        {
+                            "role": it["kind"],
+                            "snippet": ("…" if start else "") + snippet,
+                            "ts": it.get("ts"),
+                        }
+                    )
+                    if len(hits) >= limit:
+                        return hits
+    except OSError:
+        pass
+    return hits
 
 
 def file_size(path: Path) -> int:
