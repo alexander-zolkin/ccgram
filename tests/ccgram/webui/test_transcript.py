@@ -285,3 +285,12 @@ def test_current_turn_reports_prompt_time(tmp_path):
         "start": "2026-10-22T18:44:00.658Z",
         "out": 42,
     }
+
+
+def test_interrupt_ends_the_turn_without_turn_duration(tmp_path):
+    p = tmp_path / "t.jsonl"
+    prompt = _user("сделай", "u1")
+    prompt["timestamp"] = "2026-10-22T18:44:00.658Z"
+    stop = _user([{"type": "text", "text": "[Request interrupted by user]"}], "u2")
+    _write(p, [prompt, _usage([], "a1", "m1", 42), stop])
+    assert transcript.current_turn(p) == {"start": None, "out": 0}

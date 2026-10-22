@@ -573,6 +573,10 @@ function toBottom(smooth = false) {
 
 function appendItems(items) {
   const thread = $("thread");
+  if (state.inflight?.tid === state.current && items.some((it) => it.kind === "turn")) {
+    state.inflight = null;
+    renderHeader();
+  }
   const stick = nearBottom();
   const frag = buildBlocks(items, thread.lastElementChild, true);
   for (const n of frag.children) {
@@ -602,7 +606,7 @@ function autoOpenLive() {
   const s = currentSession();
   const thread = $("thread");
   const last = thread.lastElementChild;
-  if (last && last.classList.contains("steps") && s && s.state === "active") last.classList.add("open");
+  if (last && last.classList.contains("steps") && turnRunning(s)) last.classList.add("open");
 }
 
 function resetThread(html) {
@@ -933,9 +937,10 @@ function renderHeader() {
   $("title-btn").hidden = false;
   if (!$("chat-name").querySelector("input")) $("chat-name").textContent = s.name;
   $("chat-badge").hidden = !s.web_only;
-  const label = STATE_LABEL[s.state] || "";
-  $("chat-state").innerHTML = label ? `<span class="dot ${esc(s.state)}"></span><span>${esc(label)}</span>` : "";
-  const working = s.state === "active";
+  const working = turnRunning(s);
+  const shown = working && s.state === "idle" ? "active" : s.state;
+  const label = STATE_LABEL[shown] || "";
+  $("chat-state").innerHTML = label ? `<span class="dot ${esc(shown)}"></span><span>${esc(label)}</span>` : "";
   $("working").hidden = !working;
   renderSoundBtn(s);
   $("gone-card").hidden = !s.topic_deleted;
@@ -980,7 +985,7 @@ function setLed(mode) {
 
 function updateLed() {
   const s = currentSession();
-  setLed(!s ? "idle" : !$("prompt-card").hidden ? "attention" : s.state === "active" ? "working" : "idle");
+  setLed(!s ? "idle" : !$("prompt-card").hidden ? "attention" : turnRunning(s) ? "working" : "idle");
 }
 
 // ═══ notifications per chat ═════════════════════════════════════════════════
@@ -1159,6 +1164,7 @@ async function pollPane() {
           else pre.textContent = data.alive ? data.text.replace(/\s+$/, "") : "(сессия спит)";
           if (stick) pre.scrollTop = pre.scrollHeight;
         }
+        state.lastLive = { tid, live };
         renderLive(live, s);
         if (s.provider === "claude" && (!state.modeAt || Date.now() - state.modeAt > 15000)) refreshMode(tid);
         const inter = data.interactive;
@@ -1179,7 +1185,7 @@ async function pollPane() {
       }
     } catch (_) { /* transient */ }
   }
-  const fast = !document.hidden && (!$("pane").hidden || (s && s.state === "active") || !$("prompt-card").hidden);
+  const fast = !document.hidden && (!$("pane").hidden || turnRunning(s) || !$("prompt-card").hidden);
   state.paneTimer = setTimeout(pollPane, fast ? 2000 : 6000);
 }
 
@@ -1265,7 +1271,8 @@ async function sendTo(tid, message, node) {
     p.querySelector(".tick").innerHTML = TICK.sent;
     p.dataset.sent = "1";
     refreshMsgStatus();
-    if (s) { s.state = "active"; renderHeader(); }
+    startInflight(tid);
+    renderHeader();
   } catch (e) {
     state.pending.delete(tid);
     p.classList.add("failed");
@@ -1295,6 +1302,7 @@ async function send() {
       if (state.worktree) { state.worktree = false; renderCwd(); }
       clearComposer();
       state.pending.set(res.thread_id, message);
+      startInflight(res.thread_id);
       await refreshSessions();
       location.hash = `#${res.thread_id}`;
       return;
@@ -1916,6 +1924,22 @@ async function probeTopic(tid) {
 }
 
 // ═══ live status: what the agent is doing right now ═════════════════════════
+// Is a turn running? The session list lags (Telegram topics repaint on a
+// debounce, short turns never show "active"), so also trust the spinner on
+// the pane and a message just sent from here until its turn is seen to end.
+const INFLIGHT_MS = 120000;
+function turnRunning(s) {
+  if (!s) return false;
+  if (s.state === "active") return true;
+  const l = state.lastLive;
+  if (l && l.tid === s.thread_id && l.live && l.live.status) return true;
+  const f = state.inflight;
+  return Boolean(f && f.tid === s.thread_id && Date.now() - f.at < INFLIGHT_MS);
+}
+function startInflight(tid) {
+  state.inflight = { tid, at: Date.now(), seen: false };
+  state.turnClock = { tid, start: Date.now(), out: 0 };
+}
 const STATUS_RU = [[/^(reading|read)\b/i, "Читает"], [/^(writing|write)\b/i, "Пишет"], [/^(editing|edit)\b/i, "Правит"], [/^(searching|search|grep)/i, "Ищет"], [/^(running|bash|execut)/i, "Выполняет"], [/^(thinking|reason)/i, "Думает"], [/^(testing|test)/i, "Тестирует"], [/^fetch/i, "Загружает"]];
 // "still thinking with xhigh effort" → "всё ещё думает · усилие xhigh"
 function thinkRu(part) {
@@ -1965,7 +1989,13 @@ setInterval(tickWork, 1000);
 
 function renderLive(live, s) {
   const box = $("live");
-  const working = s && s.state === "active";
+  const f = state.inflight;
+  if (f && s && f.tid === s.thread_id && live) {
+    if (live.status) f.seen = true;
+    else if (f.seen) state.inflight = null; // the spinner came and went: turn over
+  }
+  const working = turnRunning(s);
+  if ($("working").hidden === working) renderHeader();
   if (!working) state.turnClock = null;
   if (!live || !working) { box.hidden = true; if (working) $("working-text").textContent = "Кара работает…"; tickWork(); refreshMsgStatus(); return; }
   const status = parseStatus(live.status);
@@ -2253,7 +2283,7 @@ function refreshMsgStatus() {
     const s = currentSession();
     let answered = false;
     for (let n = last.nextElementSibling; n; n = n.nextElementSibling) if (n.classList.contains("a-msg")) { answered = true; break; }
-    if (s && s.state === "active" && !answered) st = "working";
+    if (turnRunning(s) && !answered) st = "working";
   }
   last.classList.add("latest");
   last.dataset.status = st;

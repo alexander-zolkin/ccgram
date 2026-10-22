@@ -301,6 +301,23 @@ def _turn_end(entry: dict[str, Any]) -> bool:
     return entry.get("type") == "system" and entry.get("subtype") == "turn_duration"
 
 
+_INTERRUPTED = "[Request interrupted by user"
+
+
+def _interrupted(entry: dict[str, Any]) -> bool:
+    """Esc in Claude Code: the turn ends without a ``turn_duration`` entry."""
+    if entry.get("type") != "user" or entry.get("isSidechain"):
+        return False
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, list):
+        content = " ".join(
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return isinstance(content, str) and content.lstrip().startswith(_INTERRUPTED)
+
+
 def _is_prompt(entry: dict[str, Any], items: list[dict[str, Any]]) -> bool:
     return entry.get("type") == "user" and any(
         it["kind"] in _PROMPT_KINDS for it in items
@@ -335,7 +352,7 @@ def _turn_back(path: Path, offset: int) -> _Turn:
                     continue
                 if not isinstance(entry, dict):
                     continue
-                if _turn_end(entry):
+                if _turn_end(entry) or _interrupted(entry):
                     turn.complete = True
                     return turn
                 if _is_prompt(entry, parse_entry(entry)):
@@ -450,7 +467,9 @@ def _parse_lines(
             turn = _Turn(complete=True)
             continue
         parsed = parse_entry(entry)
-        if _is_prompt(entry, parsed):
+        if _interrupted(entry):
+            turn = _Turn(complete=True)
+        elif _is_prompt(entry, parsed):
             turn = _Turn(complete=True, start=entry.get("timestamp"))
         turn.add(entry)
         items.extend(parsed)
