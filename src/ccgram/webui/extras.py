@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -183,6 +184,9 @@ async def probe_topic(bot: Any, thread_id: int) -> dict[str, Any]:
 
 # ── live status / subagents / todos / mode ───────────────────────────────────
 
+_RULE = re.compile(r"^\s*─{8,}\s*$")
+_SPINNER_LINE = re.compile(r"^\s*[·✻✽✶✳✢*]\s+(\S.*….*)$")
+
 
 async def pane_status(window_id: str) -> str | None:
     """The status block read straight off a pane no topic poller watches.
@@ -198,7 +202,19 @@ async def pane_status(window_id: str) -> str | None:
     if not text or extract_interactive_content(text):
         return None
     block = parse_status_block(text)
-    return block if block and "…" in block.split("\n", 1)[0] else None
+    if block and "…" in block.split("\n", 1)[0]:
+        return block
+    # Frames the parser skips: a plain "*" spinner, or a "⎿ Tip:" line wedged
+    # between the status and the input box.
+    lines = text.rstrip().split("\n")
+    rules = [i for i, line in enumerate(lines) if _RULE.match(line)]
+    box_top = rules[-2:-1]  # the input box is framed by two rules
+    if not box_top:
+        return None
+    for line in reversed(lines[max(0, box_top[0] - 6) : box_top[0]]):
+        if m := _SPINNER_LINE.match(line):
+            return m.group(1).strip()
+    return None
 
 
 async def live(thread_id: int) -> dict[str, Any]:

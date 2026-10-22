@@ -109,8 +109,11 @@ async def test_pane_status_counts_only_a_running_spinner():
     panes = {
         "@1": "● Пишу ответ\n✻ Pondering… (12s · ↓ 1.2k tokens)" + chrome,
         "@2": "● Готово\n✻ Baked for 19s · done 9:42 PM" + chrome,
+        "@3": "● Стих\n* Zesting… (52s · ↓ 4.3k tokens)\n  ⎿  Tip: Use /permissions"
+        + chrome,
     }
     capture = AsyncMock(side_effect=lambda wid: panes[wid])
     with patch("ccgram.multiplexer.multiplexer", capture_pane=capture):
         assert await extras.pane_status("@1") == "Pondering… (12s · ↓ 1.2k tokens)"
         assert await extras.pane_status("@2") is None
+        assert await extras.pane_status("@3") == "Zesting… (52s · ↓ 4.3k tokens)"
