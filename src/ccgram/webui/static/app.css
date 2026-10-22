@@ -128,7 +128,7 @@ input:focus { border-color: var(--accent); }
 .conn.on { background: var(--ok); }
 .scrim { display: none; }
 
-.main { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
+.main { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; overflow-x: hidden; }
 .topbar { display: flex; align-items: center; gap: 4px; padding: calc(8px + env(safe-area-inset-top)) 12px 8px; min-height: 52px; }
 .show-collapsed { display: none; }
 .app.collapsed .show-collapsed { display: inline-grid; }
@@ -384,6 +384,12 @@ input:focus { border-color: var(--accent); }
   .title-btn { max-width: 52vw; }
   .chat-state span:last-child { display: none; }
   .chat-meta .m-name { display: none; }
+  .chat-meta .ctx-bar { display: none; }
+  .chat-meta { padding: 4px; margin: 0; }
+  .topbar { gap: 0; padding-left: 6px; padding-right: 6px; }
+  .topbar .spacer { flex: 0 0 4px; }
+  .title-btn { max-width: none; flex: 1 1 auto; min-width: 0; }
+  .topbar .icon-btn { flex: none; }
   .app.home-mode .dock { padding-bottom: 14vh; }
   /* iOS Safari zooms into any focused field under 16px. */
   input, textarea, .composer textarea, .search-wrap input, .rename-input { font-size: 16px; }
