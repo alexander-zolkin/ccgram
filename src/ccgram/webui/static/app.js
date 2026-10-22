@@ -2848,7 +2848,7 @@ function renderPending(p) {
         ? `<button type="button" class="icon-btn small" data-act="open" data-tip="Открыть чат по этому делу">${HUB_ICON.chat}</button>`
         : `<button type="button" class="icon-btn small" data-act="start" data-tip="Взяться — новый чат с контекстом дела">${HUB_ICON.start}</button>`;
       return `<li class="pend ${cls}" data-id="${it.id}"><span class="pdate"><b>${d}.${m}</b><span>${dueRu(it.days)}</span></span>
-        <span class="pbody"><span class="ptext">${inlineMd(it.text)}</span>${chat ? `<a class="hub-chip pchat" href="#${chat.thread_id}"><span class="dot ${esc(chat.state)}"></span>${esc(chat.name)}${STATE_LABEL[chat.state] ? `<span class="muted">· ${esc(STATE_LABEL[chat.state])}</span>` : ""}</a>` : ""}</span>
+        <span class="pbody"><span class="ptext">${inlineMd(it.text)}</span>${chat ? `<a class="hub-chip pchat" href="#${chat.thread_id}"><span class="dot ${esc(chat.state)}"></span><span class="pchat-name">${esc(chat.name)}</span>${STATE_LABEL[chat.state] ? `<span class="muted">· ${esc(STATE_LABEL[chat.state])}</span>` : ""}</a>` : ""}</span>
         <span class="pacts">${go}<button type="button" class="icon-btn small" data-act="done" data-tip="Сделано — убрать в архив">${HUB_ICON.done}</button><button type="button" class="icon-btn small" data-act="later" data-tip="Отложить">${HUB_ICON.later}</button></span></li>`;
     }).join("")}</ul>` : '<div class="hub-empty">Обещанных дел нет — всё закрыто.</div>'}`;
   card.querySelectorAll(".ptext").forEach((t) => { t.onclick = (ev) => { if (!ev.target.closest("a")) t.classList.toggle("open"); }; });

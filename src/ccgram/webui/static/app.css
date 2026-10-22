@@ -616,7 +616,8 @@ input:focus { border-color: var(--accent); }
 .pchat { align-self: flex-start; font-size: 12.5px; padding: 2px 10px 2px 9px; }
 .pchat .dot { flex: none; }
 .pchat .dot:not(.idle):not(.active) { background: var(--faint); }
-.pchat .muted { color: var(--muted); }
+.pchat .pchat-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.pchat .muted { flex: none; color: var(--muted); }
 .pacts [data-act="start"]:hover, .pacts [data-act="open"]:hover { color: var(--accent); }
 .icon-btn.busy svg { animation: pulse 1.2s infinite; }
 .ptext { flex: 1; min-width: 0; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
@@ -708,6 +709,7 @@ body.sheet-open { overflow: hidden; }
   .hub-sub .wide { display: none; }
   .hub-card { padding: 12px 14px 10px; }
   .pdate { width: 66px; }
+  .pchat .muted { display: none; }  /* the dot tells the state; the name needs the room */
   .rstat { max-width: 42%; }
   .sheet { padding: 0; }
   .sheet-panel { border-radius: 0; padding-top: env(safe-area-inset-top); }
