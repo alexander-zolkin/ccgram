@@ -40,9 +40,22 @@ async function api(path, opts = {}) {
 function toast(text) {
   const t = $("toast");
   t.textContent = text;
+  t.classList.remove("out");
   t.hidden = false;
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { t.hidden = true; }, 3500);
+  toast.timer = setTimeout(() => {
+    t.classList.add("out");
+    toast.timer = setTimeout(() => { t.hidden = true; t.classList.remove("out"); }, 200);
+  }, 3500);
+}
+
+const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// Restart a one-shot CSS animation class on an element.
+function replay(node, cls) {
+  node.classList.remove(cls);
+  void node.offsetWidth;
+  node.classList.add(cls);
 }
 
 const shortPath = (p) => {
@@ -72,6 +85,9 @@ const SVG = {
   term: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>',
   sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
   bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10 21h4"/></svg>',
+  bellOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8.7 3.6A6 6 0 0 1 18 8c0 3 .6 5 1.3 6.4M17 17H3s3-2 3-9c0-.6.1-1.2.3-1.8M10 21h4M3 3l18 18"/></svg>',
+  bellRing: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10 21h4M2.5 7.5A9 9 0 0 1 5 3M21.5 7.5A9 9 0 0 0 19 3"/></svg>',
+  bellAuto: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10 21h4"/><path d="M10 12.5l2-5 2 5M10.6 11h2.8" stroke-width="1.5"/></svg>',
   out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>',
   chev: '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>',
 };
@@ -91,6 +107,7 @@ function openMenu(items, at, owner) {
     menu.appendChild(node);
   }
   menu.hidden = false;
+  replay(menu, "pop");
   const { width, height } = menu.getBoundingClientRect();
   let x = at.x;
   let y = at.y;
@@ -293,7 +310,7 @@ function refreshStepsHead(block) {
 
 function stepsBlock() {
   const block = el("div", "steps");
-  block.innerHTML = '<div class="steps-head"></div><div class="steps-body"></div>';
+  block.innerHTML = '<div class="steps-head"></div><div class="steps-body"><div class="steps-inner"></div></div>';
   block.querySelector(".steps-head").onclick = () => block.classList.toggle("open");
   return block;
 }
@@ -336,7 +353,40 @@ function userNode(it) {
     n.appendChild(att);
   }
   if (text) { const md = renderMarkdown(text); md.className = "u-md"; n.appendChild(md); }
+  n.appendChild(el("div", "u-meta", `<span class="msg-time">${esc(hhmm(it.ts))}</span><span class="tick">${TICK.read}</span>`));
   return n;
+}
+
+const TICK = {
+  clock: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.2 1.4"/></svg>',
+  sent: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>',
+  read: '<svg viewBox="0 0 20 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1.5 8.5l3 3 7-7M8.5 11.5l7-7"/></svg>',
+};
+
+// A just-sent message: shown at once, before the server answers (Telegram style).
+function pendingNode(text) {
+  const n = userNode({ text });
+  n.classList.add("pending");
+  n.querySelector(".msg-time").textContent = hhmm(Date.now());
+  n.querySelector(".tick").innerHTML = TICK.clock;
+  return n;
+}
+
+// The bubble flies up out of the composer into its place in the thread.
+function flyIn(node) {
+  if (reducedMotion() || !node.animate) return;
+  const from = $("input").getBoundingClientRect();
+  const to = node.getBoundingClientRect();
+  const dx = Math.min(0, from.left - to.left);
+  const dy = from.top - to.top;
+  node.animate(
+    [
+      { transform: `translate(${dx}px, ${dy}px) scale(.94)`, opacity: 0 },
+      { opacity: 1, offset: 0.35 },
+      { transform: "none", opacity: 1 },
+    ],
+    { duration: 380, easing: "cubic-bezier(.2,.9,.25,1)" },
+  );
 }
 
 function assistantNode(it) {
@@ -357,7 +407,7 @@ function itemKey(it) {
   return it.uuid ? `${it.kind}:${it.uuid}` : null;
 }
 
-function buildBlocks(items, continueFrom) {
+function buildBlocks(items, continueFrom, live = false) {
   const frag = document.createDocumentFragment();
   let steps = continueFrom && continueFrom.classList.contains("steps") ? continueFrom : null;
   for (const it of items) {
@@ -381,21 +431,26 @@ function buildBlocks(items, continueFrom) {
       if (it.kind === "tool") {
         const node = stepNode(it);
         state.steps.set(it.id, node);
-        steps.querySelector(".steps-body").appendChild(node);
+        if (live) node.classList.add("enter");
+        steps.querySelector(".steps-inner").appendChild(node);
       }
       refreshStepsHead(steps);
       continue;
     }
     steps = null;
-    if (it.kind === "user") clearPending();
-    frag.appendChild(it.kind === "user" ? userNode(it) : assistantNode(it));
+    const node = it.kind === "user" ? userNode(it) : assistantNode(it);
+    // The transcript copy replaces the pending bubble in place: no re-entry.
+    if (it.kind === "user" && clearPending()) node.classList.add("swap");
+    frag.appendChild(node);
   }
   return frag;
 }
 
 function clearPending() {
-  $("thread").querySelector(".u-msg.pending")?.remove();
+  const p = $("thread").querySelector(".u-msg.pending:not(.failed)");
+  p?.remove();
   if (state.current != null) state.pending.delete(state.current);
+  return Boolean(p);
 }
 
 function markLast() {
@@ -409,15 +464,20 @@ function nearBottom() {
   const s = $("scroller");
   return s.scrollHeight - s.scrollTop - s.clientHeight < 160;
 }
-function toBottom() { const s = $("scroller"); s.scrollTop = s.scrollHeight; }
+function toBottom(smooth = false) {
+  const s = $("scroller");
+  s.scrollTo({ top: s.scrollHeight, behavior: smooth && !reducedMotion() ? "smooth" : "auto" });
+}
 
 function appendItems(items) {
   const thread = $("thread");
   const stick = nearBottom();
-  thread.appendChild(buildBlocks(items, thread.lastElementChild));
+  const frag = buildBlocks(items, thread.lastElementChild, true);
+  for (const n of frag.children) if (!n.classList.contains("swap")) n.classList.add("enter");
+  thread.appendChild(frag);
   markLast();
   autoOpenLive();
-  if (stick) toBottom(); else if (items.length) $("jump-btn").hidden = false;
+  if (stick) toBottom(true); else if (items.length) $("jump-btn").hidden = false;
 }
 
 function prependItems(items) {
@@ -481,8 +541,10 @@ function showHome() {
   $("home").hidden = false;
   resetThread("");
   $("greet-text").textContent = greeting();
+  loadDraft();
   $("title-btn").hidden = true;
   $("pane-btn").hidden = true;
+  $("sound-btn").hidden = true;
   $("pane").hidden = true;
   $("chat-state").innerHTML = "";
   $("working").hidden = true;
@@ -490,7 +552,7 @@ function showHome() {
   $("tg-toggle").hidden = false;
   $("model-btn").hidden = false;
   $("input").placeholder = "Как я могу помочь?";
-  document.title = "Кара";
+  setTitle("Кара");
   renderToggle();
   renderSessions();
   loadModels();
@@ -505,6 +567,7 @@ async function openSession(tid) {
   $("input").placeholder = "Ответить Каре…";
   state.current = tid;
   state.unread.delete(tid);
+  loadDraft();
   if (location.hash !== `#${tid}`) history.replaceState(null, "", `#${tid}`);
   $("pane-btn").hidden = false;
   $("prompt-card").hidden = true;
@@ -519,7 +582,8 @@ async function openSession(tid) {
     resetThread(state.structured && data.start > 0 ? '<div class="loader-row">Загружаю ранние сообщения при прокрутке…</div>' : "");
     $("thread").appendChild(buildBlocks(data.items, null));
     const pending = state.pending.get(tid);
-    if (pending) { const p = userNode({ text: pending }); p.classList.add("pending"); $("thread").appendChild(p); }
+    if (pending) { const p = pendingNode(pending); p.querySelector(".tick").innerHTML = TICK.sent; $("thread").appendChild(p); }
+    replay($("thread"), "fade");
     markLast();
     autoOpenLive();
     if (location.search.includes("expand")) {
@@ -708,9 +772,65 @@ function renderHeader() {
   $("chat-state").innerHTML = label ? `<span class="dot ${esc(s.state)}"></span><span>${esc(label)}</span>` : "";
   const working = s.state === "active";
   $("working").hidden = !working;
+  renderSoundBtn(s);
   $("gone-card").hidden = !s.topic_deleted;
   $("disclaimer").textContent = s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
-  document.title = `${working ? "⏳ " : ""}${s.name} — Кара`;
+  setTitle(`${working ? "⏳ " : ""}${s.name} — Кара`);
+}
+
+function setTitle(base) {
+  const n = state.unread.size;
+  document.title = n ? `(${n}) ${base}` : base;
+}
+
+// ═══ notifications per chat ═════════════════════════════════════════════════
+// "auto": Telegram copies are silent while the chat is driven from here;
+// "on"/"off": always ring / never ring. "off" also mutes browser notifications.
+function soundInfo(s) {
+  const mode = s.sound || "auto";
+  if (s.web_only) return mode === "off" ? { icon: SVG.bellOff, title: "Уведомления выключены" } : { icon: SVG.bell, title: "Уведомления включены" };
+  if (mode === "on") return { icon: SVG.bellRing, title: "Telegram: всегда со звуком" };
+  if (mode === "off") return { icon: SVG.bellOff, title: "Без звука — ни в Telegram, ни в браузере" };
+  return { icon: SVG.bellAuto, title: s.quiet_now ? "Авто: сейчас тихо — ты пишешь из веба" : "Авто: со звуком" };
+}
+
+function renderSoundBtn(s) {
+  const b = $("sound-btn");
+  b.hidden = s.sound === undefined; // backend without sound modes
+  const info = soundInfo(s);
+  if (b.dataset.mode !== `${s.sound}|${s.quiet_now}|${s.web_only}`) {
+    b.dataset.mode = `${s.sound}|${s.quiet_now}|${s.web_only}`;
+    b.innerHTML = info.icon;
+  }
+  b.title = info.title;
+  b.classList.toggle("muted-bell", s.sound === "off");
+}
+
+async function setSound(s, mode) {
+  const prev = s.sound;
+  s.sound = mode;
+  renderHeader();
+  replay($("sound-btn"), "ring");
+  try {
+    await api(`/api/sessions/${s.thread_id}/sound`, { body: { mode } });
+    toast(soundInfo(s).title);
+  } catch (e) { s.sound = prev; renderHeader(); toast(e.message); }
+}
+
+function soundMenu(s) {
+  const mode = s.sound || "auto";
+  if (s.web_only) {
+    return [
+      { label: "Уведомления включены", icon: SVG.bell, check: mode !== "off", action: () => setSound(s, "auto") },
+      { label: "Без уведомлений", icon: SVG.bellOff, check: mode === "off", action: () => setSound(s, "off") },
+    ];
+  }
+  return [
+    { heading: "Уведомления этого чата" },
+    { label: "Авто", sub: "Тихо в Telegram, пока пишешь отсюда", icon: SVG.bellAuto, check: mode === "auto", action: () => setSound(s, "auto") },
+    { label: "Всегда со звуком", sub: "Telegram звенит на каждый ответ", icon: SVG.bellRing, check: mode === "on", action: () => setSound(s, "on") },
+    { label: "Без звука", sub: "Ни Telegram, ни браузер не беспокоят", icon: SVG.bellOff, check: mode === "off", action: () => setSound(s, "off") },
+  ];
 }
 
 // ═══ pane / prompts ═════════════════════════════════════════════════════════
@@ -807,10 +927,48 @@ function composeMessage() {
   return [...files, text].filter(Boolean).join("\n\n");
 }
 
+const draftKey = () => `kara-draft-${state.current ?? "new"}`;
+function loadDraft() {
+  $("input").value = store.get(draftKey()) || "";
+  autosize();
+}
+
 function clearComposer() {
   $("input").value = "";
+  store.set(draftKey(), "");
   state.attachments = [];
   renderAttachments();
+}
+
+async function sendTo(tid, message, node) {
+  const s = sessionById(tid);
+  const p = node || pendingNode(message);
+  if (!node) {
+    $("thread").appendChild(p);
+    toBottom();
+    flyIn(p);
+  }
+  p.classList.remove("failed");
+  p.querySelector(".retry")?.remove();
+  p.querySelector(".tick").innerHTML = TICK.clock;
+  state.pending.set(tid, message);
+  if (s && s.state === "dead") { $("working").hidden = false; $("working-text").textContent = "Бужу сессию…"; }
+  try {
+    await api(`/api/sessions/${tid}/send`, { body: { text: message } });
+    p.querySelector(".tick").innerHTML = TICK.sent;
+    if (s) { s.state = "active"; renderHeader(); }
+  } catch (e) {
+    state.pending.delete(tid);
+    p.classList.add("failed");
+    p.querySelector(".tick").textContent = "!";
+    const retry = el("button", "retry", "Не отправлено · Повторить");
+    retry.type = "button";
+    retry.onclick = () => sendTo(tid, message, p);
+    p.appendChild(retry);
+    toast(`❌ ${e.message}`);
+  } finally {
+    $("working-text").textContent = "Кара работает…";
+  }
 }
 
 async function send() {
@@ -830,16 +988,9 @@ async function send() {
       location.hash = `#${res.thread_id}`;
       return;
     }
-    const s = currentSession();
-    if (s && s.state === "dead") { $("working").hidden = false; $("working-text").textContent = "Бужу сессию…"; }
-    await api(`/api/sessions/${state.current}/send`, { body: { text: message } });
     clearComposer();
-    const p = userNode({ text: message });
-    p.classList.add("pending");
-    $("thread").appendChild(p);
-    state.pending.set(state.current, message);
-    toBottom();
-    if (s) { s.state = "active"; renderHeader(); }
+    sendTo(state.current, message); // optimistic: the composer frees up at once
+    return;
   } catch (e) {
     toast(`❌ ${e.message}`);
   } finally {
@@ -893,6 +1044,7 @@ function pickModel(provider, model) {
 // ═══ live events ════════════════════════════════════════════════════════════
 function notify(s, e) {
   if (!("Notification" in window) || Notification.permission !== "granted") return;
+  if (s && s.sound === "off") return;
   if (!document.hidden && e.thread_id === state.current) return;
   if (e.role !== "assistant" || e.content_type !== "text" || !e.is_complete) return;
   const n = new Notification(s ? s.name : "Кара", { body: String(e.text).slice(0, 180), tag: `t${e.thread_id}`, icon: "/static/icon.svg" });
@@ -916,7 +1068,7 @@ function connect() {
       if (prev !== now) { autoOpenLive(); if (now === "idle") scheduleFetch(); }
     } else if (e.type === "message") {
       if (e.thread_id === state.current) scheduleFetch();
-      else if (e.role === "assistant" && e.content_type === "text" && e.is_complete) { state.unread.add(e.thread_id); renderSessions(); }
+      else if (e.role === "assistant" && e.content_type === "text" && e.is_complete) { state.unread.add(e.thread_id); renderSessions(); if (state.current == null) setTitle("Кара"); }
       notify(sessionById(e.thread_id), e);
     } else if (e.type === "resync" && state.current != null) {
       openSession(state.current);
@@ -983,7 +1135,7 @@ $("login-form").onsubmit = async (ev) => {
 };
 window.addEventListener("hashchange", route);
 $("composer").onsubmit = (ev) => { ev.preventDefault(); send(); };
-$("input").addEventListener("input", autosize);
+$("input").addEventListener("input", () => { autosize(); store.set(draftKey(), $("input").value); });
 $("input").addEventListener("keydown", (ev) => {
   if (handleFormatKey(ev)) return;
   if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing && !isMobile()) { ev.preventDefault(); send(); }
@@ -1108,6 +1260,12 @@ $("menu-btn").onclick = () => {
 $("scrim").onclick = () => $("app").classList.remove("drawer");
 $("session-list").addEventListener("click", (ev) => { if (ev.target.closest(".s-item") && isMobile()) $("app").classList.remove("drawer"); });
 $("new-btn").onclick = () => { if (isMobile()) $("app").classList.remove("drawer"); };
+$("sound-btn").onclick = () => {
+  const s = currentSession();
+  if (!s) return;
+  const r = $("sound-btn").getBoundingClientRect();
+  openMenu(soundMenu(s), { x: r.right - 260, y: r.bottom + 4, top: r.top }, $("sound-btn"));
+};
 $("pane-btn").onclick = () => { $("pane").hidden = !$("pane").hidden; pollPane(); };
 $("stop-btn").onclick = () => sendKey("Escape");
 $("gone-keep").onclick = async () => {
@@ -1169,7 +1327,7 @@ $("scroller").addEventListener("scroll", () => {
 });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { pollPane(); if (state.current != null) scheduleFetch(); } });
 document.addEventListener("keydown", (ev) => {
-  if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.key.toLowerCase() === "o") { ev.preventDefault(); location.hash = "#new"; }
+  if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.code === "KeyO") { ev.preventDefault(); location.hash = "#new"; }
 });
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
