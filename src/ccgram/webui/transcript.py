@@ -470,6 +470,60 @@ def daily_stats(path: Path, since: float, until: float) -> dict[str, dict[str, i
     return {day: {"out": t.tokens, "turns": n[0]} for day, (t, n) in days.items()}
 
 
+def _dialog_items(
+    raw: bytes, since: float, until: float
+) -> list[dict[str, Any]] | None:
+    """Texts said on one line; None once the line is older than ``since``."""
+    if b'"user"' not in raw and b'"assistant"' not in raw:
+        return []
+    stamp = _TS.search(raw)
+    when = _epoch(stamp.group(1)) if stamp else None
+    if when is None or when >= until:
+        return []
+    if when < since:
+        return None
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(entry, dict):
+        return []
+    return [
+        {"role": it["kind"], "text": it["text"], "ts": when}
+        for it in parse_entry(entry)
+        if it["kind"] in ("user", "assistant") and it.get("text")
+    ]
+
+
+def day_dialog(
+    path: Path, since: float, until: float, max_items: int = 400
+) -> list[dict[str, Any]]:
+    """What was said between ``since`` and ``until``: user / assistant texts, in order."""
+    out: list[dict[str, Any]] = []
+    size = file_size(path)
+    try:
+        fh = path.open("rb")
+    except OSError:
+        return []
+    with fh:
+        carry = b""
+        pos = size
+        while pos > 0 and size - pos < WEEK_BACK and len(out) < max_items:
+            new = max(0, pos - CHUNK)
+            fh.seek(new)
+            lines = (fh.read(pos - new) + carry).split(b"\n")
+            pos = new
+            carry = lines.pop(0) if new > 0 else b""
+            for raw in reversed(lines):
+                items = _dialog_items(raw, since, until)
+                if items is None:
+                    pos = 0
+                    break
+                out.extend(reversed(items))
+    out.reverse()
+    return out[-max_items:]
+
+
 def _merge_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fold tool_result items into their tool call when both are present."""
     calls = {it["id"]: it for it in items if it["kind"] == "tool" and it.get("id")}

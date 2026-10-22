@@ -2549,6 +2549,7 @@ const HUB_ICON = {
   done: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L19.5 7"/></svg>',
   happened: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg>',
   usage: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
+  diary: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h11a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6z"/><path d="M6 3v18M10 8h5M10 12h5"/></svg>',
   later: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="13" r="7.5"/><path d="M12 9.5V13l2.5 1.5M5 4L2.5 6.5M19 4l2.5 2.5"/></svg>',
 };
 
@@ -2600,6 +2601,8 @@ function applyHub(data) {
   renderPending(data.pending);
   renderHappened(data.happened, data.pending);
   renderUsage(data.usage);
+  $("hub-diary").hidden = !data.diary;
+  if (data.diary) initDiary();
   if (data.memory) renderMemory(data.memory, data.map);
   $("hub-memory").hidden = !data.memory;
   $("hub-pending").hidden = !data.pending;
@@ -2619,6 +2622,7 @@ function hubSkeleton() {
     <div class="hub-grid"><article id="hub-now" class="hub-card"></article><article id="hub-reach" class="hub-card"></article></div>
     <article id="hub-events" class="hub-card" hidden></article>
     <article id="hub-usage" class="hub-card" hidden></article>
+    <article id="hub-diary" class="hub-card" hidden></article>
     <article id="hub-pending" class="hub-card"></article>
     <article id="hub-memory" class="hub-card">
       <header class="hub-head">${HUB_ICON.memory}<h2>Что я помню</h2><span id="hub-mem-count" class="hub-sub"></span><span class="spacer"></span>
@@ -2738,6 +2742,64 @@ function renderUsage(u) {
         ${u.chats.length ? `<ul class="u-chats">${u.chats.map((c) => `<li><a href="#${c.thread_id}">${esc(c.name)}</a><span class="u-num">${tokRu(c.out)}</span><span class="u-share"><i style="width:${Math.max(3, (c.out / top) * 100)}%"></i></span></li>`).join("")}</ul>` : '<div class="muted ev-none">За неделю чаты не работали</div>'}
       </div>
     </div>`;
+}
+
+// ═══ «Дневник»: a short digest of a day, written on request ═════════════════
+const isoDay = (back) => {
+  const d = new Date();
+  d.setDate(d.getDate() - back);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+function dayLabel(back, iso) {
+  if (back === 0) return "сегодня";
+  if (back === 1) return "вчера";
+  return new Date(`${iso}T12:00:00`).toLocaleDateString("ru-RU", { weekday: "short", day: "numeric", month: "long" });
+}
+function initDiary() {
+  const card = $("hub-diary");
+  if (card.dataset.built) return;
+  card.dataset.built = "1";
+  state.diaryBack = 0;
+  card.innerHTML = `<header class="hub-head">${HUB_ICON.diary}<h2>Дневник</h2><span class="spacer"></span>
+    <button type="button" id="dy-prev" class="icon-btn small" data-tip="День назад">‹</button><span id="dy-day" class="dy-day"></span><button type="button" id="dy-next" class="icon-btn small" data-tip="День вперёд">›</button></header>
+    <div id="dy-body"></div>`;
+  $("dy-prev").onclick = () => { state.diaryBack += 1; loadDiary(); };
+  $("dy-next").onclick = () => { if (state.diaryBack > 0) { state.diaryBack -= 1; loadDiary(); } };
+  loadDiary();
+}
+async function loadDiary() {
+  const back = state.diaryBack;
+  const day = isoDay(back);
+  $("dy-day").textContent = dayLabel(back, day);
+  $("dy-next").disabled = back === 0;
+  try {
+    const d = await api(`/api/hub/diary?date=${day}`);
+    if (state.diaryBack === back) renderDiary(d, back);
+  } catch (e) { $("dy-body").textContent = e.message; }
+}
+function renderDiary(d, back) {
+  const body = $("dy-body");
+  body.innerHTML = "";
+  if (d.text) {
+    const md = renderMarkdown(d.text);
+    md.className = "dy-text";
+    body.appendChild(md);
+  } else {
+    body.appendChild(el("div", "hub-empty", back === 0 ? "Дневник за сегодня ещё не составлен." : "За этот день дневника нет."));
+  }
+  const row = el("div", "dy-row");
+  if (!d.text || back === 0) {
+    const btn = el("button", "btn small", d.text ? "Обновить" : "Составить");
+    btn.type = "button";
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "Составляю… обычно полминуты";
+      try { const r = await api("/api/hub/diary", { body: { date: d.date } }); if (state.diaryBack === back) renderDiary(r, back); } catch (e) { toast(e.message); btn.disabled = false; btn.textContent = "Составить"; }
+    };
+    row.appendChild(btn);
+  }
+  if (d.generated) row.appendChild(el("span", "muted", `составлен ${whenRu(d.generated)}`));
+  body.appendChild(row);
 }
 
 const ALERT_DOT = { escalated: "err", "serial-flapper-suppressed": "warn", failed: "warn", flap: "ok", resolved: "ok" };

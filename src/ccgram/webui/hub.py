@@ -24,6 +24,10 @@ paths and hosts live only in that file, never in the repo::
     [calendar]                                    # prints "DD.MM.YYYY HH:MM … — title"
     command = "~/bin/calendar.sh 1"
 
+    [diary]                                       # a day's digest; prompt on stdin
+    command = "~/bin/llm-call.sh"                 # absent = a plain non-LLM summary
+    dir = "~/.ccgram/hub_diary"
+
     [inventory]                                   # a fleet file, TCP-probed
     name = "VPN nodes"
     file = "~/fleet.toml"                         # [[servers]] host/label/scopes
@@ -245,6 +249,125 @@ def usage() -> dict[str, Any] | None:
     if time.time() - stamp > USAGE_TTL_S and _usage_task is None:
         _usage_task = asyncio.get_running_loop().create_task(_refresh_usage())
     return data
+
+
+# ── diary: a short digest of a day across the hub's chats ────────────────────
+
+DIARY_MAX_CHARS = 14000
+DIARY_LINE = 300
+DIARY_TODAY_GAP_S = 600
+DIARY_TIMEOUT_S = 180
+DIARY_PROMPT = (
+    "Ниже — выдержки из чатов Кары с Александром за {day}. Составь короткий "
+    "дневник этого дня от лица Кары: 4–8 пунктов Markdown-списком — что сделали, "
+    "что решили, что осталось открытым. По-русски, в женском роде, без вступления "
+    "и выводов, только факты из выдержек; несколько чатов про одно — в один пункт.\n\n"
+)
+_diary_lock = asyncio.Lock()
+
+
+def _diary_dir() -> Path:
+    return _expand((config().get("diary") or {}).get("dir") or "~/.ccgram/hub_diary")
+
+
+def _diary_day(day: str) -> date:
+    try:
+        when = date.fromisoformat(day)
+    except ValueError:
+        raise WebUIError("bad date") from None
+    if when > date.today():
+        raise WebUIError("that day hasn't happened yet")
+    return when
+
+
+def diary_get(day: str) -> dict[str, Any]:
+    when = _diary_day(day)
+    path = _diary_dir() / f"{when.isoformat()}.md"
+    try:
+        return {
+            "date": when.isoformat(),
+            "text": path.read_text(encoding="utf-8"),
+            "generated": path.stat().st_mtime,
+        }
+    except OSError:
+        return {"date": when.isoformat(), "text": None, "generated": None}
+
+
+async def _diary_material(when: date) -> tuple[str, str]:
+    """(excerpts for the model, plain fallback summary)."""
+    # Lazy: service pulls the handler graph; transcript is a leaf.
+    from . import service, transcript
+
+    since = datetime.combine(when, datetime.min.time()).timestamp()
+    until = since + 86400
+    chats = []
+    for s in await service.list_sessions():
+        if s.get("last_activity", 0) < since:
+            continue
+        with contextlib.suppress(WebUIError):
+            tx, _provider = service._transcript_for(
+                service.find_binding(s["thread_id"])
+            )
+            if tx:
+                said = await asyncio.to_thread(transcript.day_dialog, tx, since, until)
+                if said:
+                    chats.append((s["name"], said))
+    chats.sort(key=lambda c: -len(c[1]))
+    budget = DIARY_MAX_CHARS
+    blocks, plain = [], []
+    for name, said in chats:
+        asks = [x for x in said if x["role"] == "user"]
+        first = " ".join(asks[0]["text"].split())[:120] if asks else ""
+        plain.append(
+            f"- **{name}** — {len(asks)} {'сообщ.'}" + (f": «{first}»" if first else "")
+        )
+        if budget <= 0:
+            continue
+        lines = [f"### {name}"]
+        for x in said:
+            who = "Александр" if x["role"] == "user" else "Кара"
+            lines.append(f"{who}: {' '.join(x['text'].split())[:DIARY_LINE]}")
+        block = "\n".join(lines)[:budget]
+        budget -= len(block)
+        blocks.append(block)
+    return "\n\n".join(blocks), "\n".join(plain)
+
+
+async def diary_make(day: str) -> dict[str, Any]:
+    """Write (or refresh today's) digest; past days are written once."""
+    when = _diary_day(day)
+    have = diary_get(day)
+    if have["text"] and (
+        when < date.today() or time.time() - have["generated"] < DIARY_TODAY_GAP_S
+    ):
+        return have
+    async with _diary_lock:
+        excerpts, plain = await _diary_material(when)
+        text = plain or "За этот день в чатах хаба ничего не происходило."
+        command = (config().get("diary") or {}).get("command")
+        if excerpts and command:
+            prompt = DIARY_PROMPT.format(day=when.strftime("%d.%m.%Y")) + excerpts
+            try:
+                done = await asyncio.to_thread(
+                    subprocess.run,
+                    os.path.expanduser(command),
+                    shell=True,  # noqa: S604 — the command comes from the local hub.toml
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=DIARY_TIMEOUT_S,
+                )
+                if done.returncode == 0 and done.stdout.strip():
+                    text = done.stdout.strip()
+                else:
+                    logger.warning("hub diary command failed rc=%s", done.returncode)
+                    text = f"{plain}\n\n_Короткая сводка: составить дневник не вышло._"
+            except OSError, subprocess.SubprocessError:
+                logger.exception("hub diary command failed")
+        path = _diary_dir() / f"{when.isoformat()}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomic(path, text + "\n")
+    return diary_get(day)
 
 
 # ── reach: where the agent can get to ───────────────────────────────────────
@@ -980,4 +1103,5 @@ async def overview() -> dict[str, Any]:
         "map": bool((conf.get("memory") or {}).get("map")),
         "happened": await asyncio.to_thread(happened),
         "usage": usage(),
+        "diary": bool(conf.get("diary")),
     }

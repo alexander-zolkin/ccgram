@@ -255,3 +255,80 @@ def test_save_and_forget_are_no_loss(store, tmp_path, monkeypatch):
     assert rel in log and "Laptop SSH" in log
     assert len(list(backups.iterdir())) == 2  # the memory before the edit + the index
     assert hub.memory_overview()["total"] == 1
+
+
+async def test_diary_writes_a_past_day_once(store, tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+    from types import SimpleNamespace
+
+    from ccgram.webui import service
+
+    yesterday = date.today() - timedelta(days=1)
+    at = datetime.combine(yesterday, datetime.min.time()) + timedelta(hours=10)
+    stamp = at.astimezone().isoformat()
+    tx = tmp_path / "t.jsonl"
+    tx.write_text(
+        "\n".join(
+            json.dumps(e)
+            for e in (
+                {
+                    "type": "user",
+                    "uuid": "u1",
+                    "timestamp": stamp,
+                    "message": {"content": "Почини бэкап"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a1",
+                    "timestamp": stamp,
+                    "message": {
+                        "content": [{"type": "text", "text": "Починила, проверила."}]
+                    },
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    async def sessions():
+        return [
+            {
+                "thread_id": 7,
+                "name": "Бэкапы",
+                "state": "idle",
+                "last_activity": time.time(),
+            }
+        ]
+
+    monkeypatch.setattr(service, "list_sessions", sessions)
+    monkeypatch.setattr(
+        service, "find_binding", lambda tid: SimpleNamespace(thread_id=tid)
+    )
+    monkeypatch.setattr(service, "_transcript_for", lambda b: (tx, "claude"))
+    seen = tmp_path / "prompt.txt"
+    llm = tmp_path / "llm.sh"
+    llm.write_text(
+        f"#!/bin/sh\ncat >> {seen}\necho '- Починили бэкап'\n", encoding="utf-8"
+    )
+    llm.chmod(0o755)
+    toml = tmp_path / "hub.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8")
+        + f'[diary]\ncommand = "{llm}"\ndir = "{tmp_path / "diary"}"\n',
+        encoding="utf-8",
+    )
+    hub._conf_cache = (-1.0, {})
+    day = yesterday.isoformat()
+    assert hub.diary_get(day)["text"] is None
+    got = await hub.diary_make(day)
+    assert got["text"] == "- Починили бэкап\n"
+    prompt = seen.read_text(encoding="utf-8")
+    assert (
+        "### Бэкапы" in prompt
+        and "Александр: Почини бэкап" in prompt
+        and "Кара: Починила" in prompt
+    )
+    await hub.diary_make(day)  # a past day is written once
+    assert prompt == seen.read_text(encoding="utf-8")
+    with pytest.raises(WebUIError):
+        hub.diary_get((date.today() + timedelta(days=1)).isoformat())

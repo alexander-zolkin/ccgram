@@ -47,6 +47,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/hub/pending/{id}/close|snooze``  close (to the done log) / postpone
 - ``GET  /api/hub/memory/search?q=``, ``/api/hub/memory/file?path=``
 - ``POST /api/hub/memory/save|forget``     edit a memory / move it to the archive
+- ``GET/POST /api/hub/diary``              a day's digest (POST writes it)
 - ``GET  /hub/map/…``                     memory map site for the home-page iframe
 
 State-changing requests must carry ``X-CCGram: 1``; with no CORS headers
@@ -629,6 +630,13 @@ async def _hub_memory_forget(request: web.Request) -> web.Response:
     )
 
 
+async def _hub_diary(request: web.Request) -> web.Response:
+    if request.method == "POST":
+        day = str((await _json_body(request)).get("date", ""))
+        return web.json_response(await hub.diary_make(day))
+    return web.json_response(hub.diary_get(request.query.get("date", "")))
+
+
 async def _hub_memory_file(request: web.Request) -> web.Response:
     rel = request.query.get("path", "")
     return web.json_response(await asyncio.to_thread(hub.memory_file, rel))
@@ -937,6 +945,8 @@ def _add_hub_routes(r: web.UrlDispatcher) -> None:
     r.add_get("/api/hub/memory/file", _hub_memory_file)
     r.add_post("/api/hub/memory/save", _hub_memory_save)
     r.add_post("/api/hub/memory/forget", _hub_memory_forget)
+    r.add_get("/api/hub/diary", _hub_diary)
+    r.add_post("/api/hub/diary", _hub_diary)
     r.add_get("/hub/map/{tail:.*}", _hub_map)
 
 
