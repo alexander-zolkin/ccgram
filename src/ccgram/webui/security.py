@@ -86,9 +86,14 @@ def sign_out_everywhere() -> None:
     _save(data)
 
 
+def _log(data: dict[str, Any]) -> list[dict[str, Any]]:
+    log = data.get("logins")
+    return log if isinstance(log, list) else []
+
+
 def record(method: str, ok: bool, device: str, ip: str) -> None:
     data = _load()
-    log = data.get("logins") if isinstance(data.get("logins"), list) else []
+    log = _log(data)
     log.append(
         {"ts": time.time(), "method": method, "ok": ok, "device": device, "ip": ip}
     )
@@ -98,7 +103,7 @@ def record(method: str, ok: bool, device: str, ip: str) -> None:
 
 def overview() -> dict[str, Any]:
     data = _load()
-    log = data.get("logins") if isinstance(data.get("logins"), list) else []
+    log = _log(data)
     day_ago = time.time() - 86400
     return {
         "password_set_here": isinstance(data.get("password"), dict),
