@@ -174,9 +174,17 @@ def test_alerts_latest_per_alert_with_the_verdict(tmp_path, monkeypatch):
     )
     hub._conf_cache = (-1.0, {})
     hub._calendar_cache = (0.0, None)
-    assert hub.happened()["calendar"] is None  # first call never waits ...
-    hub._refresh_calendar()  # ... the background run fills the cache
-    got = hub.happened()
+
+    class NowThread:  # run the background refresh inline, after the answer
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(hub.threading, "Thread", NowThread)
+    assert hub.happened()["calendar"] is None  # the first call never waits ...
+    got = hub.happened()  # ... the refresh it started has filled the cache
     a = got["alerts"]
     assert (a["important"], a["noise"]) == (1, 2)
     assert [(x["name"], x["kind"], x["count"]) for x in a["items"]] == [
