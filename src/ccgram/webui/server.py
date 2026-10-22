@@ -11,6 +11,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``GET  /api/sessions/{tid}/pane``       current pane snapshot
 - ``POST /api/sessions/{tid}/key``        one whitelisted key into the pane
 - ``POST /api/sessions/{tid}/answer``     allow / deny the prompt a push was for
+- ``POST /api/tts``                       one chunk of a reply → MP3 (read aloud)
 - ``POST /api/sessions/{tid}/close``      end a web-only session
 - ``GET  /api/sessions/{tid}/entries``    structured transcript (``limit``,
   ``before``/``after`` byte cursors)
@@ -66,7 +67,7 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from . import extras, hub, passkeys, push, security, service, tg_login
+from . import extras, hub, passkeys, push, security, service, tg_login, tts
 from ..providers.claude import EFFORT_LEVELS
 from .auth import COOKIE_NAME, SESSION_TTL_S, LoginThrottle
 from .auth import issue_cookie, verify_cookie
@@ -401,7 +402,9 @@ async def _logout(_request: web.Request) -> web.Response:
 
 async def _me(_request: web.Request) -> web.Response:
     # "hub": the home page has cards, so the client lays it out before /api/hub.
-    return web.json_response({"ok": True, "hub": bool(hub.config())})
+    return web.json_response(
+        {"ok": True, "hub": bool(hub.config()), "tts": tts.enabled()}
+    )
 
 
 # ── sessions ─────────────────────────────────────────────────────────────────
@@ -762,6 +765,16 @@ async def _answer(request: web.Request) -> web.Response:
     )
 
 
+async def _tts(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    audio = await tts.speak(str(body.get("text", "")))
+    return web.Response(
+        body=audio,
+        content_type="audio/mpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
 async def _key(request: web.Request) -> web.Response:
     body = await _json_body(request)
     return web.json_response(
@@ -873,6 +886,7 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_get("/api/models", _models)
     r.add_post("/api/sessions/{tid}/key", _key)
     r.add_post("/api/sessions/{tid}/answer", _answer)
+    r.add_post("/api/tts", _tts)
     r.add_get("/api/events", _events)
     _add_auth_routes(r)
     _add_hub_routes(r)

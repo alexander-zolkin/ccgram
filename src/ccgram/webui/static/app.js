@@ -429,7 +429,14 @@ function assistantNode(it) {
   const copy = el("button", "copy-btn", "Копировать");
   copy.type = "button";
   copy.onclick = () => copyText(it.text, copy);
-  actions.append(copy, el("span", "msg-time", esc(hhmm(it.ts))));
+  actions.append(copy);
+  if (state.tts) {
+    const listen = el("button", "copy-btn listen-btn", "Прослушать");
+    listen.type = "button";
+    listen.onclick = () => speak(n, listen);
+    actions.append(listen);
+  }
+  actions.append(el("span", "msg-time", esc(hhmm(it.ts))));
   n.appendChild(actions);
   return n;
 }
@@ -1747,6 +1754,7 @@ $("security").querySelector("form").addEventListener("submit", (ev) => {
 
 async function boot(me) {
   if (me && "hub" in me) store.set("kara-hub", me.hub ? "1" : "0");
+  if (me && "tts" in me) state.tts = me.tts;
   $("login").hidden = true;
   $("app").hidden = false;
   if (store.get("kara-collapsed") === "1" && !isMobile()) $("app").classList.add("collapsed");
@@ -2842,6 +2850,68 @@ async function memSearch() {
     if ($("hub-mem-q").value.trim() !== q) return;
     renderMemList(r.results, r.results.length ? `Нашлось ${r.results.length}${r.results.length === 20 ? "+" : ""} — самые подходящие сверху` : "Ничего не нашлось");
   } catch (e) { toast(e.message); }
+}
+
+// ═══ read a reply aloud (TTS) ════════════════════════════════════════════════
+// The reply goes out in sentence groups; the next one is fetched while the
+// current one plays, so speech starts in about a second.
+const TTS_CHUNK = 350;
+// 50 ms of silence: played inside the tap, it unlocks the element on iOS.
+const SILENCE = "data:audio/mpeg;base64,SUQzBAAAAAAAIlRTU0UAAAAOAAADTGF2ZjYxLjcuMTAzAAAAAAAAAAAAAAD/83DAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAACWAB6enp6enp6enp6enp6enp6enp6enp6enqmpqampqampqampqampqampqampqampqam09PT09PT09PT09PT09PT09PT09PT09PT0/////////////////////////////////8AAAAATGF2YzYxLjE5AAAAAAAAAAAAAAAAJAJxAAAAAAAAAlj7+meXAAAAAAAAAAAAAAAAAP/zQMQAAAADSAAAAABMQU1FMy4xMDBVVVVVVVVVVVVVTEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//NCxFsAAANIAAAAAFVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//NAxKQAAANIAAAAAFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/80LEowAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+function speechText(node) {
+  const body = node.firstElementChild.cloneNode(true);
+  body.querySelectorAll("pre, .codebox, table, img").forEach((x) => x.remove());
+  return body.innerText.trim();
+}
+function speechChunks(text) {
+  const sentences = text.replace(/\s*\n+\s*/g, ". ").replace(/\.\s*\./g, ".").match(/[^.!?…]+[.!?…]*\s*/g) || [];
+  const chunks = [];
+  let cur = "";
+  for (const raw of sentences) {
+    const part = raw.length > TTS_CHUNK * 2 ? `${raw.slice(0, TTS_CHUNK * 2)} ` : raw;
+    if (cur && (cur + part).length > TTS_CHUNK) { chunks.push(cur.trim()); cur = ""; }
+    cur += part;
+  }
+  if (cur.trim()) chunks.push(cur.trim());
+  return chunks.filter((c) => /[\p{L}\p{N}]/u.test(c));
+}
+async function ttsClip(text) {
+  const res = await fetch("/api/tts", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json", "X-CCGram": "1" }, body: JSON.stringify({ text }) });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+  return URL.createObjectURL(await res.blob());
+}
+function stopSpeaking() {
+  const run = state.speech;
+  if (!run) return;
+  state.speech = null;
+  run.stopped = true;
+  run.audio.pause();
+  run.resolve?.();
+  run.btn.textContent = "Прослушать";
+  run.btn.classList.remove("on");
+}
+async function speak(node, btn) {
+  if (state.speech?.btn === btn) { stopSpeaking(); return; }
+  stopSpeaking();
+  const chunks = speechChunks(speechText(node)).slice(0, 60);
+  if (!chunks.length) { toast("Здесь нечего читать вслух"); return; }
+  const audio = new Audio(SILENCE);
+  audio.play().catch(() => {});
+  const run = { audio, btn, stopped: false };
+  state.speech = run;
+  btn.textContent = "Стоп";
+  btn.classList.add("on");
+  let next = ttsClip(chunks[0]);
+  for (let i = 0; i < chunks.length && !run.stopped; i++) {
+    let url;
+    try { url = await next; } catch (e) { toast(`Озвучка: ${e.message}`); break; }
+    if (i + 1 < chunks.length) next = ttsClip(chunks[i + 1]);
+    if (run.stopped) { URL.revokeObjectURL(url); break; }
+    audio.src = url;
+    await new Promise((resolve) => { run.resolve = resolve; audio.onended = resolve; audio.onerror = resolve; audio.play().catch(resolve); });
+    URL.revokeObjectURL(url);
+  }
+  if (state.speech === run) stopSpeaking();
 }
 
 // ═══ sheet: the memory map (or one memory) over the page ═══════════════════
