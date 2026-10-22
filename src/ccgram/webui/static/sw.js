@@ -3,6 +3,20 @@
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 self.addEventListener("fetch", () => {});
+
+// Web Push from the server: a finished reply while no Kara tab is on screen.
+self.addEventListener("push", (e) => {
+  let p = {};
+  try { p = e.data ? e.data.json() : {}; } catch (_) { p = { body: e.data && e.data.text() }; }
+  e.waitUntil(self.registration.showNotification(p.title || "Кара", {
+    body: p.body || "",
+    tag: p.tag,
+    renotify: Boolean(p.tag),
+    icon: "/static/icon-192.png",
+    badge: "/static/badge-96.png",
+    data: { url: p.url || "/" },
+  }));
+});
 // Notifications are shown through the worker (the only way on Android);
 // a tap focuses an open tab on that chat, or opens one.
 self.addEventListener("notificationclick", (e) => {

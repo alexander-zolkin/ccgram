@@ -52,6 +52,7 @@ def publish_new_message(msg: Any, active_users: list[tuple[Any, ...]]) -> None:
 
     Never raises: the Telegram delivery path calls this inline.
     """
+    _push_reply(msg, active_users)
     if not bus.has_subscribers:
         return
     try:
@@ -75,6 +76,31 @@ def publish_new_message(msg: Any, active_users: list[tuple[Any, ...]]) -> None:
             )
     except Exception:  # noqa: BLE001 — never break Telegram delivery
         logger.exception("webui publish failed")
+
+
+def _push_reply(msg: Any, active_users: list[tuple[Any, ...]]) -> None:
+    """Web Push for a finished reply — independent of open browser tabs."""
+    if msg.role != "assistant" or msg.content_type != "text" or not msg.is_complete:
+        return
+    try:
+        # Lazy: push / quiet_threads / topic names are leaves, only needed here.
+        from .. import quiet_threads
+        from ..handlers.status.topic_emoji import get_stored_topic_name
+        from . import push
+
+        if not push.has_subscriptions():
+            return
+        done: set[int] = set()
+        for _user_id, _window_id, thread_id, chat_id in active_users:
+            if thread_id is None or thread_id in done:
+                continue
+            done.add(thread_id)
+            if quiet_threads.mode(thread_id) == "off":
+                continue
+            title = (chat_id and get_stored_topic_name(chat_id, thread_id)) or "Кара"
+            push.notify_reply(thread_id, title, str(msg.text or ""))
+    except Exception:  # noqa: BLE001 — never break Telegram delivery
+        logger.exception("webui push failed")
 
 
 def publish_web_only_message(msg: Any) -> None:

@@ -1203,6 +1203,7 @@ function pickModel(provider, model) {
 function notify(s, e) {
   if (!("Notification" in window) || Notification.permission !== "granted") return;
   if (s && s.sound === "off") return;
+  if (document.hidden && state.pushOn) return; // the server's Web Push shows it
   if (!document.hidden && e.thread_id === state.current) return;
   if (e.role !== "assistant" || e.content_type !== "text" || !e.is_complete) return;
   const title = s ? s.name : "Кара";
@@ -1261,12 +1262,71 @@ function profileMenu() {
     { label: "Тёмная", icon: SVG.sun, check: theme === "dark", action: () => setTheme("dark") },
     "sep",
   ];
-  if ("Notification" in window && Notification.permission !== "granted") {
-    items.push({ label: "Включить уведомления", icon: SVG.bell, action: () => Notification.requestPermission() });
+  if (pushSupported()) {
+    items.push(state.pushOn
+      ? { label: "Уведомления включены", sub: "Нажми, чтобы выключить на этом устройстве", icon: SVG.bell, check: true, action: disablePush }
+      : { label: "Включить уведомления", sub: isStandalone() || !isIOS() ? "Придут, даже когда приложение закрыто" : "На iPhone — после «На экран Домой»", icon: SVG.bellOff, action: enablePush });
   }
   items.push({ label: "Выйти", icon: SVG.out, action: async () => { await api("/api/logout", { body: {} }).catch(() => {}); showLogin(); } });
   return items;
 }
+
+// ═══ web push ════════════════════════════════════════════════════════════════
+const isIOS = () => /iP(hone|ad|od)/.test(navigator.userAgent);
+const isStandalone = () => matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const b64ToBytes = (b64) => {
+  const s = atob((b64 + "=".repeat((4 - (b64.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(s, (c) => c.charCodeAt(0));
+};
+
+async function refreshPushState() {
+  if (!pushSupported()) return;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    state.pushOn = Boolean(sub) && Notification.permission === "granted";
+    // Re-register: keeps the server list right after a key/endpoint change.
+    if (state.pushOn) await api("/api/push/subscribe", { body: { subscription: sub.toJSON() } });
+  } catch (_) { state.pushOn = false; }
+}
+
+async function enablePush() {
+  // Ask first, synchronously inside the tap: iOS refuses permission prompts
+  // that are not a direct result of a user gesture.
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") { toast(isIOS() && !isStandalone() ? "На iPhone уведомления работают в приложении с экрана Домой" : "Уведомления запрещены в настройках браузера"); return; }
+  try {
+    const { key } = await api("/api/push/key");
+    const reg = await navigator.serviceWorker.ready;
+    const sub = (await reg.pushManager.getSubscription()) || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
+    await api("/api/push/subscribe", { body: { subscription: sub.toJSON() } });
+    state.pushOn = true;
+    toast("Уведомления включены");
+  } catch (e) { toast(`Не получилось: ${e.message}`); }
+}
+
+async function disablePush() {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      await api("/api/push/unsubscribe", { body: { endpoint: sub.endpoint } }).catch(() => {});
+      await sub.unsubscribe();
+    }
+  } catch (_) { /* already gone */ }
+  state.pushOn = false;
+  toast("Уведомления выключены на этом устройстве");
+}
+
+// While a Kara tab is on screen the server holds pushes back (the page shows
+// its own notification); it resumes 45 s after the last "visible" ping.
+const clientId = Math.random().toString(36).slice(2);
+function reportPresence() {
+  api("/api/presence", { body: { client: clientId, visible: !document.hidden } }).catch(() => {});
+}
+document.addEventListener("visibilitychange", reportPresence);
+setInterval(() => { if (!document.hidden) reportPresence(); }, 25000);
 
 // ═══ auth / boot ════════════════════════════════════════════════════════════
 function showLogin() {
@@ -1283,6 +1343,8 @@ async function boot() {
   await refreshSessions();
   connect();
   route();
+  reportPresence();
+  refreshPushState();
 }
 
 $("login-form").onsubmit = async (ev) => {

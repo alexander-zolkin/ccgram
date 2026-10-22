@@ -19,6 +19,8 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/sessions/{tid}/sound``      Telegram sound for the topic: auto / on / off
 - ``GET  /api/sessions/{tid}/file?path=`` an upload of the session (.ccgram-uploads only)
 - ``GET  /api/search?q=``                  full-text search over all transcripts
+- ``GET  /api/push/key``, ``POST /api/push/(un)subscribe``  Web Push devices
+- ``POST /api/presence``                   "this tab is visible" (mutes push)
 - ``POST /api/sessions/{tid}/detach``     delete the topic, keep the session
 - ``POST /api/sessions/{tid}/keep``       keep a session whose topic was deleted
 - ``POST /api/sessions/{tid}/delete``     kill the session, delete its topic
@@ -44,7 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from . import service
+from . import push, service
 from ..providers.claude import EFFORT_LEVELS
 from .auth import COOKIE_NAME, SESSION_TTL_S, LoginThrottle, check_password
 from .auth import issue_cookie, verify_cookie
@@ -304,6 +306,31 @@ async def _pin(request: web.Request) -> web.Response:
     )
 
 
+async def _push_key(_request: web.Request) -> web.Response:
+    return web.json_response({"key": push.public_key()})
+
+
+async def _push_subscribe(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    try:
+        count = push.subscribe(body.get("subscription"))
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response({"ok": True, "devices": count})
+
+
+async def _push_unsubscribe(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    push.unsubscribe(str(body.get("endpoint", "")))
+    return web.json_response({"ok": True})
+
+
+async def _presence(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    push.mark_visible(str(body.get("client", "")), bool(body.get("visible")))
+    return web.json_response({"ok": True})
+
+
 async def _sound(request: web.Request) -> web.Response:
     body = await _json_body(request)
     return web.json_response(
@@ -439,6 +466,10 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/sound", _sound)
     r.add_get("/api/sessions/{tid}/file", _file)
     r.add_get("/api/search", _search)
+    r.add_get("/api/push/key", _push_key)
+    r.add_post("/api/push/subscribe", _push_subscribe)
+    r.add_post("/api/push/unsubscribe", _push_unsubscribe)
+    r.add_post("/api/presence", _presence)
     r.add_post("/api/sessions/{tid}/detach", _detach)
     r.add_post("/api/sessions/{tid}/keep", _keep)
     r.add_post("/api/sessions/{tid}/delete", _delete)
