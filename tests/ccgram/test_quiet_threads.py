@@ -41,3 +41,35 @@ async def test_ptb_client_send_message_is_silenced():
     assert calls[0]["disable_notification"] is True
     assert "disable_notification" not in calls[1]
     quiet_threads.reset_for_testing()
+
+
+def test_explicit_mode_overrides_auto_rule():
+    quiet_threads.reset_for_testing()
+    kw = {"message_thread_id": 7}
+    assert quiet_threads.mode(7) == "auto"
+    quiet_threads.set_mode(7, "off")
+    assert quiet_threads.apply(-100, dict(kw))["disable_notification"] is True
+    quiet_threads.mark_web(-100, 7)
+    quiet_threads.set_mode(7, "on")
+    # "on" rings even while the topic is web-driven
+    assert "disable_notification" not in quiet_threads.apply(-100, dict(kw))
+    quiet_threads.set_mode(7, "auto")
+    assert quiet_threads.mode(7) == "auto"
+    assert quiet_threads.apply(-100, dict(kw))["disable_notification"] is True
+    quiet_threads.load_modes({8: "off", 9: "bogus"})
+    assert quiet_threads.mode(8) == "off" and quiet_threads.mode(9) == "auto"
+    assert quiet_threads.mode(None) == "auto"
+    quiet_threads.reset_for_testing()
+
+
+def test_sound_modes_persist(tmp_path, monkeypatch):
+    from ccgram.webui import prefs
+
+    monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
+    prefs.reset_for_testing()
+    prefs.set_sound_mode(5, "off")
+    prefs.set_sound_mode(6, "on")
+    prefs.set_sound_mode(6, "auto")
+    prefs.reset_for_testing()
+    assert prefs.sound_modes() == {5: "off"}
+    prefs.reset_for_testing()

@@ -16,6 +16,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/sessions/{tid}/rename``     rename session + its topic
 - ``POST /api/sessions/{tid}/upload``     multipart file into the session cwd
 - ``POST /api/sessions/{tid}/pin``        pin / unpin in the sidebar
+- ``POST /api/sessions/{tid}/sound``      Telegram sound for the topic: auto / on / off
 - ``POST /api/sessions/{tid}/detach``     delete the topic, keep the session
 - ``POST /api/sessions/{tid}/keep``       keep a session whose topic was deleted
 - ``POST /api/sessions/{tid}/delete``     kill the session, delete its topic
@@ -298,6 +299,13 @@ async def _pin(request: web.Request) -> web.Response:
     )
 
 
+async def _sound(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    return web.json_response(
+        await service.set_sound(_thread_id(request), str(body.get("mode", "")))
+    )
+
+
 async def _keep(request: web.Request) -> web.Response:
     return web.json_response(await service.keep_web_only(_thread_id(request)))
 
@@ -414,6 +422,7 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/rename", _rename)
     r.add_post("/api/sessions/{tid}/upload", _upload)
     r.add_post("/api/sessions/{tid}/pin", _pin)
+    r.add_post("/api/sessions/{tid}/sound", _sound)
     r.add_post("/api/sessions/{tid}/detach", _detach)
     r.add_post("/api/sessions/{tid}/keep", _keep)
     r.add_post("/api/sessions/{tid}/delete", _delete)
@@ -442,6 +451,11 @@ async def start_webui(bot: Bot | Any) -> None:
         )
         return
     try:
+        # Lazy: leaf modules, only needed once the UI is actually enabled.
+        from .. import quiet_threads
+        from .prefs import sound_modes
+
+        quiet_threads.load_modes(sound_modes())
         app = build_app(
             bot=bot,
             bot_token=config.telegram_bot_token,

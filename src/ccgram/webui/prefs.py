@@ -1,4 +1,4 @@
-"""Small web-UI preferences shared by every browser (pinned sessions).
+"""Small web-UI preferences shared by every browser (pins, topic sound modes).
 
 Persisted to ``<CCGRAM_DIR>/webui_prefs.json``; stdlib-only leaf module.
 """
@@ -38,6 +38,28 @@ def _save() -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(_load(), fh, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+def sound_modes() -> dict[int, str]:
+    raw = _load().get("sound", {})
+    out: dict[int, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[int(k)] = str(v)
+            except ValueError:
+                continue
+    return out
+
+
+def set_sound_mode(session_id: int, mode: str) -> None:
+    modes = sound_modes()
+    if mode in ("on", "off"):
+        modes[session_id] = mode
+    else:
+        modes.pop(session_id, None)
+    _load()["sound"] = {str(k): v for k, v in sorted(modes.items())}
+    _save()
 
 
 def reset_for_testing() -> None:

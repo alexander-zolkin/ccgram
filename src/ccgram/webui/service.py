@@ -297,6 +297,9 @@ async def list_sessions() -> list[dict[str, Any]]:
                 )
                 == "telegram",
                 "pinned": b.thread_id in pins,
+                "sound": quiet_threads.mode(b.thread_id),
+                "quiet_now": not b.web_only
+                and quiet_threads.is_quiet(b.chat_id, b.thread_id),
             }
         )
     sessions.sort(key=lambda s: s["last_activity"], reverse=True)
@@ -965,6 +968,19 @@ async def set_pin(thread_id: int, on: bool) -> dict[str, Any]:
     find_binding(thread_id)
     set_pinned(thread_id, on)
     return {"ok": True, "pinned": on}
+
+
+async def set_sound(thread_id: int, mode: str) -> dict[str, Any]:
+    """Telegram notification sound for a topic: auto / always on / off."""
+    # Lazy: prefs is a leaf; keep it next to its only users.
+    from .prefs import set_sound_mode
+
+    if mode not in quiet_threads.MODES:
+        raise WebUIError("bad sound mode")
+    find_binding(thread_id)
+    quiet_threads.set_mode(thread_id, mode)
+    set_sound_mode(thread_id, mode)
+    return {"ok": True, "sound": mode}
 
 
 async def _drop_topic(bot: Bot, binding: Binding, *, window_alive: bool) -> None:
