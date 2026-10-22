@@ -305,13 +305,16 @@ function refreshStepsHead(block) {
   const what = !tools.length ? "Размышляла"
     : running && last ? toolMeta(last).title.replace(/<[^>]+>/g, "")
       : `${tools.length} ${plural(tools.length, "действие", "действия", "действий")}`;
-  block.querySelector(".steps-head").innerHTML = `<span class="sum">${esc(what)}${names && !running ? ` · <span class="muted">${esc(names)}</span>` : ""}</span>${running ? '<span class="spin"></span>' : errors ? `<span style="color:var(--err)">${errors} ✕</span>` : ""}${SVG.chev}`;
+  // Thinking text is redacted in transcripts: a thinking-only block has
+  // nothing to expand, so it is a plain label without the chevron.
+  block.classList.toggle("thought-only", !tools.length);
+  block.querySelector(".steps-head").innerHTML = `<span class="sum">${esc(what)}${names && !running ? ` · <span class="muted">${esc(names)}</span>` : ""}</span>${running ? '<span class="spin"></span>' : errors ? `<span style="color:var(--err)">${errors} ✕</span>` : ""}${tools.length ? SVG.chev : ""}`;
 }
 
 function stepsBlock() {
   const block = el("div", "steps");
   block.innerHTML = '<div class="steps-head"></div><div class="steps-body"><div class="steps-inner"></div></div>';
-  block.querySelector(".steps-head").onclick = () => block.classList.toggle("open");
+  block.querySelector(".steps-head").onclick = () => { if (!block.classList.contains("thought-only")) block.classList.toggle("open"); };
   return block;
 }
 
