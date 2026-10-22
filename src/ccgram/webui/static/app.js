@@ -89,6 +89,8 @@ const SVG = {
   bellRing: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10 21h4M2.5 7.5A9 9 0 0 1 5 3M21.5 7.5A9 9 0 0 0 19 3"/></svg>',
   bellAuto: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10 21h4"/><path d="M10 12.5l2-5 2 5M10.6 11h2.8" stroke-width="1.5"/></svg>',
   out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>',
+  globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>',
+  tgGone: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 5L3 11.5l5 1.8M21 5l-3 14-6.5-4.5M21 5L8 13.3v5.2l3.5-3.2M3 3l18 18"/></svg>',
   chev: '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>',
 };
 
@@ -756,10 +758,42 @@ function renderSessions() {
   renderHeader();
 }
 
+const TIP = {
+  web: "Только в вебе: у этого чата нет топика в Telegram",
+  gone: "Топик удалён в Telegram — чат продолжает жить здесь",
+};
+
+// One floating tooltip for every [data-tip]: instant, never clipped by the
+// sidebar's overflow. On touch screens a tap shows the same text as a toast.
+(() => {
+  const tip = el("div", "tip");
+  tip.hidden = true;
+  document.body.appendChild(tip);
+  document.addEventListener("pointerover", (ev) => {
+    const t = ev.target.closest?.("[data-tip]");
+    if (!t || ev.pointerType === "touch") { tip.hidden = true; return; }
+    tip.textContent = t.dataset.tip;
+    tip.hidden = false;
+    const r = t.getBoundingClientRect();
+    const w = tip.offsetWidth;
+    tip.style.left = `${Math.max(8, Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2))}px`;
+    tip.style.top = `${r.bottom + 6}px`;
+  });
+  document.addEventListener("scroll", () => { tip.hidden = true; }, true);
+  document.addEventListener("click", (ev) => {
+    const t = ev.target.closest?.("[data-tip]");
+    if (t && matchMedia("(hover: none)").matches) { ev.preventDefault(); ev.stopPropagation(); toast(t.dataset.tip); }
+  }, true);
+})();
+
 function sessionItem(s) {
   const item = el("a", `s-item${s.thread_id === state.current ? " active" : ""}${state.unread.has(s.thread_id) ? " unread" : ""}`);
   item.href = `#${s.thread_id}`;
-  item.innerHTML = `<span class="dot ${esc(s.state)}" title="${esc(STATE_LABEL[s.state] || "")}"></span><span class="s-name">${esc(s.name)}${s.web_only ? '<span class="badge" title="Без Telegram">веб</span>' : ""}</span>`;
+  // Flags sit outside the name so the name ellipsizes and they never clip.
+  const flag = s.topic_deleted
+    ? `<span class="s-flag gone" data-tip="${esc(TIP.gone)}">${SVG.tgGone}</span>`
+    : s.web_only ? `<span class="s-flag" data-tip="${esc(TIP.web)}">${SVG.globe}</span>` : "";
+  item.innerHTML = `<span class="dot ${esc(s.state)}" title="${esc(STATE_LABEL[s.state] || "")}"></span><span class="s-name">${esc(s.name)}</span>${flag}`;
   const more = el("button", "s-more", SVG.more);
   more.type = "button";
   more.title = "Действия";
@@ -1593,6 +1627,31 @@ $("menu-btn").onclick = () => {
   else { $("app").classList.remove("collapsed"); store.set("kara-collapsed", ""); }
 };
 $("scrim").onclick = () => $("app").classList.remove("drawer");
+
+// Desktop: drag the sidebar edge to resize; the width is remembered.
+(() => {
+  const app = $("app");
+  const apply = (w) => app.style.setProperty("--side-w", `${Math.max(200, Math.min(520, w))}px`);
+  const saved = parseInt(store.get("kara-side-w") || "", 10);
+  if (saved) apply(saved);
+  const handle = $("side-resizer");
+  handle.addEventListener("pointerdown", (ev) => {
+    if (isMobile() || app.classList.contains("collapsed")) return;
+    ev.preventDefault();
+    handle.setPointerCapture(ev.pointerId);
+    app.classList.add("resizing");
+    const move = (e) => apply(e.clientX);
+    const up = (e) => {
+      handle.releasePointerCapture(e.pointerId);
+      handle.removeEventListener("pointermove", move);
+      app.classList.remove("resizing");
+      store.set("kara-side-w", String(parseInt(getComputedStyle(app).getPropertyValue("--side-w"), 10) || 272));
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up, { once: true });
+  });
+  handle.addEventListener("dblclick", () => { apply(272); store.set("kara-side-w", "272"); });
+})();
 // Phone: swipe right from the left edge opens the chat list, swipe left closes it.
 (() => {
   let x0 = null;
