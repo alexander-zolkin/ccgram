@@ -424,8 +424,12 @@ function assistantNode(it) {
   return n;
 }
 
+// Claude Code stores shell text HTML-escaped (`-&gt;`): decode once for display.
+const unentity = (str) => { const t = document.createElement("textarea"); t.innerHTML = String(str || ""); return t.value; };
+
 // "!cmd" typed in Claude Code (or sent from here / Telegram) — a terminal card.
-function bashNode(it) {
+function bashNode(raw) {
+  const it = { ...raw, command: unentity(raw.command), stdout: unentity(raw.stdout), stderr: unentity(raw.stderr) };
   const n = el("div", "bash-card");
   const head = el("div", "bash-head");
   head.innerHTML = `<span class="bash-prompt">$</span><code class="bash-cmd">${esc(it.command || "")}</code>`;
@@ -436,8 +440,8 @@ function bashNode(it) {
   const body = el("div", "bash-body", '<div class="bash-wait"><span class="spin"></span> выполняется…</div>');
   n.append(head, body);
   n._fill = (r) => {
-    const out = String(r.stdout || "");
-    const err = String(r.stderr || "");
+    const out = unentity(r.stdout);
+    const err = unentity(r.stderr);
     body.innerHTML = "";
     if (out.trim()) body.appendChild(el("pre", "bash-out", esc(out)));
     if (err.trim()) body.appendChild(el("pre", "bash-out err", esc(err)));
@@ -459,7 +463,7 @@ function bashNode(it) {
 function commandNode(it) {
   const n = el("div", "cmd-chip");
   n.innerHTML = `<code>${esc(it.kind === "command" ? it.text : "")}</code>`;
-  n._fill = (r) => { if (r.text) n.appendChild(el("span", "cmd-out", esc(r.text.split("\n")[0].slice(0, 160)))); };
+  n._fill = (r) => { if (r.text) n.appendChild(el("span", "cmd-out", esc(unentity(r.text).split("\n")[0].slice(0, 160)))); };
   if (it.kind === "command_result") { n.innerHTML = ""; n._fill(it); n._filled = true; }
   return n;
 }
@@ -1433,8 +1437,11 @@ function hitsBox(q, results) {
   const box = el("div", "search-hits");
   box.appendChild(el("div", "group-label", "В переписке"));
   const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "ig");
-  for (const r of data.results) {
+  const seen = new Set();  // sessions sharing one transcript repeat the same hit
+  for (const r of results) {
     for (const h of r.hits.slice(0, 2)) {
+      if (seen.has(h.ts + h.snippet)) continue;
+      seen.add(h.ts + h.snippet);
       const a = el("a", "hit");
       a.href = `#${r.thread_id}`;
       a.innerHTML = `<span class="hit-name">${esc(r.name)}</span><span class="hit-snip">${esc(h.snippet).replace(re, (m) => `<mark>${m}</mark>`)}</span>`;
