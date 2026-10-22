@@ -327,8 +327,13 @@ async def reach(refresh: bool = False) -> dict[str, Any]:
 async def run() -> None:
     while True:
         try:
-            if config().get("reach") or config().get("inventory"):
+            conf = config()
+            if conf.get("reach") or conf.get("inventory"):
                 await probe_all()
+            if (conf.get("memory") or {}).get("dir"):
+                # Keeps the memory index warm: the first home-page load after
+                # a restart would otherwise walk ~1000 files (~2 s).
+                await asyncio.to_thread(memory_overview)
         except Exception:  # noqa: BLE001 — a probe must never kill the loop
             logger.exception("hub probe failed")
         await asyncio.sleep(PROBE_EVERY)

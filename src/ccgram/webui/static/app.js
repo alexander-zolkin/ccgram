@@ -672,6 +672,8 @@ function showHome() {
   updateLed();
   renderToggle();
   renderSessions();
+  showHubCached();
+  document.querySelector(".main").scrollTop = 0;
   loadHub();
   loadModels();
   if (!isMobile()) $("input").focus();
@@ -2285,17 +2287,35 @@ const dueRu = (n) => (n < 0 ? `просрочено ${-n} ${pluralRu(-n, "ден
 // Pending items are one-line markdown; [[wiki-links]] point into memory.
 const inlineMd = (text) => DOMPurify.sanitize(marked.parseInline(String(text).replace(/\[\[([^\]]+)\]\]/g, "`$1`")));
 
+// The layout must not jump when the data lands: show the last data at once
+// (or placeholders on a cold start, the "enabled" flag is remembered), then
+// refresh in place.
+function showHubCached() {
+  if (state.hubData) { applyHub(state.hubData); return; }
+  if (store.get("kara-hub") !== "1") return;
+  hubSkeleton();
+  $("app").classList.add("has-hub");
+  $("hub").classList.add("loading");
+  $("hub").hidden = false;
+}
+
 async function loadHub() {
   clearTimeout(state.hubTimer);
   if (state.current != null) return;
   state.hubTimer = setTimeout(loadHub, 60000);
-  if (document.hidden && $("hub").dataset.built) return;
+  if (document.hidden && state.hubData) return;
   let data;
   try { data = await api("/api/hub"); } catch (_) { return; }
-  if (state.current != null) return;
+  state.hubData = data;
+  store.set("kara-hub", data.enabled ? "1" : "0");
+  if (state.current == null) applyHub(data);
+}
+
+function applyHub(data) {
   const on = Boolean(data.enabled);
   $("app").classList.toggle("has-hub", on);
   $("hub").hidden = !on;
+  $("hub").classList.remove("loading");
   if (!on) return;
   hubSkeleton();
   renderNow(data.now);
@@ -2373,7 +2393,11 @@ function renderReach(reach) {
   $("hub-reach-btn").onclick = async (ev) => {
     const btn = ev.currentTarget;
     btn.classList.add("spinning");
-    try { renderReach(await api("/api/hub/reach", { body: {} })); } catch (e) { toast(e.message); btn.classList.remove("spinning"); }
+    try {
+      const reach = await api("/api/hub/reach", { body: {} });
+      if (state.hubData) state.hubData.reach = reach;
+      renderReach(reach);
+    } catch (e) { toast(e.message); btn.classList.remove("spinning"); }
   };
 }
 
@@ -2400,15 +2424,20 @@ function renderPending(p) {
   });
 }
 
+function keepPending(p) {
+  if (state.hubData) state.hubData.pending = p;
+  return p;
+}
+
 async function closePending(it) {
   const short = it.text.replace(/\s+/g, " ").slice(0, 180);
   if (!(await confirmDialog("Дело сделано?", `${short}${it.text.length > 180 ? "…" : ""}\n\nУберу его в архив закрытых дел.`, "Закрыть"))) return;
-  try { renderPending(await api(`/api/hub/pending/${it.id}/close`, { body: {} })); toast("Закрыто — дело в архиве"); } catch (e) { toast(e.message); loadHub(); }
+  try { renderPending(keepPending(await api(`/api/hub/pending/${it.id}/close`, { body: {} }))); toast("Закрыто — дело в архиве"); } catch (e) { toast(e.message); loadHub(); }
 }
 
 async function snoozePending(it, days) {
   try {
-    const p = await api(`/api/hub/pending/${it.id}/snooze`, { body: { days } });
+    const p = keepPending(await api(`/api/hub/pending/${it.id}/snooze`, { body: { days } }));
     renderPending(p);
     const moved = p.items.find((x) => x.text === it.text);
     toast(moved ? `Напомню ${moved.date.split("-").reverse().slice(0, 2).join(".")}` : "Отложено");
