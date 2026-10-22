@@ -83,8 +83,7 @@ def _push_reply(msg: Any, active_users: list[tuple[Any, ...]]) -> None:
     if msg.role != "assistant" or msg.content_type != "text" or not msg.is_complete:
         return
     try:
-        # Lazy: push / quiet_threads / topic names are leaves, only needed here.
-        from .. import quiet_threads
+        # Lazy: push / topic names are leaves, only needed here.
         from ..handlers.status.topic_emoji import get_stored_topic_name
         from . import extras, push
 
@@ -95,7 +94,7 @@ def _push_reply(msg: Any, active_users: list[tuple[Any, ...]]) -> None:
             if thread_id is None or thread_id in done:
                 continue
             done.add(thread_id)
-            if quiet_threads.mode(thread_id) == "off":
+            if not push.allowed(thread_id):
                 continue
             title = (chat_id and get_stored_topic_name(chat_id, thread_id)) or "Кара"
             if extras.notify_mode() == "done":

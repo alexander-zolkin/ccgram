@@ -29,6 +29,10 @@ _GONE = (404, 410)
 
 _state: dict[str, Any] | None = None
 _visible: dict[str, float] = {}  # client id → last "visible" report
+# Web notifications are their own channel, independent of Telegram's sound
+# settings: a global switch (every device) and a per-chat switch.
+_web_muted = False
+_web_off: set[int] = set()
 
 
 def _path() -> Path:
@@ -106,6 +110,36 @@ def unsubscribe(endpoint: str) -> None:
     _save()
 
 
+def set_web_muted(on: bool) -> None:
+    global _web_muted
+    _web_muted = bool(on)
+
+
+def web_muted() -> bool:
+    return _web_muted
+
+
+def set_chat_web(thread_id: int, on: bool) -> None:
+    if on:
+        _web_off.discard(int(thread_id))
+    else:
+        _web_off.add(int(thread_id))
+
+
+def load_web_off(ids: list[int]) -> None:
+    _web_off.clear()
+    _web_off.update(int(i) for i in ids)
+
+
+def web_off() -> list[int]:
+    return sorted(_web_off)
+
+
+def allowed(thread_id: int) -> bool:
+    """May this chat send web notifications at all (both switches on)?"""
+    return not _web_muted and int(thread_id) not in _web_off
+
+
 def has_subscriptions() -> bool:
     return bool(_load()["subscriptions"])
 
@@ -161,7 +195,7 @@ def _send_all(payload: dict[str, Any]) -> None:
 def notify_reply(thread_id: int, title: str, text: str) -> None:
     """Queue a push for a finished reply. Never raises; never blocks."""
     try:
-        if not has_subscriptions() or someone_watching():
+        if not has_subscriptions() or someone_watching() or not allowed(thread_id):
             return
         payload = {
             "title": title,
@@ -176,6 +210,8 @@ def notify_reply(thread_id: int, title: str, text: str) -> None:
 
 
 def reset_for_testing() -> None:
-    global _state
+    global _state, _web_muted
     _state = None
     _visible.clear()
+    _web_muted = False
+    _web_off.clear()

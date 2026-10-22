@@ -118,9 +118,8 @@ async def on_stop(window_id: str, client: TelegramClient) -> None:
 
         for chat_id, thread_id in _targets(window_id):
             title, text = _last_reply.pop(thread_id, ("", ""))
-            if quiet_threads.mode(thread_id) == "off":
-                continue
-            if chat_id and not quiet_threads.all_muted():
+            tg_ok = quiet_threads.mode(thread_id) != "off"
+            if chat_id and tg_ok and not quiet_threads.all_muted():
                 await _ping(client, chat_id, thread_id, "✅ Готово")
             push.notify_reply(
                 thread_id, title or _title(chat_id, thread_id), text or "Готово"
@@ -136,9 +135,13 @@ async def on_attention(window_id: str, header: str, client: TelegramClient) -> N
         from . import push
 
         for chat_id, thread_id in _targets(window_id):
-            if quiet_threads.mode(thread_id) == "off":
-                continue
-            if _notify_mode == "done" and chat_id and not quiet_threads.all_muted():
+            tg_ok = quiet_threads.mode(thread_id) != "off"
+            if (
+                _notify_mode == "done"
+                and chat_id
+                and tg_ok
+                and not quiet_threads.all_muted()
+            ):
                 await _ping(client, chat_id, thread_id, f"⏳ {header}")
             push.notify_reply(thread_id, _title(chat_id, thread_id), f"⏳ {header}")
     except Exception:  # noqa: BLE001 — a hook must never break the bot
@@ -263,7 +266,9 @@ def commands(thread_id: int | None, provider_name: str = "claude") -> dict[str, 
         )
     else:
         provider = provider_registry.get(provider_name)
-    found = discover_provider_commands(provider)
+    found = list(discover_provider_commands(provider))
+    if provider.capabilities.name == "claude":
+        found += _user_skills({c.name.lstrip("/") for c in found})
     return {
         "commands": [
             {
@@ -274,6 +279,35 @@ def commands(thread_id: int | None, provider_name: str = "claude") -> dict[str, 
             for c in found
         ]
     }
+
+
+def _user_skills(known: set[str]) -> list[Any]:
+    """Top-level ~/.claude/skills Claude Code itself offers as /name.
+
+    ccgram's catalog only lists skills marked ``user-invocable: true``; Claude
+    Code treats every skill as invocable unless it says ``false``.
+    """
+    # Lazy: frontmatter parser + config.
+    from types import SimpleNamespace
+
+    from ..command_catalog import parse_frontmatter
+    from ..config import config
+
+    out: list[Any] = []
+    root = Path(config.claude_config_dir) / "skills"
+    if not root.is_dir():
+        return out
+    for skill in sorted(root.iterdir()):
+        md = skill / "SKILL.md"
+        if skill.name.startswith(".") or not md.is_file():
+            continue
+        fm = parse_frontmatter(md)
+        name = fm.get("name", skill.name)
+        if fm.get("user-invocable", "").lower() == "false" or name in known:
+            continue
+        desc = " ".join(fm.get("description", "").split())
+        out.append(SimpleNamespace(name=name, description=desc[:200], source="skill"))
+    return out
 
 
 # ── voice ────────────────────────────────────────────────────────────────────

@@ -616,6 +616,7 @@ async function loadOlder() {
 
 // ═══ routing: home screen vs a session ══════════════════════════════════════
 function route() {
+  $("cmd-palette").hidden = true;
   const id = parseInt(location.hash.slice(1), 10);
   if (!Number.isNaN(id)) openSession(id);
   else showHome();
@@ -797,7 +798,8 @@ const TIP = {
   });
   document.addEventListener("scroll", () => { tip.hidden = true; }, true);
   document.addEventListener("click", (ev) => {
-    const t = ev.target.closest?.("[data-tip]");
+    // Only for passive markers (flags, ticks): buttons keep doing their job.
+    const t = ev.target.closest?.(".s-flag[data-tip], .tick[data-tip]");
     if (t && matchMedia("(hover: none)").matches) { ev.preventDefault(); ev.stopPropagation(); toast(t.dataset.tip); }
   }, true);
 })();
@@ -931,52 +933,73 @@ function setTitle(base) {
 // ═══ notifications per chat ═════════════════════════════════════════════════
 // "auto": Telegram copies are silent while the chat is driven from here;
 // "on"/"off": always ring / never ring. "off" also mutes browser notifications.
+// Two independent channels, each with a global and a per-chat switch:
+//   Telegram — global "Звук в Telegram" (profile) × per-topic auto / on / off
+//   Web      — global "Веб-уведомления" (profile) × per-chat on / off
+const webOn = (s) => !(state.webOff && state.webOff.has(s.thread_id));
+function tgRings(s) {
+  return !s.web_only && !state.tgMuted && (s.sound || "auto") !== "off";
+}
 function soundInfo(s) {
+  const tg = tgRings(s);
+  const web = webOn(s) && !state.webMuted;
   const mode = s.sound || "auto";
-  if (s.web_only) return mode === "off" ? { icon: SVG.bellOff, title: "Уведомления выключены" } : { icon: SVG.bell, title: "Уведомления включены" };
-  if (state.tgMuted && mode !== "off") return { icon: SVG.bellOff, title: "Telegram заглушён целиком (меню профиля). Режим чата вернётся, когда включишь" };
-  if (mode === "on") return { icon: SVG.bellRing, title: "Telegram: всегда со звуком" };
-  if (mode === "off") return { icon: SVG.bellOff, title: "Без звука — ни в Telegram, ни в браузере" };
-  return { icon: SVG.bellAuto, title: s.quiet_now ? "Авто: сейчас тихо — ты пишешь из веба" : "Авто: со звуком" };
+  const tgText = s.web_only ? "Telegram: нет топика" : state.tgMuted ? "Telegram: выключен везде" : mode === "off" ? "Telegram: без звука" : mode === "on" ? "Telegram: всегда со звуком" : s.quiet_now ? "Telegram: авто (сейчас тихо — пишешь из веба)" : "Telegram: авто";
+  const webText = state.webMuted ? "веб: выключены везде" : webOn(s) ? "веб: включены" : "веб: выключены";
+  const title = `${tgText} · ${webText}`;
+  if (!tg && !web) return { icon: SVG.bellOff, title, off: true };
+  if (tg && mode === "on") return { icon: SVG.bellRing, title };
+  if (tg && mode === "auto") return { icon: SVG.bellAuto, title };
+  return { icon: SVG.bell, title };
 }
 
 function renderSoundBtn(s) {
   const b = $("sound-btn");
   b.hidden = s.sound === undefined; // backend without sound modes
   const info = soundInfo(s);
-  if (b.dataset.mode !== `${s.sound}|${s.quiet_now}|${s.web_only}|${state.tgMuted}`) {
-    b.dataset.mode = `${s.sound}|${s.quiet_now}|${s.web_only}|${state.tgMuted}`;
+  if (b.dataset.sig !== info.title) {
+    b.dataset.sig = info.title;
     b.innerHTML = info.icon;
   }
   b.title = info.title;
-  b.classList.toggle("muted-bell", s.sound === "off" || (state.tgMuted && !s.web_only));
+  b.classList.toggle("muted-bell", Boolean(info.off));
 }
 
-async function setSound(s, mode) {
-  const prev = s.sound;
-  s.sound = mode;
+async function setSound(s, body) {
+  const prev = { sound: s.sound, web: webOn(s) };
+  if (body.mode) s.sound = body.mode;
+  if ("web" in body) { if (body.web) state.webOff.delete(s.thread_id); else state.webOff.add(s.thread_id); }
   renderHeader();
   replay($("sound-btn"), "ring");
   try {
-    await api(`/api/sessions/${s.thread_id}/sound`, { body: { mode } });
+    await api(`/api/sessions/${s.thread_id}/sound`, { body });
     toast(soundInfo(s).title);
-  } catch (e) { s.sound = prev; renderHeader(); toast(e.message); }
+  } catch (e) {
+    s.sound = prev.sound;
+    if (prev.web) state.webOff.delete(s.thread_id); else state.webOff.add(s.thread_id);
+    renderHeader();
+    toast(e.message);
+  }
 }
 
 function soundMenu(s) {
   const mode = s.sound || "auto";
-  if (s.web_only) {
-    return [
-      { label: "Уведомления включены", icon: SVG.bell, check: mode !== "off", action: () => setSound(s, "auto") },
-      { label: "Без уведомлений", icon: SVG.bellOff, check: mode === "off", action: () => setSound(s, "off") },
-    ];
+  const items = [];
+  if (!s.web_only) {
+    items.push({ heading: state.tgMuted ? "Telegram · сейчас выключен везде (профиль)" : "Telegram — этот чат" });
+    items.push(
+      { label: "Авто", sub: "Тихо, пока пишешь отсюда; иначе со звуком", icon: SVG.bellAuto, check: mode === "auto", action: () => setSound(s, { mode: "auto" }) },
+      { label: "Всегда со звуком", icon: SVG.bellRing, check: mode === "on", action: () => setSound(s, { mode: "on" }) },
+      { label: "Без звука", sub: "Этот топик молчит, даже когда Telegram включён", icon: SVG.bellOff, check: mode === "off", action: () => setSound(s, { mode: "off" }) },
+      "sep",
+    );
   }
-  return [
-    { heading: state.tgMuted ? "Этот чат · сейчас весь Telegram без звука" : "Уведомления этого чата" },
-    { label: "Авто", sub: "Тихо в Telegram, пока пишешь отсюда", icon: SVG.bellAuto, check: mode === "auto", action: () => setSound(s, "auto") },
-    { label: "Всегда со звуком", sub: "Telegram звенит на каждый ответ", icon: SVG.bellRing, check: mode === "on", action: () => setSound(s, "on") },
-    { label: "Без звука", sub: "Ни Telegram, ни браузер не беспокоят", icon: SVG.bellOff, check: mode === "off", action: () => setSound(s, "off") },
-  ];
+  items.push({ heading: state.webMuted ? "Веб · сейчас выключены везде (профиль)" : "Веб — этот чат" });
+  items.push(
+    { label: "Уведомлять", sub: state.pushOn ? "Push на этом устройстве включён" : "Push на этом устройстве выключен — включи в профиле", icon: SVG.bell, check: webOn(s), action: () => setSound(s, { web: true }) },
+    { label: "Не уведомлять", icon: SVG.bellOff, check: !webOn(s), action: () => setSound(s, { web: false }) },
+  );
+  return items;
 }
 
 function effortMenu(s) {
@@ -1278,7 +1301,7 @@ function pickModel(provider, model) {
 // ═══ live events ════════════════════════════════════════════════════════════
 function notify(s, e) {
   if (!("Notification" in window) || Notification.permission !== "granted") return;
-  if (s && s.sound === "off") return;
+  if (s && (!webOn(s) || state.webMuted)) return;
   if (document.hidden && state.pushOn) return; // the server's Web Push shows it
   if (!document.hidden && e.thread_id === state.current) return;
   if (e.role !== "assistant" || e.content_type !== "text" || !e.is_complete) return;
@@ -1360,6 +1383,13 @@ function profileMenu() {
     check: !state.tgMuted,
     action: () => setTgMuted(!state.tgMuted),
   });
+  items.push({
+    label: "Веб-уведомления",
+    sub: state.webMuted ? "Выключены на всех устройствах · настройки чатов сохранены" : "Включены · по настройкам каждого чата",
+    icon: state.webMuted ? SVG.bellOff : SVG.bell,
+    check: !state.webMuted,
+    action: () => setWebMuted(!state.webMuted),
+  });
   if (pushSupported()) {
     items.push(state.pushOn
       ? { label: "Push на этом устройстве", sub: "Включён · нажми, чтобы выключить", icon: SVG.bell, check: true, action: disablePush }
@@ -1367,6 +1397,15 @@ function profileMenu() {
   }
   items.push({ label: "Выйти", icon: SVG.out, action: async () => { await api("/api/logout", { body: {} }).catch(() => {}); showLogin(); } });
   return items;
+}
+
+async function setWebMuted(on) {
+  try {
+    state.webMuted = (await api("/api/settings", { body: { web_muted: on } })).web_muted;
+    toast(on ? "Веб-уведомления выключены везде — выключенные чаты так и останутся выключенными" : "Веб-уведомления снова приходят — по настройкам каждого чата");
+    const s = currentSession();
+    if (s) renderSoundBtn(s);
+  } catch (e) { toast(e.message); }
 }
 
 async function setTgMuted(on) {
@@ -1455,6 +1494,8 @@ async function boot() {
   api("/api/settings").then((r) => {
     state.tgMuted = r.tg_muted;
     state.notifyMode = r.notify_mode || "each";
+    state.webMuted = Boolean(r.web_muted);
+    state.webOff = new Set(r.web_off || []);
     state.stt = Boolean(r.stt);
     $("mic-btn").hidden = !micSupported();
     if (typeof r.new_chat_telegram === "boolean") { state.telegram = r.new_chat_telegram; store.set("kara-telegram", state.telegram ? "1" : "0"); renderToggle(); }
@@ -1905,6 +1946,8 @@ function ansiToHtml(text) {
 }
 
 // ═══ folder for a new chat (+ git worktree) ═════════════════════════════════
+state.webOff = new Set();
+state.webMuted = false;
 state.cwd = store.get("kara-cwd") || "";
 state.worktree = false;
 function renderCwd() {
@@ -1961,7 +2004,8 @@ $("resume-btn").onclick = async () => {
     const list = $("resume-list");
     list.innerHTML = "";
     for (const x of r.sessions) {
-      const b = el("button", "pk-item two", `<span>${esc(x.summary || x.id.slice(0, 8))}</span><span class="muted">${esc(ago(x.mtime))}</span>`);
+      const summary = String(x.summary || "").replace(/<[^>]+>/g, " ").replace(/`{3,}/g, "").replace(/\s+/g, " ").trim();
+      const b = el("button", "pk-item two", `<span>${esc(summary || x.id.slice(0, 8))}</span><span class="muted">${esc(ago(x.mtime))}</span>`);
       b.type = "button";
       b.onclick = async () => {
         dlg.close();

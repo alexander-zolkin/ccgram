@@ -129,3 +129,16 @@ def test_send_all_signs_with_the_stored_key(monkeypatch):
     assert url == "https://push.example/x"
     assert headers["content-encoding"] == "aes128gcm"
     assert headers["authorization"].startswith("vapid t=")
+
+
+def test_web_switches_are_independent_and_combine():
+    assert push.allowed(5)
+    push.set_chat_web(5, False)
+    assert not push.allowed(5) and push.allowed(6)
+    push.set_web_muted(True)
+    assert not push.allowed(6)
+    push.set_web_muted(False)
+    push.set_chat_web(5, True)
+    assert push.allowed(5) and push.web_off() == []
+    push.load_web_off([7, 8])
+    assert push.web_off() == [7, 8]

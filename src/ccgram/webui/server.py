@@ -340,6 +340,7 @@ async def _settings(request: web.Request) -> web.Response:
     from .. import quiet_threads
     from .prefs import new_chat_telegram, set_new_chat_telegram, set_tg_muted
     from .prefs import set_notify_mode as save_notify_mode
+    from .prefs import set_web_muted as save_web_muted
 
     if request.method == "POST":
         body = await _json_body(request)
@@ -350,6 +351,9 @@ async def _settings(request: web.Request) -> web.Response:
             # Server-side on purpose: an iOS home-screen app has its own
             # localStorage, so a browser-only choice silently reset there.
             set_new_chat_telegram(bool(body["new_chat_telegram"]))
+        if "web_muted" in body:
+            push.set_web_muted(bool(body["web_muted"]))
+            save_web_muted(bool(body["web_muted"]))
         if body.get("notify_mode") in extras.NOTIFY_MODES:
             extras.set_notify_mode(body["notify_mode"])
             save_notify_mode(body["notify_mode"])
@@ -358,6 +362,8 @@ async def _settings(request: web.Request) -> web.Response:
             "tg_muted": quiet_threads.all_muted(),
             "new_chat_telegram": new_chat_telegram(),
             "notify_mode": extras.notify_mode(),
+            "web_muted": push.web_muted(),
+            "web_off": push.web_off(),
             "stt": bool(os.getenv("CCGRAM_WHISPER_PROVIDER")),
         }
     )
@@ -440,10 +446,21 @@ async def _presence(request: web.Request) -> web.Response:
 
 
 async def _sound(request: web.Request) -> web.Response:
+    """Per-chat notifications: ``mode`` = Telegram sound, ``web`` = web on/off."""
+    # Lazy: prefs is a leaf.
+    from .prefs import set_web_off
+
     body = await _json_body(request)
-    return web.json_response(
-        await service.set_sound(_thread_id(request), str(body.get("mode", "")))
-    )
+    tid = _thread_id(request)
+    result: dict[str, Any] = {"ok": True}
+    if "web" in body:
+        service.find_binding(tid)
+        push.set_chat_web(tid, bool(body["web"]))
+        set_web_off(push.web_off())
+        result["web"] = tid not in push.web_off()
+    if "mode" in body:
+        result.update(await service.set_sound(tid, str(body.get("mode", ""))))
+    return web.json_response(result)
 
 
 async def _keep(request: web.Request) -> web.Response:
@@ -620,10 +637,14 @@ async def start_webui(bot: Bot | Any) -> None:
         # Lazy: leaf modules, only needed once the UI is actually enabled.
         from .. import quiet_threads
         from .prefs import notify_mode, sound_modes, tg_muted
+        from .prefs import web_muted as prefs_web_muted
+        from .prefs import web_off as prefs_web_off
 
         quiet_threads.load_modes(sound_modes())
         quiet_threads.set_all_muted(tg_muted())
         extras.set_notify_mode(notify_mode())
+        push.set_web_muted(prefs_web_muted())
+        push.load_web_off(prefs_web_off())
         app = build_app(
             bot=bot,
             bot_token=config.telegram_bot_token,

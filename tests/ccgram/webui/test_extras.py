@@ -71,8 +71,8 @@ async def test_done_mode_respects_muted_topic_and_global_mute(wired):
     quiet_threads.set_mode(7, "off")
     quiet_threads.set_all_muted(True)
     await extras.on_stop("@1", FakeClient())
-    assert sent == []
-    assert [p[0] for p in pushed] == [-3]
+    assert sent == []  # Telegram muted (topic + globally) ...
+    assert [p[0] for p in pushed] == [7, -3]  # ... web is its own channel
 
 
 async def test_attention_rings_in_done_mode_and_pushes(wired):

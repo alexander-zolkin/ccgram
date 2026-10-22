@@ -90,6 +90,25 @@ def set_notify_mode(mode: str) -> None:
     _save()
 
 
+def web_muted() -> bool:
+    return bool(_load().get("web_muted", False))
+
+
+def set_web_muted(on: bool) -> None:
+    _load()["web_muted"] = bool(on)
+    _save()
+
+
+def web_off() -> list[int]:
+    raw = _load().get("web_off", [])
+    return [int(x) for x in raw if isinstance(x, int)]
+
+
+def set_web_off(ids: list[int]) -> None:
+    _load()["web_off"] = sorted(set(ids))
+    _save()
+
+
 def reset_for_testing() -> None:
     global _prefs
     _prefs = None
