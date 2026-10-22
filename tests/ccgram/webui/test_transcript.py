@@ -101,6 +101,15 @@ def test_parse_shapes_and_merge(tmp_path):
     assert edit["result"]["patch"][0]["lines"] == ["-x", "+y"]
 
 
+def test_paste_wrappers_are_not_shown():
+    wrapped = '<pasted_content id="caa1">\nДело:\n> текст\n</pasted_content id="caa1">'
+    (item,) = transcript.parse_entry(_user(wrapped, "u1"))
+    assert item["text"] == "Дело:\n> текст"
+    blocks = [{"type": "text", "text": "смотри\n" + wrapped + "\nчто это?"}]
+    (item,) = transcript.parse_entry(_user(blocks, "u2"))
+    assert item["text"] == "смотри\nДело:\n> текст\nчто это?"
+
+
 def test_after_returns_late_result_standalone(tmp_path):
     p = tmp_path / "t.jsonl"
     call = _assistant(

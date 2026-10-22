@@ -42,6 +42,9 @@ _TAG = re.compile(
     re.S,
 )
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# Claude Code wraps pasted text in these (a multi-line message from the web
+# arrives as a paste); the person wrote only what is inside.
+_PASTED = re.compile(r'\n?</?pasted_content(?: id="[^"]*")?>\n?')
 
 
 def _tags(text: str) -> dict[str, str]:
@@ -184,7 +187,8 @@ def _parse_user_text(
         return special if special is not None else []
     if content.strip() == _SYNTHETIC_CONTINUE:
         return []
-    return [{"kind": "user", "text": content, "ts": ts, "uuid": uuid}]
+    text = _PASTED.sub("\n", content).strip("\n")
+    return [{"kind": "user", "text": text, "ts": ts, "uuid": uuid}]
 
 
 def _parse_user(entry: dict[str, Any], content: Any, ts: Any, uuid: str) -> list:
@@ -205,7 +209,7 @@ def _parse_user(entry: dict[str, Any], content: Any, ts: Any, uuid: str) -> list
         elif btype == "image":
             images += 1
     if texts or images:
-        text = "\n".join(t for t in texts if t)
+        text = _PASTED.sub("\n", "\n".join(t for t in texts if t)).strip("\n")
         items.append(
             {"kind": "user", "text": text, "images": images, "ts": ts, "uuid": uuid}
         )
