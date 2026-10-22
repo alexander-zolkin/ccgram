@@ -20,7 +20,14 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``GET  /api/sessions/{tid}/file?path=`` an upload of the session (.ccgram-uploads only)
 - ``GET  /api/search?q=``                  full-text search over all transcripts
 - ``GET  /api/push/key``, ``POST /api/push/(un)subscribe``  Web Push devices
-- ``GET/POST /api/settings``               {tg_muted}: silence every Telegram topic
+- ``GET/POST /api/settings``  tg_muted / new_chat_telegram / notify_mode (each|done)
+- ``POST /api/sessions/{tid}/probe``       does the Telegram topic still exist?
+- ``GET  /api/sessions/{tid}/live``        status line, checklist, subagents, todos
+- ``GET/POST /api/sessions/{tid}/mode``    Claude Code mode (POST = Shift+Tab)
+- ``GET  /api/sessions/{tid}/terminal``    pane with ANSI colours
+- ``GET  /api/commands?tid=|provider=``    slash commands + skills
+- ``POST /api/stt``                         voice → text (Whisper)
+- ``GET  /api/browse?path=``, ``/api/resumable?cwd=``  folders / old sessions
 - ``POST /api/presence``                   "this tab is visible" (mutes push)
 - ``POST /api/sessions/{tid}/detach``     delete the topic, keep the session
 - ``POST /api/sessions/{tid}/keep``       keep a session whose topic was deleted
@@ -41,13 +48,14 @@ import contextlib
 import json
 import logging
 import os
+import re
 from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from . import push, service
+from . import extras, push, service
 from ..providers.claude import EFFORT_LEVELS
 from .auth import COOKIE_NAME, SESSION_TTL_S, LoginThrottle, check_password
 from .auth import issue_cookie, verify_cookie
@@ -68,6 +76,8 @@ _STATIC_DIR = Path(
 
 _BOT_KEY = web.AppKey("webui_bot", object)
 _TOKEN_KEY = web.AppKey("webui_bot_token", str)
+MAX_AUDIO = 20 * 1024 * 1024
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _PASSWORD_KEY = web.AppKey("webui_password", str)
 _THROTTLE_KEY = web.AppKey("webui_throttle", LoginThrottle)
 
@@ -216,16 +226,25 @@ async def _create(request: web.Request) -> web.Response:
     model = service.valid_model(body.get("model"))
     provider = service.valid_provider(body.get("provider"))
     effort = body.get("effort") if body.get("effort") in EFFORT_LEVELS else None
+    cwd = await asyncio.to_thread(extras.valid_cwd, body.get("cwd") or None)
+    resume_id = body.get("resume_id") or None
+    if resume_id is not None and not _UUID_RE.match(str(resume_id)):
+        raise service.WebUIError("bad session id")
+    if body.get("worktree") and cwd:
+        title = name or str(body.get("text", ""))[:40]
+        cwd = await extras.make_worktree(cwd, title)
     logger.info(
-        "webui create: web_only=%s provider=%s model=%s effort=%s",
+        "webui create: web_only=%s provider=%s model=%s effort=%s cwd=%s resume=%s",
         bool(body.get("web_only")),
         provider,
         model,
         effort,
+        cwd,
+        resume_id,
     )
     if body.get("web_only"):
         result = await service.create_web_only_session(
-            str(body.get("text", "")), name, model, provider, effort
+            str(body.get("text", "")), name, model, provider, effort, cwd, resume_id
         )
     else:
         result = await service.create_session(
@@ -235,6 +254,8 @@ async def _create(request: web.Request) -> web.Response:
             model,
             provider,
             effort,
+            cwd,
+            resume_id,
         )
     return web.json_response(result)
 
@@ -318,6 +339,7 @@ async def _settings(request: web.Request) -> web.Response:
     # Lazy: leaf modules.
     from .. import quiet_threads
     from .prefs import new_chat_telegram, set_new_chat_telegram, set_tg_muted
+    from .prefs import set_notify_mode as save_notify_mode
 
     if request.method == "POST":
         body = await _json_body(request)
@@ -328,12 +350,68 @@ async def _settings(request: web.Request) -> web.Response:
             # Server-side on purpose: an iOS home-screen app has its own
             # localStorage, so a browser-only choice silently reset there.
             set_new_chat_telegram(bool(body["new_chat_telegram"]))
+        if body.get("notify_mode") in extras.NOTIFY_MODES:
+            extras.set_notify_mode(body["notify_mode"])
+            save_notify_mode(body["notify_mode"])
     return web.json_response(
         {
             "tg_muted": quiet_threads.all_muted(),
             "new_chat_telegram": new_chat_telegram(),
+            "notify_mode": extras.notify_mode(),
+            "stt": bool(os.getenv("CCGRAM_WHISPER_PROVIDER")),
         }
     )
+
+
+async def _probe(request: web.Request) -> web.Response:
+    return web.json_response(
+        await extras.probe_topic(request.app[_BOT_KEY], _thread_id(request))
+    )
+
+
+async def _live(request: web.Request) -> web.Response:
+    return web.json_response(await extras.live(_thread_id(request)))
+
+
+async def _mode(request: web.Request) -> web.Response:
+    cycle = request.method == "POST"
+    return web.json_response(await extras.approval_mode(_thread_id(request), cycle))
+
+
+async def _terminal(request: web.Request) -> web.Response:
+    return web.json_response(await extras.terminal(_thread_id(request)))
+
+
+async def _commands(request: web.Request) -> web.Response:
+    tid = request.query.get("tid")
+    result = await asyncio.to_thread(
+        extras.commands,
+        int(tid) if tid and tid.lstrip("-").isdigit() else None,
+        request.query.get("provider", "claude"),
+    )
+    return web.json_response(result)
+
+
+async def _stt(request: web.Request) -> web.Response:
+    reader = await request.multipart()
+    part = await reader.next()
+    if part is None or getattr(part, "name", None) != "audio":
+        raise service.WebUIError("no audio")
+    data = await part.read(decode=False)  # type: ignore[union-attr]
+    if len(data) > MAX_AUDIO:
+        raise service.WebUIError("recording too long", 413)
+    filename = getattr(part, "filename", None) or "voice.webm"
+    return web.json_response(await extras.transcribe(bytes(data), filename))
+
+
+async def _browse(request: web.Request) -> web.Response:
+    return web.json_response(
+        await asyncio.to_thread(extras.browse, request.query.get("path"))
+    )
+
+
+async def _resumable(request: web.Request) -> web.Response:
+    return web.json_response(await extras.resumable(request.query.get("cwd")))
 
 
 async def _push_key(_request: web.Request) -> web.Response:
@@ -496,6 +574,15 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/sound", _sound)
     r.add_get("/api/sessions/{tid}/file", _file)
     r.add_get("/api/search", _search)
+    r.add_post("/api/sessions/{tid}/probe", _probe)
+    r.add_get("/api/sessions/{tid}/live", _live)
+    r.add_get("/api/sessions/{tid}/mode", _mode)
+    r.add_post("/api/sessions/{tid}/mode", _mode)
+    r.add_get("/api/sessions/{tid}/terminal", _terminal)
+    r.add_get("/api/commands", _commands)
+    r.add_post("/api/stt", _stt)
+    r.add_get("/api/browse", _browse)
+    r.add_get("/api/resumable", _resumable)
     r.add_get("/api/settings", _settings)
     r.add_post("/api/settings", _settings)
     r.add_get("/api/push/key", _push_key)
@@ -532,10 +619,11 @@ async def start_webui(bot: Bot | Any) -> None:
     try:
         # Lazy: leaf modules, only needed once the UI is actually enabled.
         from .. import quiet_threads
-        from .prefs import sound_modes, tg_muted
+        from .prefs import notify_mode, sound_modes, tg_muted
 
         quiet_threads.load_modes(sound_modes())
         quiet_threads.set_all_muted(tg_muted())
+        extras.set_notify_mode(notify_mode())
         app = build_app(
             bot=bot,
             bot_token=config.telegram_bot_token,

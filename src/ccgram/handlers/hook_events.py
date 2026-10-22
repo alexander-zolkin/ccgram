@@ -38,6 +38,36 @@ from .status.topic_emoji import update_topic_emoji
 logger = structlog.get_logger()
 
 
+_webui_tasks: set[asyncio.Task] = set()
+
+
+def _webui_hook(kind: str, event: HookEvent, client: TelegramClient) -> None:
+    """Hand a Stop / Notification hook to the web UI (no-op when it's off)."""
+    try:
+        # Lazy: the web UI is an optional surface.
+        from ..config import config
+
+        if not config.webui_port:
+            return
+        from ..webui import extras
+
+        window_id = strip_session_map_prefix(event.window_key, session_map_prefix())
+        if window_id is None:
+            return
+        if kind == "stop":
+            coro = extras.on_stop(window_id, client)
+        else:
+            header = classify_wait_message(event.data.get("message", ""))
+            if not header or header == _WAITING_INPUT:
+                return
+            coro = extras.on_attention(window_id, header, client)
+        task = asyncio.get_running_loop().create_task(coro)
+        _webui_tasks.add(task)
+        task.add_done_callback(_webui_tasks.discard)
+    except Exception:  # noqa: BLE001 — the web UI must never break hooks
+        logger.exception("webui hook failed")
+
+
 def _resolve_users_for_window_key(
     window_key: str,
 ) -> list[tuple[int, int, str]]:
@@ -84,6 +114,8 @@ def _resolve_user_chats_for_window_key(
 
 async def _handle_notification(event: HookEvent, client: TelegramClient) -> None:
     """Handle a Notification event — render interactive UI."""
+    # CCGRAM-HOTFIX:webui-hooks — permission / plan prompts ring + push.
+    _webui_hook("notification", event, client)
     users = _resolve_user_chats_for_window_key(event.window_key)
     if not users:
         logger.debug(
@@ -185,6 +217,10 @@ async def _handle_stop(event: HookEvent, client: TelegramClient) -> None:
     transcript/activity heuristic and cause active/idle rename churn on quiet
     topics, so Stop only updates the status bubble.
     """
+
+    # CCGRAM-HOTFIX:webui-hooks — "notify when done" ping + push; runs before
+    # the binding check so web-only chats (no topic) get their push too.
+    _webui_hook("stop", event, client)
 
     users = _resolve_users_for_window_key(event.window_key)
     if not users:

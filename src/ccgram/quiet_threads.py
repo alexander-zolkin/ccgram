@@ -22,6 +22,9 @@ _modes: dict[int, str] = {}  # thread id → "on" | "off"; absent = "auto"
 # the per-topic modes: flipping it back on restores every topic's own mode,
 # so a topic muted on its own stays muted.
 _all_muted = False
+# "Notify when the turn is done" (web UI setting): every message of a turn is
+# silent; the web UI sends one ringing ping when the agent stops.
+_turn_quiet = False
 MODES = ("auto", "on", "off")
 
 
@@ -73,11 +76,16 @@ def all_muted() -> bool:
     return _all_muted
 
 
+def set_turn_quiet(on: bool) -> None:
+    global _turn_quiet
+    _turn_quiet = bool(on)
+
+
 def is_quiet(chat_id: Any, thread_id: Any) -> bool:
     key = _key(chat_id, thread_id)
     if key is None:
         return False
-    if _all_muted:
+    if _all_muted or _turn_quiet:
         return True
     explicit = _modes.get(key[1])
     if explicit is not None:
@@ -93,7 +101,8 @@ def apply(chat_id: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def reset_for_testing() -> None:
-    global _all_muted
+    global _all_muted, _turn_quiet
     _quiet.clear()
     _modes.clear()
     _all_muted = False
+    _turn_quiet = False

@@ -685,6 +685,8 @@ async def create_session(
     model: str | None,
     provider: str = "claude",
     effort: str | None = None,
+    cwd: str | None = None,
+    resume_id: str | None = None,
 ) -> dict[str, Any]:
     """Open a new forum topic and launch a quick-start session bound to it."""
     # Lazy: the launch service drags in the topics handler graph.
@@ -712,8 +714,9 @@ async def create_session(
     chat_id = config.group_id
     if chat_id is None:
         raise WebUIError("CCGRAM_GROUP_ID is not configured", 500)
-    if not Path(QUICKSTART_DEFAULT_CWD).is_dir():
-        raise WebUIError("default directory missing", 500)
+    folder = cwd or QUICKSTART_DEFAULT_CWD
+    if not Path(folder).is_dir():
+        raise WebUIError("directory missing", 500)
     title = (name or "").strip()[:120] or _default_topic_name()
     user_id = _owner_user_id()
 
@@ -754,11 +757,12 @@ async def create_session(
             user_id=user_id,
             thread_id=thread_id,
             provider_name=provider,
-            cwd=QUICKSTART_DEFAULT_CWD,
+            cwd=folder,
             mode=QUICKSTART_DEFAULT_MODE,
             pending_text=text if as_arg else None,
             model=model_id,
             effort=effort,
+            resume_id=resume_id,
             chat_id=chat_id,
         ),
     )
@@ -778,6 +782,7 @@ def _web_only_launch(
     provider_name: str = "claude",
     text: str = "",
     effort: str | None = None,
+    resume_id: str | None = None,
 ) -> tuple[str, str, str, Any, bool]:
     """(launch command, provider name, approval mode, provider) for quick-start.
 
@@ -805,15 +810,19 @@ def _web_only_launch(
     provider_name = provider_name or QUICKSTART_DEFAULT_PROVIDER
     mode = QUICKSTART_DEFAULT_MODE
     provider = provider_registry.get(provider_name)
-    args = provider.make_launch_args()
+    args = (
+        provider.make_launch_args(resume_id=resume_id)
+        if resume_id
+        else provider.make_launch_args()
+    )
     args = args if isinstance(args, str) else ""
     model_id = model or (recall_model(provider_name) or (None,))[0]
-    if model_id and provider.capabilities.supports_model_picker:
+    if model_id and provider.capabilities.supports_model_picker and not resume_id:
         if provider_name == "claude":
             model_id = with_1m_context(model_id)
         # Quoted: ids like ``claude-opus-5-5[1m]`` are shell globs.
         args = f"{args} --model {shlex.quote(model_id)}".strip()
-    if effort and provider_name == "claude":
+    if effort and provider_name == "claude" and not resume_id:
         # Lazy: provider module is already loaded by the registry above.
         from ..providers.claude import with_effort
 
@@ -832,6 +841,8 @@ async def create_web_only_session(
     model: str | None = None,
     provider: str = "claude",
     effort: str | None = None,
+    cwd: str | None = None,
+    resume_id: str | None = None,
 ) -> dict[str, Any]:
     """Launch a quick-start session with no Telegram topic at all.
 
@@ -860,11 +871,11 @@ async def create_web_only_session(
     text = text.strip()
     if len(text) > MAX_TEXT_LEN:
         raise WebUIError("message too long")
-    cwd = QUICKSTART_DEFAULT_CWD
+    cwd = cwd or QUICKSTART_DEFAULT_CWD
     if not Path(cwd).is_dir():
-        raise WebUIError("default directory missing", 500)
+        raise WebUIError("directory missing", 500)
     launch, provider_name, mode, provider, as_arg = _web_only_launch(
-        valid_model(model), provider, text, effort
+        valid_model(model), provider, text, effort, resume_id
     )
     title = (name or "").strip()[:120] or "веб " + time.strftime("%m-%d %H-%M")
 

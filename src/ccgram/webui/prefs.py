@@ -81,6 +81,15 @@ def set_new_chat_telegram(on: bool) -> None:
     _save()
 
 
+def notify_mode() -> str:
+    return str(_load().get("notify_mode", "each"))
+
+
+def set_notify_mode(mode: str) -> None:
+    _load()["notify_mode"] = mode
+    _save()
+
+
 def reset_for_testing() -> None:
     global _prefs
     _prefs = None

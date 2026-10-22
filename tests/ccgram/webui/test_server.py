@@ -46,7 +46,9 @@ def calls(monkeypatch):
             raise service.WebUIError("unknown session", 404)
         return {"messages": [{"role": "user", "text": "hi"}], "total": 1}
 
-    async def fake_create(bot, text, name, model, provider="claude", effort=None):
+    async def fake_create(
+        bot, text, name, model, provider="claude", effort=None, cwd=None, resume_id=None
+    ):
         log.append(("create", text, name) + ((effort,) if effort else ()))
         return {"thread_id": 8, "window_id": "@4", "name": name or "kara"}
 
@@ -362,14 +364,22 @@ async def test_settings_roundtrip(client, tmp_path, monkeypatch):
     prefs.reset_for_testing()
     await _login(client)
     resp = await client.get("/api/settings")
-    assert await resp.json() == {"tg_muted": False, "new_chat_telegram": True}
+    got = await resp.json()
+    assert got["tg_muted"] is False and got["new_chat_telegram"] is True
+    assert got["notify_mode"] == "each"
     resp = await client.post(
         "/api/settings",
-        json={"new_chat_telegram": False, "tg_muted": True},
+        json={"new_chat_telegram": False, "tg_muted": True, "notify_mode": "done"},
         headers=POST_HEADERS,
     )
-    assert await resp.json() == {"tg_muted": True, "new_chat_telegram": False}
+    got = await resp.json()
+    assert got["tg_muted"] is True and got["new_chat_telegram"] is False
+    assert got["notify_mode"] == "done" and quiet_threads.is_quiet(-1, 5)
     prefs.reset_for_testing()
     assert prefs.new_chat_telegram() is False and prefs.tg_muted() is True
+    assert prefs.notify_mode() == "done"
+    from ccgram.webui import extras
+
+    extras.reset_for_testing()
     quiet_threads.reset_for_testing()
     prefs.reset_for_testing()

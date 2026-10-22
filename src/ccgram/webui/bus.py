@@ -86,9 +86,9 @@ def _push_reply(msg: Any, active_users: list[tuple[Any, ...]]) -> None:
         # Lazy: push / quiet_threads / topic names are leaves, only needed here.
         from .. import quiet_threads
         from ..handlers.status.topic_emoji import get_stored_topic_name
-        from . import push
+        from . import extras, push
 
-        if not push.has_subscriptions():
+        if not push.has_subscriptions() and extras.notify_mode() != "done":
             return
         done: set[int] = set()
         for _user_id, _window_id, thread_id, chat_id in active_users:
@@ -98,7 +98,11 @@ def _push_reply(msg: Any, active_users: list[tuple[Any, ...]]) -> None:
             if quiet_threads.mode(thread_id) == "off":
                 continue
             title = (chat_id and get_stored_topic_name(chat_id, thread_id)) or "Кара"
-            push.notify_reply(thread_id, title, str(msg.text or ""))
+            if extras.notify_mode() == "done":
+                # Deferred: the Stop hook pushes the turn's last reply once.
+                extras.remember_reply(thread_id, title, str(msg.text or ""))
+            else:
+                push.notify_reply(thread_id, title, str(msg.text or ""))
     except Exception:  # noqa: BLE001 — never break Telegram delivery
         logger.exception("webui push failed")
 

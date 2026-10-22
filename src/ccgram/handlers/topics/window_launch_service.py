@@ -68,6 +68,9 @@ class WindowLaunchRequest:
     model: str | None = None
     # CCGRAM-HOTFIX:webui-effort — reasoning effort for a fresh claude session.
     effort: str | None = None
+    # CCGRAM-HOTFIX:webui-extras — continue an earlier session instead of a
+    # fresh one (web UI "continue a past session"); model/effort keep theirs.
+    resume_id: str | None = None
     # CCGRAM-HOTFIX:private-session — when True (grok only), the session runs in
     # an isolated private folder with a private GROK_HOME so its files + history
     # stay out of the assistant's scan paths. ``cwd`` is expected to already be
@@ -311,6 +314,14 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         accepts_prompt = False
     if not isinstance(fresh_args, str):
         fresh_args = ""
+    if request.resume_id:
+        try:
+            resumed = provider_registry.get(provider_name).make_launch_args(
+                resume_id=request.resume_id
+            )
+        except Exception:  # noqa: BLE001 — a bad id falls back to a fresh start
+            resumed = ""
+        fresh_args = resumed if isinstance(resumed, str) else ""
     # CCGRAM-HOTFIX:model-picker — append the chosen model as `--model <id>` for
     # any provider with a model picker (claude, grok). When no model was picked,
     # grok honours the CCGRAM_GROK_MODEL env default; other providers fall back
@@ -327,13 +338,13 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         from ccgram.model_catalog import with_1m_context
 
         model_id = with_1m_context(model_id)
-    if model_id and supports_model:
+    if model_id and supports_model and not request.resume_id:
         # Lazy: shlex only needed on the model path. Quoted because ids like
         # ``claude-opus-5-5[1m]`` are shell globs.
         import shlex
 
         fresh_args = f"{fresh_args} --model {shlex.quote(model_id)}".strip()
-    if request.effort and provider_name == "claude":
+    if request.effort and provider_name == "claude" and not request.resume_id:
         # Lazy: provider module is already loaded by the registry above.
         from ccgram.providers.claude import with_effort
 

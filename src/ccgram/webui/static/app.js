@@ -91,6 +91,9 @@ const SVG = {
   out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>',
   globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>',
   tgGone: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 5L3 11.5l5 1.8M21 5l-3 14-6.5-4.5M21 5L8 13.3v5.2l3.5-3.2M3 3l18 18"/></svg>',
+  check2: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/></svg>',
+  folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  branch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-12 3-12 8"/></svg>',
   chev: '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>',
 };
 
@@ -567,6 +570,7 @@ function appendItems(items) {
   }
   thread.appendChild(frag);
   markLast();
+  refreshMsgStatus();
   autoOpenLive();
   if (stick) toBottom(true); else if (items.length) $("jump-btn").hidden = false;
 }
@@ -643,6 +647,11 @@ function showHome() {
   $("prompt-card").hidden = true;
   $("tg-toggle").hidden = false;
   $("model-btn").hidden = false;
+  $("cwd-btn").hidden = false;
+  $("home-actions").hidden = false;
+  $("mode-btn").hidden = true;
+  $("live").hidden = true;
+  renderCwd();
   $("input").placeholder = "Как я могу помочь?";
   setTitle("Кара");
   renderToggle();
@@ -657,6 +666,11 @@ async function openSession(tid) {
   $("tg-toggle").hidden = true;
   $("model-btn").hidden = true;
   $("effort-btn").hidden = true;
+  $("cwd-btn").hidden = true;
+  $("home-actions").hidden = true;
+  $("live").hidden = true;
+  $("mode-btn").hidden = true;
+  $("mode-btn").dataset.mode = "";
   $("input").placeholder = "Ответить Каре…";
   state.current = tid;
   state.unread.delete(tid);
@@ -678,6 +692,7 @@ async function openSession(tid) {
     const pending = state.pending.get(tid);
     if (pending) { const p = pendingNode(pending); p.querySelector(".tick").innerHTML = TICK.sent; $("thread").appendChild(p); }
     replay($("thread"), "fade");
+    refreshMsgStatus();
     markLast();
     autoOpenLive();
     if (location.search.includes("expand")) {
@@ -693,6 +708,7 @@ async function openSession(tid) {
     resetThread(`<div class="loader-row">Не загрузилось: ${esc(e.message)}</div>`);
   }
   pollPane();
+  probeTopic(tid);
   if (!isMobile()) $("input").focus();
 }
 
@@ -904,6 +920,7 @@ function renderHeader() {
   $("gone-card").hidden = !s.topic_deleted;
   $("disclaimer").textContent = s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
   setTitle(`${working ? "⏳ " : ""}${s.name} — Кара`);
+  refreshMsgStatus();
 }
 
 function setTitle(base) {
@@ -1052,13 +1069,22 @@ async function pollPane() {
   if (tid == null || !s) return;
   if (!document.hidden && s.state !== "dead") {
     try {
-      const data = await api(`/api/sessions/${tid}/pane`);
+      const wantTerm = !$("pane").hidden;
+      const [data, live, term] = await Promise.all([
+        api(`/api/sessions/${tid}/pane`),
+        api(`/api/sessions/${tid}/live`).catch(() => null),
+        wantTerm ? api(`/api/sessions/${tid}/terminal`).catch(() => null) : null,
+      ]);
       if (tid === state.current) {
-        if (!$("pane").hidden) {
+        if (wantTerm) {
           const pre = $("pane-text");
-          pre.textContent = data.alive ? data.text.replace(/\s+$/, "") : "(сессия спит)";
-          pre.scrollTop = pre.scrollHeight;
+          const stick = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+          if (term && term.alive) pre.innerHTML = ansiToHtml(term.ansi.replace(/\s+$/, ""));
+          else pre.textContent = data.alive ? data.text.replace(/\s+$/, "") : "(сессия спит)";
+          if (stick) pre.scrollTop = pre.scrollHeight;
         }
+        renderLive(live, s);
+        if (s.provider === "claude" && (!state.modeAt || Date.now() - state.modeAt > 15000)) refreshMode(tid);
         const inter = data.interactive;
         $("prompt-card").hidden = !inter;
         if (inter) renderPrompt(inter);
@@ -1138,6 +1164,7 @@ async function sendTo(tid, message, node) {
   const p = node || pendingNode(message);
   if (!node) {
     $("thread").appendChild(p);
+    refreshMsgStatus();
     toBottom();
     flyIn(p);
   }
@@ -1149,6 +1176,8 @@ async function sendTo(tid, message, node) {
   try {
     await api(`/api/sessions/${tid}/send`, { body: { text: message } });
     p.querySelector(".tick").innerHTML = TICK.sent;
+    p.dataset.sent = "1";
+    refreshMsgStatus();
     if (s) { s.state = "active"; renderHeader(); }
   } catch (e) {
     state.pending.delete(tid);
@@ -1175,7 +1204,8 @@ async function send() {
       $("working-text").textContent = state.telegram ? "Создаю чат и топик…" : "Создаю чат…";
       const c = currentChoice();
       const effort = c?.provider.id === "claude" && state.effort ? state.effort : undefined;
-      const res = await api("/api/sessions", { body: { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort } });
+      const res = await api("/api/sessions", { body: { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort, cwd: state.cwd || undefined, worktree: state.worktree || undefined } });
+      if (state.worktree) { state.worktree = false; renderCwd(); }
       clearComposer();
       state.pending.set(res.thread_id, message);
       await refreshSessions();
@@ -1318,6 +1348,12 @@ function profileMenu() {
   });
   items.push({ heading: "Уведомления" });
   items.push({
+    label: "Когда уведомлять",
+    sub: state.notifyMode === "done" ? "Один раз — когда задача готова (и если нужно разрешение)" : "На каждое сообщение",
+    icon: state.notifyMode === "done" ? SVG.check2 : SVG.bell,
+    action: () => setNotifyMode(state.notifyMode === "done" ? "each" : "done"),
+  });
+  items.push({
     label: "Звук в Telegram",
     sub: state.tgMuted ? "Все топики без звука · настройки чатов сохранены" : "Звук по настройкам каждого чата",
     icon: state.tgMuted ? SVG.bellOff : SVG.tg,
@@ -1418,6 +1454,9 @@ async function boot() {
   refreshPushState();
   api("/api/settings").then((r) => {
     state.tgMuted = r.tg_muted;
+    state.notifyMode = r.notify_mode || "each";
+    state.stt = Boolean(r.stt);
+    $("mic-btn").hidden = !micSupported();
     if (typeof r.new_chat_telegram === "boolean") { state.telegram = r.new_chat_telegram; store.set("kara-telegram", state.telegram ? "1" : "0"); renderToggle(); }
     const s = currentSession();
     if (s) renderSoundBtn(s);
@@ -1758,6 +1797,311 @@ document.addEventListener("keydown", (ev) => {
   if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.code === "KeyO") { ev.preventDefault(); location.hash = "#new"; }
   if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey && ev.code === "KeyP") { ev.preventDefault(); openSwitcher(); }
 });
+
+// ═══ deleted-topic probe ═════════════════════════════════════════════════════
+// Telegram never tells bots a topic was deleted; opening the chat checks it.
+async function probeTopic(tid) {
+  const s = sessionById(tid);
+  if (!s || s.web_only || !s.chat_id) return;
+  try {
+    const r = await api(`/api/sessions/${tid}/probe`, { body: {} });
+    if (r.exists === false) { toast("Топик этого чата удалён в Telegram"); await refreshSessions(); }
+  } catch (_) { /* best effort */ }
+}
+
+// ═══ live status: what the agent is doing right now ═════════════════════════
+const STATUS_RU = [[/^(reading|read)\b/i, "Читает"], [/^(writing|write)\b/i, "Пишет"], [/^(editing|edit)\b/i, "Правит"], [/^(searching|search|grep)/i, "Ищет"], [/^(running|bash|execut)/i, "Выполняет"], [/^(thinking|reason)/i, "Думает"], [/^(testing|test)/i, "Тестирует"], [/^fetch/i, "Загружает"]];
+function statusLabel(raw) {
+  const text = String(raw || "").replace(/\s*\(([^)]*)\)\s*$/, (m, inner) => (/\d/.test(inner) ? ` · ${inner.replace(/esc to interrupt/i, "").replace(/[·,]\s*$/, "").trim()}` : m)).trim();
+  for (const [re, ru] of STATUS_RU) if (re.test(text)) return `${ru}: ${text}`;
+  return text;
+}
+
+function renderLive(live, s) {
+  const box = $("live");
+  const working = s && s.state === "active";
+  if (!live || !working) { box.hidden = true; if (working) $("working-text").textContent = "Кара работает…"; refreshMsgStatus(); return; }
+  if (live.status) $("working-text").textContent = statusLabel(live.status);
+  else $("working-text").textContent = live.wait || "Кара работает…";
+  const agents = live.subagents || [];
+  $("live-agents").innerHTML = agents.length
+    ? `<span class="la-ico">${ICONS.bot}</span><span>${agents.length === 1 ? "Субагент" : `Субагентов: ${agents.length}`} — ${agents.map((a) => `<b>${esc(a)}</b>`).join(", ")}</span>`
+    : "";
+  const items = (live.todos && live.todos.length)
+    ? live.todos.map((t) => ({ text: t.text, mark: t.status === "completed" ? "done" : t.status === "in_progress" ? "doing" : "todo" }))
+    : (live.progress || []).map((line) => {
+      const m = line.match(/^(?:⎿\s*)?([✔◼◻◔])\s+(.*)$/);
+      return m ? { text: m[2], mark: m[1] === "✔" ? "done" : m[1] === "◻" ? "todo" : "doing" } : { text: line, mark: "" };
+    });
+  const list = $("live-list");
+  list.innerHTML = items.slice(0, 12).map((it) => `<li class="${it.mark}"><span class="lm"></span><span>${esc(it.text)}</span></li>`).join("");
+  box.hidden = !agents.length && !items.length;
+  refreshMsgStatus();
+}
+
+// ═══ Claude Code mode (Default / Accept edits / Plan / Bypass) ══════════════
+const MODE_RU = { Def: ["Обычный", "Спрашивает разрешения"], Edit: ["Правки без вопросов", "Изменяет файлы без подтверждения"], Plan: ["План", "Сначала план, потом действия"], Full: ["Полный доступ", "Без подтверждений (yolo)"] };
+async function refreshMode(tid, cycle = false) {
+  state.modeAt = Date.now();
+  try {
+    const r = await api(`/api/sessions/${tid}/mode`, cycle ? { body: {} } : {});
+    if (tid !== state.current) return;
+    const b = $("mode-btn");
+    const m = MODE_RU[r.mode];
+    b.hidden = !m;
+    if (m) {
+      b.textContent = m[0];
+      b.dataset.mode = r.mode;
+      b.dataset.tip = `Режим Claude Code: ${m[1]}. Нажми — следующий режим (как Shift+Tab)`;
+      if (cycle) toast(`Режим: ${m[0].toLowerCase()} — ${m[1].toLowerCase()}`);
+    }
+  } catch (_) { /* window asleep */ }
+}
+$("mode-btn").onclick = () => { if (state.current != null) refreshMode(state.current, true); };
+
+// ═══ coloured terminal (ANSI SGR → HTML) ═════════════════════════════════════
+const ANSI16 = ["#1f1e1d", "#e5534b", "#57ab5a", "#c69026", "#539bf5", "#b083f0", "#39c5cf", "#d8d5cc", "#6e7681", "#ff7b72", "#7ee787", "#e3b341", "#79c0ff", "#d2a8ff", "#56d4dd", "#ffffff"];
+function ansi256(n) {
+  if (n < 16) return ANSI16[n];
+  if (n >= 232) { const v = 8 + (n - 232) * 10; return `rgb(${v},${v},${v})`; }
+  const i = n - 16; const c = (x) => (x ? 55 + x * 40 : 0);
+  return `rgb(${c(Math.floor(i / 36))},${c(Math.floor(i / 6) % 6)},${c(i % 6)})`;
+}
+function ansiToHtml(text) {
+  let fg = null; let bg = null; let bold = false; let dim = false; let ital = false; let under = false; let inv = false;
+  let out = ""; let open = false;
+  const parts = String(text).split(/\x1b\[([0-9;]*)m/);
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 0) {
+      if (!parts[i]) continue;
+      const f = inv ? (bg || "#1f1e1d") : fg; const b = inv ? (fg || "#e8e6df") : bg;
+      const css = [f && `color:${f}`, b && `background:${b}`, bold && "font-weight:700", dim && "opacity:.6", ital && "font-style:italic", under && "text-decoration:underline"].filter(Boolean).join(";");
+      out += css ? `<span style="${css}">${esc(parts[i].replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""))}</span>` : esc(parts[i].replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""));
+      continue;
+    }
+    const codes = parts[i] === "" ? [0] : parts[i].split(";").map(Number);
+    for (let k = 0; k < codes.length; k++) {
+      const c = codes[k];
+      if (c === 0) { fg = bg = null; bold = dim = ital = under = inv = false; }
+      else if (c === 1) bold = true; else if (c === 2) dim = true; else if (c === 3) ital = true; else if (c === 4) under = true; else if (c === 7) inv = true;
+      else if (c === 22) bold = dim = false; else if (c === 23) ital = false; else if (c === 24) under = false; else if (c === 27) inv = false;
+      else if (c >= 30 && c <= 37) fg = ANSI16[c - 30]; else if (c >= 90 && c <= 97) fg = ANSI16[c - 82];
+      else if (c >= 40 && c <= 47) bg = ANSI16[c - 40]; else if (c >= 100 && c <= 107) bg = ANSI16[c - 92];
+      else if (c === 39) fg = null; else if (c === 49) bg = null;
+      else if ((c === 38 || c === 48) && codes[k + 1] === 5) { const v = ansi256(codes[k + 2] || 0); if (c === 38) fg = v; else bg = v; k += 2; }
+      else if ((c === 38 || c === 48) && codes[k + 1] === 2) { const v = `rgb(${codes[k + 2] || 0},${codes[k + 3] || 0},${codes[k + 4] || 0})`; if (c === 38) fg = v; else bg = v; k += 4; }
+    }
+  }
+  void open;
+  return out;
+}
+
+// ═══ folder for a new chat (+ git worktree) ═════════════════════════════════
+state.cwd = store.get("kara-cwd") || "";
+state.worktree = false;
+function renderCwd() {
+  const name = state.cwd ? state.cwd.replace(/\/+$/, "").split("/").pop() : "workspace";
+  $("cwd-name").textContent = state.worktree ? `${name} · worktree` : name;
+  $("cwd-btn").classList.toggle("on", Boolean(state.cwd) || state.worktree);
+  $("cwd-btn").dataset.tip = state.cwd ? `Новый чат запустится в ${state.cwd}${state.worktree ? " — в отдельном git worktree" : ""}` : "Новый чат запустится в рабочей папке Кары. Нажми, чтобы выбрать другую";
+}
+async function browseTo(path) {
+  try {
+    const r = await api(`/api/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`);
+    const dlg = $("folder-dlg");
+    dlg.dataset.path = r.path;
+    $("folder-path").innerHTML = `${SVG.folder}<span>${esc(r.path.replace(/^\/home\/[^/]+/, "~"))}</span>${r.git ? '<span class="git-tag">git</span>' : ""}`;
+    const list = $("folder-list");
+    list.innerHTML = "";
+    if (r.parent) {
+      const up = el("button", "pk-item up", "<span>↑</span><span>..</span>");
+      up.type = "button"; up.onclick = () => browseTo(r.parent); list.appendChild(up);
+    }
+    for (const d of r.dirs) {
+      const b = el("button", "pk-item", `<span>${d.git ? SVG.branch : SVG.folder}</span><span>${esc(d.name)}</span>`);
+      b.type = "button"; b.onclick = () => browseTo(`${r.path}/${d.name}`); list.appendChild(b);
+    }
+    if (!r.dirs.length) list.appendChild(el("div", "pk-empty muted", "Вложенных папок нет"));
+    $("folder-wt").hidden = !r.git;
+    $("folder-wt-box").checked = false;
+  } catch (e) { toast(e.message); }
+}
+$("cwd-btn").onclick = () => { $("folder-dlg").showModal(); browseTo(state.cwd || ""); };
+$("folder-pick").onclick = () => {
+  state.cwd = $("folder-dlg").dataset.path || "";
+  state.worktree = !$("folder-wt").hidden && $("folder-wt-box").checked;
+  store.set("kara-cwd", state.cwd);
+  renderCwd();
+  $("folder-dlg").close();
+};
+$("folder-default").onclick = () => { state.cwd = ""; state.worktree = false; store.set("kara-cwd", ""); renderCwd(); $("folder-dlg").close(); };
+document.querySelectorAll("[data-close]").forEach((b) => { b.onclick = () => b.closest("dialog").close(); });
+document.querySelectorAll("dialog.picker").forEach((d) => d.addEventListener("click", (ev) => { if (ev.target === d) d.close(); }));
+
+// ═══ continue an earlier Claude session ═════════════════════════════════════
+const ago = (ts) => {
+  const d = (Date.now() / 1000 - ts) / 60;
+  return d < 60 ? `${Math.max(1, Math.round(d))} мин назад` : d < 1440 ? `${Math.round(d / 60)} ч назад` : new Date(ts * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+};
+$("resume-btn").onclick = async () => {
+  const dlg = $("resume-dlg");
+  $("resume-list").innerHTML = '<div class="pk-empty muted">Ищу сессии…</div>';
+  dlg.showModal();
+  try {
+    const r = await api(`/api/resumable${state.cwd ? `?cwd=${encodeURIComponent(state.cwd)}` : ""}`);
+    $("resume-where").innerHTML = `${SVG.folder}<span>${esc(r.cwd.replace(/^\/home\/[^/]+/, "~"))}</span>`;
+    const list = $("resume-list");
+    list.innerHTML = "";
+    for (const x of r.sessions) {
+      const b = el("button", "pk-item two", `<span>${esc(x.summary || x.id.slice(0, 8))}</span><span class="muted">${esc(ago(x.mtime))}</span>`);
+      b.type = "button";
+      b.onclick = async () => {
+        dlg.close();
+        $("working").hidden = false;
+        $("working-text").textContent = "Поднимаю сессию…";
+        try {
+          const res = await api("/api/sessions", { body: { text: "", web_only: !state.telegram, provider: "claude", resume_id: x.id, cwd: r.cwd, name: (x.summary || "").slice(0, 60) || undefined } });
+          await refreshSessions();
+          location.hash = `#${res.thread_id}`;
+        } catch (e) { toast(`❌ ${e.message}`); } finally { if (state.current == null) $("working").hidden = true; }
+      };
+      list.appendChild(b);
+    }
+    if (!r.sessions.length) list.appendChild(el("div", "pk-empty muted", "В этой папке прошлых сессий нет"));
+  } catch (e) { $("resume-list").innerHTML = `<div class="pk-empty">${esc(e.message)}</div>`; }
+};
+
+// ═══ "/" command palette ═════════════════════════════════════════════════════
+const palette = { list: [], sel: 0, key: "" };
+async function loadCommands() {
+  const key = state.current != null ? `t${state.current}` : `p${currentChoice()?.provider.id || "claude"}`;
+  if (palette.key === key) return palette.cache;
+  palette.key = key;
+  const q = state.current != null ? `tid=${state.current}` : `provider=${encodeURIComponent(currentChoice()?.provider.id || "claude")}`;
+  try { palette.cache = (await api(`/api/commands?${q}`)).commands; } catch (_) { palette.cache = []; }
+  return palette.cache;
+}
+async function updatePalette() {
+  const v = $("input").value;
+  const m = v.match(/^\/([^\s]*)$/);
+  const box = $("cmd-palette");
+  if (!m) { box.hidden = true; return; }
+  const all = await loadCommands();
+  const q = m[1].toLowerCase();
+  palette.list = all.filter((c) => c.name.slice(1).toLowerCase().includes(q))
+    .sort((a, b) => (a.name.slice(1).toLowerCase().startsWith(q) ? 0 : 1) - (b.name.slice(1).toLowerCase().startsWith(q) ? 0 : 1)).slice(0, 40);
+  palette.sel = Math.min(palette.sel, Math.max(0, palette.list.length - 1));
+  box.innerHTML = "";
+  palette.list.forEach((c, i) => {
+    const row = el("button", `cp-item${i === palette.sel ? " sel" : ""}`, `<span class="cp-name">${esc(c.name)}</span><span class="cp-desc">${esc(c.description)}</span>${c.source !== "builtin" ? `<span class="cp-src">${c.source === "skill" ? "скил" : "команда"}</span>` : ""}`);
+    row.type = "button";
+    row.onmousedown = (ev) => { ev.preventDefault(); pickCommand(i); };
+    box.appendChild(row);
+  });
+  box.hidden = !palette.list.length;
+  box.querySelector(".sel")?.scrollIntoView({ block: "nearest" });
+}
+function pickCommand(i) {
+  const c = palette.list[i];
+  if (!c) return;
+  $("input").value = `${c.name} `;
+  $("cmd-palette").hidden = true;
+  autosize();
+  $("input").focus();
+}
+$("input").addEventListener("input", () => { palette.sel = 0; updatePalette(); });
+$("input").addEventListener("keydown", (ev) => {
+  if ($("cmd-palette").hidden) return;
+  if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+    ev.preventDefault(); ev.stopImmediatePropagation();
+    palette.sel = (palette.sel + (ev.key === "ArrowDown" ? 1 : -1) + palette.list.length) % palette.list.length;
+    updatePalette();
+  } else if (ev.key === "Tab" || (ev.key === "Enter" && !ev.shiftKey)) {
+    ev.preventDefault(); ev.stopImmediatePropagation(); pickCommand(palette.sel);
+  } else if (ev.key === "Escape") { $("cmd-palette").hidden = true; }
+}, true);
+$("input").addEventListener("blur", () => setTimeout(() => { $("cmd-palette").hidden = true; }, 150));
+
+// ═══ voice input (server Whisper; works in every browser incl. Firefox/iOS) ══
+const micSupported = () => state.stt && navigator.mediaDevices && "MediaRecorder" in window;
+const mic = { rec: null, chunks: [], t0: 0, timer: null };
+async function toggleMic() {
+  if (mic.rec) { mic.rec.stop(); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (_) { toast("Нет доступа к микрофону"); return; }
+  const type = ["audio/webm;codecs=opus", "audio/mp4", "audio/ogg"].find((t) => MediaRecorder.isTypeSupported?.(t)) || "";
+  const rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+  mic.rec = rec; mic.chunks = []; mic.t0 = Date.now();
+  rec.ondataavailable = (e) => { if (e.data.size) mic.chunks.push(e.data); };
+  rec.onstop = async () => {
+    stream.getTracks().forEach((t) => t.stop());
+    clearInterval(mic.timer);
+    mic.rec = null;
+    $("mic-btn").classList.remove("rec");
+    $("mic-btn").classList.add("busy");
+    $("mic-time").textContent = "…";
+    const blob = new Blob(mic.chunks, { type: rec.mimeType || "audio/webm" });
+    const ext = (rec.mimeType || "").includes("mp4") ? "m4a" : (rec.mimeType || "").includes("ogg") ? "ogg" : "webm";
+    const form = new FormData();
+    form.append("audio", blob, `voice.${ext}`);
+    try {
+      const { text } = await api("/api/stt", { form });
+      if (text) {
+        const t = $("input");
+        t.value = (t.value.trim() ? `${t.value.trimEnd()} ` : "") + text;
+        t.dispatchEvent(new Event("input"));
+        t.focus();
+      } else toast("Ничего не расслышала");
+    } catch (e) { toast(`Распознавание не удалось: ${e.message}`); }
+    $("mic-btn").classList.remove("busy");
+    $("mic-time").textContent = "";
+  };
+  rec.start();
+  $("mic-btn").classList.add("rec");
+  mic.timer = setInterval(() => {
+    const sec = Math.floor((Date.now() - mic.t0) / 1000);
+    $("mic-time").textContent = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+    if (sec >= 300) rec.stop();
+  }, 250);
+}
+$("mic-btn").onclick = toggleMic;
+
+// ═══ notification mode ═══════════════════════════════════════════════════════
+async function setNotifyMode(mode) {
+  try {
+    state.notifyMode = (await api("/api/settings", { body: { notify_mode: mode } })).notify_mode;
+    toast(state.notifyMode === "done" ? "Уведомлю один раз — когда задача готова. Промежуточные сообщения приходят без звука" : "Уведомления на каждое сообщение");
+  } catch (e) { toast(e.message); }
+}
+
+// ═══ message status: sending → delivered → read → being worked on ═══════════
+const MSG_STATUS = {
+  sending: "Отправляется…",
+  sent: "Доставлено в сессию — модель ещё не прочитала",
+  read: "Прочитано моделью",
+  working: "Прочитано — Кара работает над этим",
+};
+function refreshMsgStatus() {
+  const thread = $("thread");
+  thread.querySelectorAll(".u-msg.latest").forEach((n) => n.classList.remove("latest"));
+  const msgs = thread.querySelectorAll(".u-msg");
+  const last = msgs[msgs.length - 1];
+  if (!last) return;
+  let st = "read";
+  if (last.classList.contains("failed")) return;
+  if (last.classList.contains("pending")) st = last.dataset.sent ? "sent" : "sending";
+  else {
+    const s = currentSession();
+    let answered = false;
+    for (let n = last.nextElementSibling; n; n = n.nextElementSibling) if (n.classList.contains("a-msg")) { answered = true; break; }
+    if (s && s.state === "active" && !answered) st = "working";
+  }
+  last.classList.add("latest");
+  last.dataset.status = st;
+  const label = last.querySelector(".u-status") || last.querySelector(".u-meta").insertBefore(el("span", "u-status"), last.querySelector(".u-meta").firstChild);
+  label.textContent = { sending: "отправляется", sent: "доставлено", read: "прочитано", working: "прочитано · в работе" }[st];
+  last.querySelector(".tick").dataset.tip = MSG_STATUS[st];
+}
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 api("/api/me").then(boot).catch(() => showLogin());
