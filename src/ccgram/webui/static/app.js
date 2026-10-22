@@ -99,13 +99,15 @@ const SVG = {
 
 // ═══ popover menu ═══════════════════════════════════════════════════════════
 // items: {label, icon, sub, danger, check, href, action} | "sep" | {heading}
-function openMenu(items, at, owner) {
+function openMenu(items, at, owner, cls = "") {
   const menu = $("menu");
+  menu.className = `menu ${cls}`.trim();
   menu.innerHTML = "";
   for (const it of items) {
     if (it === "sep") { menu.appendChild(el("div", "sep")); continue; }
     if (it.heading) { menu.appendChild(el("div", "label", esc(it.heading))); continue; }
-    const node = el(it.href ? "a" : "button", it.danger ? "danger" : "");
+    const node = el(it.href ? "a" : "button", [it.danger ? "danger" : "", it.cls || ""].join(" ").trim());
+    if (it.disabled) node.disabled = true;
     if (it.href) { node.href = it.href; node.target = "_blank"; node.rel = "noopener"; }
     node.innerHTML = `<span class="ico">${it.icon || ""}</span><span>${esc(it.label)}${it.sub ? `<span class="sub">${esc(it.sub)}</span>` : ""}</span>${it.check ? '<span class="check">✓</span>' : ""}`;
     node.onclick = () => { closeMenu(); if (it.action) it.action(); };
@@ -2029,24 +2031,67 @@ const MODE_RU = {
   Auto: ["Авто", "сама решает, о чём спрашивать"],
   YOLO: ["Без вопросов", "ничего не спрашивает (yolo)"],
 };
-async function refreshMode(tid, cycle = false) {
+const MODE_ICON = {
+  Def: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4" stroke-linecap="round"/></svg>',
+  Edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M14 6l4 4"/></svg>',
+  Plan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 3.5h6v3H9zM9 11h6M9 15h4"/></svg>',
+  Auto: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M11 3l1.8 4.2L17 9l-4.2 1.8L11 15l-1.8-4.2L5 9l4.2-1.8z"/><path d="M18.5 14l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z"/></svg>',
+  YOLO: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M13 2L4.5 13.5H11L10 22l8.5-11.5H12z"/></svg>',
+};
+const CHEV = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+
+function applyMode(tid, r) {
+  if (tid !== state.current) return;
+  if (r.available) state.modeAvail = { wid: currentSession()?.window_id, list: r.available };
+  const b = $("mode-btn");
+  const key = r.mode || "Def";
+  const m = MODE_RU[key];
+  b.hidden = !m;
+  if (!m) return;
+  b.innerHTML = `<span>${esc(m[0])}</span>${CHEV}`;
+  b.dataset.mode = key;
+  b.dataset.tip = `Режим Claude Code: ${m[1]}. Нажми, чтобы выбрать`;
+}
+
+async function refreshMode(tid) {
+  state.modeAt = Date.now();
+  try { applyMode(tid, await api(`/api/sessions/${tid}/mode`)); } catch (_) { /* window asleep */ }
+}
+
+function modeMenu() {
+  const cur = $("mode-btn").dataset.mode || "Def";
+  const s = currentSession();
+  const avail = state.modeAvail && s && state.modeAvail.wid === s.window_id ? state.modeAvail.list : null;
+  const items = [{ heading: "Режим Claude Code" }];
+  for (const [key, [label, desc]] of Object.entries(MODE_RU)) {
+    const off = Boolean(avail) && !avail.includes(key);
+    items.push({ label, sub: off ? "в этой сессии нет — её запустили без этого режима" : desc, icon: MODE_ICON[key], cls: `mode-${key}`, check: key === cur, disabled: off, action: () => setMode(key) });
+  }
+  items.push("sep", { heading: "То же, что Shift+Tab в терминале" });
+  return items;
+}
+
+async function setMode(key) {
+  const tid = state.current;
+  const b = $("mode-btn");
+  if (tid == null || key === (b.dataset.mode || "Def")) return;
+  b.classList.add("busy");
   state.modeAt = Date.now();
   try {
-    const r = await api(`/api/sessions/${tid}/mode`, cycle ? { body: {} } : {});
-    if (tid !== state.current) return;
-    const b = $("mode-btn");
-    const key = r.mode || "Def";
-    const m = MODE_RU[key];
-    b.hidden = !m;
-    if (m) {
-      b.textContent = m[0];
-      b.dataset.mode = key;
-      b.dataset.tip = `Режим Claude Code: ${m[1]}. Нажми — следующий режим (как Shift+Tab)`;
-      if (cycle) toast(`Режим: ${m[0].toLowerCase()} — ${m[1].toLowerCase()}`);
-    }
-  } catch (_) { /* window asleep */ }
+    const r = await api(`/api/sessions/${tid}/mode`, { body: { target: key } });
+    applyMode(tid, r);
+    const now = MODE_RU[r.mode || "Def"];
+    toast(r.reached ? `Режим: ${now[0].toLowerCase()} — ${now[1]}` : `В этой сессии нет режима «${MODE_RU[key][0]}» — оставила «${now[0]}»`);
+  } catch (e) { toast(e.message); } finally { b.classList.remove("busy"); }
 }
-$("mode-btn").onclick = () => { if (state.current != null) refreshMode(state.current, true); };
+
+$("mode-btn").onclick = () => {
+  const b = $("mode-btn");
+  if (state.current == null || b.classList.contains("busy")) return;
+  if (b.classList.contains("menu-open")) { closeMenu(); return; }
+  const r = b.getBoundingClientRect();
+  openMenu(modeMenu(), { x: r.right - 300, y: r.bottom + 6, top: r.top }, b, "mode-menu");
+};
 
 // ═══ coloured terminal (ANSI SGR → HTML) ═════════════════════════════════════
 const ANSI16 = ["#1f1e1d", "#e5534b", "#57ab5a", "#c69026", "#539bf5", "#b083f0", "#39c5cf", "#d8d5cc", "#6e7681", "#ff7b72", "#7ee787", "#e3b341", "#79c0ff", "#d2a8ff", "#56d4dd", "#ffffff"];

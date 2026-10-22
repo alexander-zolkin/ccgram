@@ -117,3 +117,40 @@ async def test_pane_status_counts_only_a_running_spinner():
         assert await extras.pane_status("@1") == "Pondering… (12s · ↓ 1.2k tokens)"
         assert await extras.pane_status("@2") is None
         assert await extras.pane_status("@3") == "Zesting… (52s · ↓ 4.3k tokens)"
+
+
+def _fake_modes(cycle, lag=0):
+    """A window whose Shift+Tab walks ``cycle``; the line repaints ``lag`` reads late."""
+    state = {"i": 0, "stale": 0, "presses": 0}
+
+    async def read():
+        if state["stale"]:
+            state["stale"] -= 1
+            return cycle[(state["i"] - 1) % len(cycle)]
+        return cycle[state["i"]]
+
+    async def press():
+        state["presses"] += 1
+        state["i"] = (state["i"] + 1) % len(cycle)
+        state["stale"] = lag
+
+    return read, press, state
+
+
+async def test_walk_to_reaches_the_target_despite_slow_repaint(monkeypatch):
+    monkeypatch.setattr(extras.asyncio, "sleep", _no_sleep)
+    read, press, st = _fake_modes(["Def", "Edit", "Plan", "Auto"], lag=2)
+    assert await extras._walk_to("Plan", read, press) == ("Plan", None)
+    assert st["presses"] == 2
+
+
+async def test_walk_to_missing_mode_comes_back_and_learns_the_cycle(monkeypatch):
+    monkeypatch.setattr(extras.asyncio, "sleep", _no_sleep)
+    read, press, st = _fake_modes(["Edit", "Plan", "Def"])
+    mode, cycle = await extras._walk_to("YOLO", read, press)
+    assert mode == "Edit" and cycle == ["Edit", "Plan", "Def"]
+    assert st["presses"] == 3
+
+
+async def _no_sleep(_seconds):
+    return None

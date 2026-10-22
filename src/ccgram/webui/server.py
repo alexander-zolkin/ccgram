@@ -436,8 +436,16 @@ async def _live(request: web.Request) -> web.Response:
 
 
 async def _mode(request: web.Request) -> web.Response:
-    cycle = request.method == "POST"
-    return web.json_response(await extras.approval_mode(_thread_id(request), cycle))
+    """GET = read; POST ``{}`` = one Shift+Tab; POST ``{"target": "Plan"}`` = go there."""
+    tid = _thread_id(request)
+    if request.method != "POST":
+        return web.json_response(await extras.approval_mode(tid))
+    target = (await _json_body(request)).get("target")
+    if target is not None and not isinstance(target, str):
+        raise service.WebUIError("unknown mode")
+    return web.json_response(
+        await extras.approval_mode(tid, cycle=target is None, target=target)
+    )
 
 
 async def _terminal(request: web.Request) -> web.Response:

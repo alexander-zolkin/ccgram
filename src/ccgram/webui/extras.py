@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any
 from .. import quiet_threads
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from ..telegram_client import TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -268,24 +270,86 @@ async def live(thread_id: int) -> dict[str, Any]:
     }
 
 
-async def approval_mode(thread_id: int, cycle: bool = False) -> dict[str, Any]:
-    """Claude Code's own mode (Def / Edit / Plan / Full); ``cycle`` = Shift+Tab."""
+MODE_KEYS = ("Def", "Edit", "Plan", "Auto", "YOLO")
+MODE_SETTLE_S = 1.5
+_mode_cycles: dict[str, list[str]] = {}
+_mode_lock = asyncio.Lock()
+
+
+async def _walk_to(
+    target: str,
+    read: Callable[[], Awaitable[str]],
+    press: Callable[[], Awaitable[None]],
+) -> tuple[str, list[str] | None]:
+    """Shift+Tab until ``target`` shows: (final mode, full cycle if walked).
+
+    Each press waits until the mode line actually changes, so a slow repaint
+    isn't mistaken for having come full circle. A full circle without the
+    target means the session doesn't have that mode (bypass needs a flag at
+    launch): it ends back where it started.
+    """
+    mode = start = await read()
+    seen = [start]
+    while mode != target and len(seen) <= len(MODE_KEYS):
+        await press()
+        before, waited = mode, 0.0
+        while mode == before and waited < MODE_SETTLE_S:
+            await asyncio.sleep(0.15)
+            waited += 0.15
+            mode = await read()
+        if mode == before:  # the line never changed: don't keep pressing blind
+            return mode, None
+        if mode == start:
+            return mode, seen
+        seen.append(mode)
+    return mode, None
+
+
+async def approval_mode(
+    thread_id: int, cycle: bool = False, target: str | None = None
+) -> dict[str, Any]:
+    """Claude Code's own mode (Def / Edit / Plan / Auto / YOLO).
+
+    ``cycle`` = one Shift+Tab; ``target`` = Shift+Tab until that mode shows.
+    ``available`` lists the modes this window cycles through, once known.
+    """
     # Lazy: provider registry + multiplexer.
     from .. import window_query
     from ..multiplexer import multiplexer as tmux_manager
     from ..providers import get_provider_for_window
-    from .service import find_binding
+    from .service import WebUIError, find_binding
 
+    if target is not None and target not in MODE_KEYS:
+        raise WebUIError("unknown mode")
     wid = find_binding(thread_id).window_id
     provider = get_provider_for_window(
         wid, provider_name=window_query.get_window_provider(wid)
     )
     scrape = getattr(provider, "scrape_current_mode", None)
-    if cycle:
+
+    async def read() -> str:
+        return (await scrape(wid) if scrape else None) or "Def"
+
+    async def press() -> None:
         await tmux_manager.send_keys(wid, "BTab", enter=False, literal=False)
-        await asyncio.sleep(0.35)
-    mode = await scrape(wid) if scrape else None
-    return {"mode": mode, "launch": window_query.get_approval_mode(wid)}
+
+    async with _mode_lock:
+        if target is not None:
+            mode, walked = await _walk_to(target, read, press)
+            if walked:
+                _mode_cycles[wid] = walked
+        else:
+            if cycle:
+                await press()
+                await asyncio.sleep(0.35)
+            mode = await read()
+    known = _mode_cycles.get(wid)
+    return {
+        "mode": mode,
+        "reached": target is None or mode == target,
+        "available": known,
+        "launch": window_query.get_approval_mode(wid),
+    }
 
 
 async def terminal(thread_id: int) -> dict[str, Any]:
