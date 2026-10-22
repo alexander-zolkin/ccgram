@@ -52,6 +52,7 @@ SSH_TIMEOUT = 12.0
 TCP_TIMEOUT = 5.0
 SEARCH_LIMIT = 20
 MAX_SNOOZE_DAYS = 365
+RECENT_CHATS = 6
 _SKIP_MEMORY = {"index.md", "MEMORY.md"}
 
 
@@ -118,6 +119,11 @@ async def now() -> dict[str, Any]:
             for s in sessions
             if s["state"] == "active"
         ],
+        "recent": [
+            {"thread_id": s["thread_id"], "name": s["name"], "at": s["last_activity"]}
+            for s in sorted(sessions, key=lambda s: -s.get("last_activity", 0))
+            if s["state"] != "active" and s.get("last_activity", 0) >= since
+        ][:RECENT_CHATS],
         "alive": sum(1 for s in sessions if s["state"] != "dead"),
         "today": totals,
         "chats_today": len(paths),

@@ -2322,7 +2322,7 @@ function hubSkeleton() {
     <article id="hub-memory" class="hub-card">
       <header class="hub-head">${HUB_ICON.memory}<h2>Что я помню</h2><span id="hub-mem-count" class="hub-sub"></span><span class="spacer"></span>
         <button id="hub-map-btn" type="button" class="btn small" hidden>${HUB_ICON.map}Карта</button></header>
-      <label class="hub-search">${SVG.search}<input id="hub-mem-q" type="search" placeholder="Найти в памяти…" autocomplete="off" enterkeyhint="search"></label>
+      <label class="hub-search">${ICONS.search}<input id="hub-mem-q" type="search" placeholder="Найти в памяти…" autocomplete="off" enterkeyhint="search"></label>
       <div id="hub-mem-list"></div>
     </article>`;
   $("hub-mem-q").oninput = () => { clearTimeout(state.memTimer); state.memTimer = setTimeout(memSearch, 250); };
@@ -2336,6 +2336,7 @@ function renderNow(now) {
     <header class="hub-head">${HUB_ICON.now}<h2>Сейчас</h2></header>
     <div class="hub-lead">${w.length ? `${w.length} ${pluralRu(w.length, "чат работает", "чата работают", "чатов работают")}` : "Все чаты ждут тебя"}</div>
     ${w.length ? `<div class="hub-chips">${w.map((c) => `<a class="hub-chip" href="#${c.thread_id}"><span class="dot active"></span>${esc(c.name)}</a>`).join("")}</div>` : ""}
+    ${now.recent.length ? `<div class="hub-label">Сегодня были в работе</div><div class="hub-chips">${now.recent.map((c) => `<a class="hub-chip" href="#${c.thread_id}">${esc(c.name)}<span class="hub-chip-t">${hhmm(c.at * 1000)}</span></a>`).join("")}</div>` : ""}
     <div class="hub-stats">
       <div><b>${tokRu(t.out)}</b><span>токенов сегодня</span></div>
       <div><b>${t.turns}</b><span>${pluralRu(t.turns, "ход", "хода", "ходов")}</span></div>
@@ -2348,12 +2349,12 @@ function renderNow(now) {
 function reachStatus(r) {
   if (!r.ok) return `${r.why}${r.last_ok ? ` · был ${agoRu(r.last_ok)}` : ""}`;
   const d = r.local && r.detail;
-  return d ? `нагрузка ${String(d.load).replace(".", ",")} · свободно ${(d.mem_avail_mb / 1024).toFixed(1).replace(".", ",")} ГБ` : "на связи";
+  return d ? `${(d.mem_avail_mb / 1024).toFixed(1).replace(".", ",")} ГБ свободно` : "на связи";
 }
 
 function renderReach(reach) {
   const rows = reach.targets.map((r) => `
-    <li><span class="rdot ${r.ok ? "ok" : "off"}"></span><span class="rmain"><b>${esc(r.name)}</b><span>${esc(r.access)}</span></span><span class="rstat">${esc(reachStatus(r))}</span></li>`);
+    <li><span class="rdot ${r.ok ? "ok" : "off"}"></span><span class="rmain" data-tip="${esc(r.access)}"><b>${esc(r.name)}</b><span>${esc(r.access)}</span></span><span class="rstat"${r.local && r.detail ? ` data-tip="Нагрузка ${esc(String(r.detail.load))} · работает ${esc(secsRu(r.detail.uptime_s || 0))}"` : ""}>${esc(reachStatus(r))}</span></li>`);
   for (const g of reach.groups) {
     const bad = g.items.filter((i) => !i.ok);
     const open = state.reachOpen?.has(g.name) ? " open" : "";
