@@ -1546,7 +1546,8 @@ function showLogin() {
   $("password").focus();
 }
 
-async function boot() {
+async function boot(me) {
+  if (me && "hub" in me) store.set("kara-hub", me.hub ? "1" : "0");
   $("login").hidden = true;
   $("app").hidden = false;
   if (store.get("kara-collapsed") === "1" && !isMobile()) $("app").classList.add("collapsed");
@@ -1574,7 +1575,7 @@ $("login-form").onsubmit = async (ev) => {
   try {
     await api("/api/login", { body: { password: $("password").value } });
     $("password").value = "";
-    boot();
+    boot(await api("/api/me").catch(() => null));
   } catch (e) {
     $("login-error").textContent = e.message === "wrong password" ? "Неверный пароль"
       : e.message === "too many attempts" ? "Слишком много попыток — подожди 15 минут" : e.message;

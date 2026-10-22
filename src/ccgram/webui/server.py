@@ -216,7 +216,8 @@ async def _logout(_request: web.Request) -> web.Response:
 
 
 async def _me(_request: web.Request) -> web.Response:
-    return web.json_response({"ok": True})
+    # "hub": the home page has cards, so the client lays it out before /api/hub.
+    return web.json_response({"ok": True, "hub": bool(hub.config())})
 
 
 # ── sessions ─────────────────────────────────────────────────────────────────
