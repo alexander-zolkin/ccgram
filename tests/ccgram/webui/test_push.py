@@ -142,3 +142,14 @@ def test_web_switches_are_independent_and_combine():
     assert push.allowed(5) and push.web_off() == []
     push.load_web_off([7, 8])
     assert push.web_off() == [7, 8]
+
+
+async def test_prompt_push_carries_the_fingerprint(monkeypatch):
+    calls = []
+    monkeypatch.setattr(push, "_send_all", lambda payload: calls.append(payload))
+    push.subscribe(SUB)
+    push.notify_reply(5, "Чат", "⏳ Approval needed: Bash", prompt="abc123")
+    import asyncio
+
+    await asyncio.sleep(0.05)
+    assert calls[0]["prompt"] == "abc123" and calls[0]["tid"] == 5

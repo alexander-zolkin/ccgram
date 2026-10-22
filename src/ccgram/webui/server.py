@@ -10,6 +10,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/sessions/{tid}/send``       text into the session (wakes it)
 - ``GET  /api/sessions/{tid}/pane``       current pane snapshot
 - ``POST /api/sessions/{tid}/key``        one whitelisted key into the pane
+- ``POST /api/sessions/{tid}/answer``     allow / deny the prompt a push was for
 - ``POST /api/sessions/{tid}/close``      end a web-only session
 - ``GET  /api/sessions/{tid}/entries``    structured transcript (``limit``,
   ``before``/``after`` byte cursors)
@@ -749,6 +750,18 @@ async def _pane(request: web.Request) -> web.Response:
     return web.json_response(await service.pane(_thread_id(request)))
 
 
+async def _answer(request: web.Request) -> web.Response:
+    """«Разрешить» / «Отклонить» from a notification: only for the same prompt."""
+    body = await _json_body(request)
+    return web.json_response(
+        await extras.answer_prompt(
+            _thread_id(request),
+            str(body.get("prompt", "")),
+            str(body.get("choice", "")),
+        )
+    )
+
+
 async def _key(request: web.Request) -> web.Response:
     body = await _json_body(request)
     return web.json_response(
@@ -859,6 +872,7 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/uploads", _upload_new)
     r.add_get("/api/models", _models)
     r.add_post("/api/sessions/{tid}/key", _key)
+    r.add_post("/api/sessions/{tid}/answer", _answer)
     r.add_get("/api/events", _events)
     _add_auth_routes(r)
     _add_hub_routes(r)

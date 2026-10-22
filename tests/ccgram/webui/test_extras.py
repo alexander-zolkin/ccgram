@@ -38,7 +38,12 @@ def wired(monkeypatch):
     import ccgram.handlers.messaging_pipeline.message_sender as ms
 
     monkeypatch.setattr(ms, "rate_limit_send_message", fake_send)
-    monkeypatch.setattr(push, "notify_reply", lambda *a: pushed.append(a))
+    monkeypatch.setattr(push, "notify_reply", lambda *a, **kw: pushed.append(a))
+
+    async def no_prompt(_wid):
+        return None
+
+    monkeypatch.setattr(extras, "_answerable_prompt", no_prompt)
     monkeypatch.setattr(extras, "_targets", lambda wid: [(-100, 7), (None, -3)])
     monkeypatch.setattr(extras, "_title", lambda chat, tid: f"t{tid}")
     return sent, pushed
@@ -154,3 +159,60 @@ async def test_walk_to_missing_mode_comes_back_and_learns_the_cycle(monkeypatch)
 
 async def _no_sleep(_seconds):
     return None
+
+
+PERMISSION = "Bash command\n\n  rm -rf build\n\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again for rm commands\n  3. No, and tell Claude what to do differently (esc)"
+PLAN = "Would you like to proceed?\n❯ 1. Yes, and auto-accept edits\n  2. Yes, and manually approve edits\n  3. No, keep planning"
+
+
+def test_prompt_answers_pick_the_narrowest_yes():
+    assert extras.prompt_answers("PermissionPrompt", PERMISSION) == {
+        "allow": "1",
+        "deny": "3",
+    }
+    assert extras.prompt_answers("ExitPlanMode", PLAN) == {"allow": "2", "deny": "3"}
+    assert extras.prompt_answers("AskUserQuestion", PERMISSION) is None
+    assert (
+        extras.prompt_answers(
+            "PermissionPrompt", "Do you want to proceed?\nEsc to cancel"
+        )
+        is None
+    )
+    moved = PERMISSION.replace("❯ 1.", "  1.").replace("  2. Yes,", "❯ 2. Yes,")
+    assert extras.prompt_fingerprint(
+        "PermissionPrompt", moved
+    ) == extras.prompt_fingerprint("PermissionPrompt", PERMISSION)
+    assert extras.prompt_fingerprint(
+        "PermissionPrompt", PLAN
+    ) != extras.prompt_fingerprint("PermissionPrompt", PERMISSION)
+
+
+async def test_answer_only_while_the_same_prompt_is_on_screen(monkeypatch):
+    from unittest.mock import AsyncMock, patch
+
+    from ccgram.terminal_parser import InteractiveUIContent
+
+    screen = {
+        "prompt": InteractiveUIContent(content=PERMISSION, name="PermissionPrompt")
+    }
+
+    async def current(_wid):
+        return screen["prompt"]
+
+    monkeypatch.setattr(extras, "_current_prompt", current)
+    monkeypatch.setattr(
+        "ccgram.webui.service.find_binding", lambda tid: SimpleNamespace(window_id="@9")
+    )
+    fp = extras.prompt_fingerprint("PermissionPrompt", PERMISSION)
+    send = AsyncMock(return_value=True)
+    with patch("ccgram.multiplexer.multiplexer", send_keys=send):
+        assert (await extras.answer_prompt(5, fp, "deny"))["key"] == "3"
+        send.assert_awaited_once_with("@9", "3", enter=False, literal=True)
+        screen["prompt"] = InteractiveUIContent(content=PLAN, name="ExitPlanMode")
+        with pytest.raises(WebUIError) as changed:
+            await extras.answer_prompt(5, fp, "allow")
+        assert changed.value.status == 409
+        screen["prompt"] = None
+        with pytest.raises(WebUIError):
+            await extras.answer_prompt(5, fp, "allow")
+    assert send.await_count == 1

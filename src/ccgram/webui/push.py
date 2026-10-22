@@ -192,17 +192,24 @@ def _send_all(payload: dict[str, Any]) -> None:
         unsubscribe(endpoint)
 
 
-def notify_reply(thread_id: int, title: str, text: str) -> None:
-    """Queue a push for a finished reply. Never raises; never blocks."""
+def notify_reply(
+    thread_id: int, title: str, text: str, *, prompt: str | None = None
+) -> None:
+    """Queue a push for a finished reply. Never raises; never blocks.
+
+    ``prompt`` (a prompt fingerprint) adds «Разрешить» / «Отклонить» actions.
+    """
     try:
         if not has_subscriptions() or someone_watching() or not allowed(thread_id):
             return
-        payload = {
+        payload: dict[str, Any] = {
             "title": title,
             "body": " ".join(text.split())[:180],
             "tag": f"t{thread_id}",
             "url": f"/#{thread_id}",
         }
+        if prompt:
+            payload.update(tid=thread_id, prompt=prompt)
         loop = asyncio.get_running_loop()
         loop.run_in_executor(None, _send_all, payload)
     except Exception:  # noqa: BLE001 — notifications are best-effort

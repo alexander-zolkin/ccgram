@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import re
@@ -137,6 +138,7 @@ async def on_attention(window_id: str, header: str, client: TelegramClient) -> N
         # Lazy: push pulls crypto libs on first use.
         from . import push
 
+        fingerprint = await _answerable_prompt(window_id)
         for chat_id, thread_id in _targets(window_id):
             tg_ok = quiet_threads.mode(thread_id) != "off"
             if (
@@ -146,9 +148,103 @@ async def on_attention(window_id: str, header: str, client: TelegramClient) -> N
                 and not quiet_threads.all_muted()
             ):
                 await _ping(client, chat_id, thread_id, f"⏳ {header}")
-            push.notify_reply(thread_id, _title(chat_id, thread_id), f"⏳ {header}")
+            push.notify_reply(
+                thread_id,
+                _title(chat_id, thread_id),
+                f"⏳ {header}",
+                prompt=fingerprint,
+            )
     except Exception:  # noqa: BLE001 — a hook must never break the bot
         logger.exception("webui on_attention failed")
+
+
+# ── answering a permission prompt from the notification ─────────────────────
+# A notification can sit unread while the agent moves on, so the answer
+# carries a fingerprint of the exact prompt it was shown for; the key goes
+# in only while that same prompt is still on screen.
+
+ANSWERABLE = ("PermissionPrompt", "ExitPlanMode")
+PROMPT_WAIT_S = 2.0
+_OPTION = re.compile(r"^\s*(?:[❯›>]\s*)?(\d)\.\s+(.+?)\s*$")
+_YES = re.compile(r"^(yes|да)\b", re.I)
+_NO = re.compile(r"^(no|нет)\b", re.I)
+# "Yes" options that widen permissions beyond this one request.
+_WIDER = re.compile(r"auto|don.t ask|allow all|always|session", re.I)
+
+
+def prompt_options(content: str) -> list[tuple[str, str]]:
+    return [
+        (m.group(1), m.group(2))
+        for line in content.splitlines()
+        if (m := _OPTION.match(line))
+    ]
+
+
+def prompt_fingerprint(name: str, content: str) -> str:
+    """Stable across repaints: selection markers and spacing don't count."""
+    lines = [re.sub(r"^\s*[❯›>]\s*", "", ln).strip() for ln in content.splitlines()]
+    text = name + "\n" + "\n".join(ln for ln in lines if ln)
+    return hashlib.sha256(text.encode()).hexdigest()[:24]
+
+
+def prompt_answers(name: str, content: str) -> dict[str, str] | None:
+    """Keys for «Разрешить» / «Отклонить», or None when not a yes/no prompt."""
+    if name not in ANSWERABLE:
+        return None
+    options = prompt_options(content)
+    yes = [key for key, label in options if _YES.match(label)]
+    narrow = [
+        key for key, label in options if _YES.match(label) and not _WIDER.search(label)
+    ]
+    no = next((key for key, label in options if _NO.match(label)), "Escape")
+    if not yes:
+        return None
+    return {"allow": (narrow or yes)[0], "deny": no}
+
+
+async def _current_prompt(window_id: str) -> Any:
+    # Lazy: multiplexer + terminal parser.
+    from ..multiplexer import multiplexer as tmux_manager
+    from ..terminal_parser import extract_interactive_content
+
+    text = await tmux_manager.capture_pane(window_id)
+    return extract_interactive_content(text) if text else None
+
+
+async def _answerable_prompt(window_id: str) -> str | None:
+    """Fingerprint of the yes/no prompt the hook is about (it may paint late)."""
+    waited = 0.0
+    while True:
+        prompt = await _current_prompt(window_id)
+        if prompt is not None and prompt_answers(prompt.name, prompt.content):
+            return prompt_fingerprint(prompt.name, prompt.content)
+        if waited >= PROMPT_WAIT_S:
+            return None
+        await asyncio.sleep(0.25)
+        waited += 0.25
+
+
+async def answer_prompt(
+    thread_id: int, fingerprint: str, choice: str
+) -> dict[str, Any]:
+    # Lazy: multiplexer.
+    from ..multiplexer import multiplexer as tmux_manager
+    from .service import WebUIError, find_binding
+
+    wid = find_binding(thread_id).window_id
+    prompt = await _current_prompt(wid)
+    if prompt is None:
+        raise WebUIError("the prompt is no longer on screen", 409)
+    if prompt_fingerprint(prompt.name, prompt.content) != fingerprint:
+        raise WebUIError("a different prompt is on screen now", 409)
+    answers = prompt_answers(prompt.name, prompt.content)
+    if not answers or choice not in answers:
+        raise WebUIError("this prompt can't be answered from a notification", 409)
+    key = answers[choice]
+    if not await tmux_manager.send_keys(wid, key, enter=False, literal=key.isdigit()):
+        raise WebUIError("send failed", 502)
+    logger.info("webui prompt answered from a notification: %s -> %s", choice, key)
+    return {"ok": True, "choice": choice, "key": key}
 
 
 # ── deleted-topic probe ──────────────────────────────────────────────────────
