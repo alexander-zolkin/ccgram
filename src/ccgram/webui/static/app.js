@@ -1273,8 +1273,8 @@ function profileMenu() {
   });
   if (pushSupported()) {
     items.push(state.pushOn
-      ? { label: "Уведомления включены", sub: "Нажми, чтобы выключить на этом устройстве", icon: SVG.bell, check: true, action: disablePush }
-      : { label: "Включить уведомления", sub: isStandalone() || !isIOS() ? "Придут, даже когда приложение закрыто" : "На iPhone — после «На экран Домой»", icon: SVG.bellOff, action: enablePush });
+      ? { label: "Push на этом устройстве", sub: "Включён · нажми, чтобы выключить", icon: SVG.bell, check: true, action: disablePush }
+      : { label: "Push на этом устройстве", sub: isStandalone() || !isIOS() ? "Выключен · включи, чтобы получать ответы при закрытом приложении" : "На iPhone — после «На экран Домой»", icon: SVG.bellOff, action: enablePush });
   }
   items.push({ label: "Выйти", icon: SVG.out, action: async () => { await api("/api/logout", { body: {} }).catch(() => {}); showLogin(); } });
   return items;
