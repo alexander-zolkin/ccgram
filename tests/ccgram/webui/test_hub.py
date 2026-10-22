@@ -183,7 +183,7 @@ def test_alerts_latest_per_alert_with_the_verdict(tmp_path, monkeypatch):
     ]
     assert a["items"][0]["verdict"].startswith("🚨 Down")
     assert got["calendar"] == [
-        {"time": "10:30", "title": "Митинг"},
-        {"time": None, "title": "Отпуск"},
+        {"day": "today", "time": "10:30", "title": "Митинг"},
+        {"day": "today", "time": None, "title": "Отпуск"},
     ]
     hub._conf_cache = (-1.0, {})

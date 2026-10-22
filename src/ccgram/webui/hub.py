@@ -684,8 +684,8 @@ _CAL_LINE = re.compile(
 _calendar_cache: tuple[float, list[dict[str, Any]]] = (0.0, [])
 
 
-def calendar_today() -> list[dict[str, Any]] | None:
-    """Today's events from the configured read-only calendar command."""
+def calendar_soon() -> list[dict[str, Any]] | None:
+    """Today's and tomorrow's events from the read-only calendar command."""
     global _calendar_cache
     command = (config().get("calendar") or {}).get("command")
     if not command:
@@ -703,11 +703,13 @@ def calendar_today() -> list[dict[str, Any]] | None:
     except OSError, subprocess.SubprocessError:
         return _calendar_cache[1]
     today = date.today()
+    days = {today: "today", today + timedelta(days=1): "tomorrow"}
     events = []
     for line in out.splitlines():
         m = _CAL_LINE.match(line)
-        if m and date(int(m[3]), int(m[2]), int(m[1])) == today:
-            events.append({"time": m[4], "title": m[5]})
+        day = days.get(date(int(m[3]), int(m[2]), int(m[1]))) if m else None
+        if m and day:
+            events.append({"day": day, "time": m[4], "title": m[5]})
     _calendar_cache = (time.time(), events)
     return events
 
@@ -716,7 +718,7 @@ def happened() -> dict[str, Any] | None:
     conf = config()
     if not conf.get("alerts") and not conf.get("calendar"):
         return None
-    return {"alerts": alerts(), "calendar": calendar_today()}
+    return {"alerts": alerts(), "calendar": calendar_soon()}
 
 
 # ── everything for the home page in one call ─────────────────────────────────

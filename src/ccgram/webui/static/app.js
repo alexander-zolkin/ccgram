@@ -2683,7 +2683,10 @@ function renderHappened(h, pending) {
     <li><span class="rdot ${ALERT_DOT[x.kind] || ""}"></span><span class="ev-main"><b>${esc(x.name)}${x.instance && x.instance !== "unknown" ? ` · ${esc(x.instance)}` : ""}</b><span class="muted">${esc(x.label)} · ${hhmm(x.ts * 1000)}${x.count > 1 ? ` · ×${x.count}` : ""}</span>
       ${x.verdict ? `<details class="ev-verdict"><summary>Мой разбор</summary><div>${esc(x.verdict)}</div></details>` : ""}</span></li>`).join("") : '<li class="muted">Тихо — алертов за сутки не было</li>') : "";
   const cal = h.calendar;
-  const calRows = cal ? (cal.length ? cal.map((e) => `<li class="${e.time && e.time < nowHm ? "past" : ""}"><span class="ev-time">${esc(e.time || "весь день")}</span><span>${esc(e.title)}</span></li>`).join("") : '<li class="muted">В календаре на сегодня пусто</li>') : "";
+  const calRow = (e) => `<li class="${e.day === "today" && e.time && e.time < nowHm ? "past" : ""}"><span class="ev-time">${esc(e.time || "весь день")}</span><span>${esc(e.title)}</span></li>`;
+  const todayCal = (cal || []).filter((e) => e.day === "today");
+  const tomorrowCal = (cal || []).filter((e) => e.day === "tomorrow");
+  const calRows = cal ? `${todayCal.length ? todayCal.map(calRow).join("") : '<li class="muted">В календаре на сегодня пусто</li>'}${tomorrowCal.length ? `<li class="ev-day">Завтра</li>${tomorrowCal.map(calRow).join("")}` : ""}` : "";
   const due = ((pending && pending.items) || []).filter((it) => it.days <= 0);
   const late = due.filter((it) => it.days < 0).length;
   card.innerHTML = `
