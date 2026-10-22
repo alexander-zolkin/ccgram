@@ -248,7 +248,7 @@ def _topic_name(binding: Binding) -> str:
 
 async def list_sessions() -> list[dict[str, Any]]:
     # Lazy: registry is a leaf, but keep the import next to its only users.
-    from . import registry
+    from . import extras, registry
 
     # Lazy: prefs is a leaf; keep it next to its only user.
     from .prefs import pinned
@@ -273,8 +273,11 @@ async def list_sessions() -> list[dict[str, Any]]:
         except OSError:
             last_activity = 0.0
         if b.web_only:
-            # No topic poller paints these; liveness is all we know.
-            state = "idle" if b.window_id in live else "dead"
+            # No topic poller paints these: read the spinner off the pane.
+            if b.window_id not in live:
+                state = "dead"
+            else:
+                state = "active" if await extras.pane_status(b.window_id) else "idle"
         else:
             state = _session_state(b, live)
         sessions.append(

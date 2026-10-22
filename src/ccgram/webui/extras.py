@@ -184,6 +184,23 @@ async def probe_topic(bot: Any, thread_id: int) -> dict[str, Any]:
 # ── live status / subagents / todos / mode ───────────────────────────────────
 
 
+async def pane_status(window_id: str) -> str | None:
+    """The status block read straight off a pane no topic poller watches.
+
+    None when idle: Claude Code leaves "Baked for 19s · done" under a finished
+    turn, so only a running "Verbing…" spinner line counts.
+    """
+    # Lazy: multiplexer + terminal parser.
+    from ..multiplexer import multiplexer as tmux_manager
+    from ..terminal_parser import extract_interactive_content, parse_status_block
+
+    text = await tmux_manager.capture_pane(window_id)
+    if not text or extract_interactive_content(text):
+        return None
+    block = parse_status_block(text)
+    return block if block and "…" in block.split("\n", 1)[0] else None
+
+
 async def live(thread_id: int) -> dict[str, Any]:
     """What the agent is doing right now, from ccgram's poller + hook state."""
     # Lazy: polling + task state pull the handler graph.
@@ -198,11 +215,15 @@ async def live(thread_id: int) -> dict[str, Any]:
     turn = await asyncio.to_thread(transcript.current_turn, tx) if tx else None
     if turn:
         turn["now"] = time.time()  # the browser's clock may be off
-    status = progress = None
+    status = progress = raw = None
     ws = terminal_poll_state.peek_state(wid)
     result = ws.last_pyte_result if ws else None
     if result is not None and not result.is_interactive and result.raw_text:
-        head, _, rest = result.raw_text.partition("\n")
+        raw = result.raw_text
+    elif binding.web_only:
+        raw = await pane_status(wid)
+    if raw:
+        head, _, rest = raw.partition("\n")
         status = head.strip()
         progress = [line.strip() for line in rest.splitlines() if line.strip()]
     todos = []

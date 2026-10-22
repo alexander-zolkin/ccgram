@@ -99,3 +99,18 @@ def test_browse_stays_inside_home(tmp_path, monkeypatch):
     with pytest.raises(WebUIError):
         extras.browse(str(home / "missing"))
     assert extras.valid_cwd(None) is None
+
+
+async def test_pane_status_counts_only_a_running_spinner():
+    from unittest.mock import AsyncMock, patch
+
+    sep = "─" * 60
+    chrome = f"\n{sep}\n❯ \n{sep}\n  ⏵⏵ auto mode on (shift+tab to cycle)"
+    panes = {
+        "@1": "● Пишу ответ\n✻ Pondering… (12s · ↓ 1.2k tokens)" + chrome,
+        "@2": "● Готово\n✻ Baked for 19s · done 9:42 PM" + chrome,
+    }
+    capture = AsyncMock(side_effect=lambda wid: panes[wid])
+    with patch("ccgram.multiplexer.multiplexer", capture_pane=capture):
+        assert await extras.pane_status("@1") == "Pondering… (12s · ↓ 1.2k tokens)"
+        assert await extras.pane_status("@2") is None
