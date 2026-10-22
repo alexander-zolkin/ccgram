@@ -1265,16 +1265,17 @@ async function sendTo(tid, message, node) {
   p.querySelector(".retry")?.remove();
   p.querySelector(".tick").innerHTML = TICK.clock;
   state.pending.set(tid, message);
-  if (s && s.state === "dead") { $("working").hidden = false; $("working-text").textContent = "Бужу сессию…"; }
+  startInflight(tid); // the clock starts on the click, like Claude Code's own
+  renderHeader();
+  if (s && s.state === "dead") $("working-text").textContent = "Бужу сессию…";
   try {
     await api(`/api/sessions/${tid}/send`, { body: { text: message } });
     p.querySelector(".tick").innerHTML = TICK.sent;
     p.dataset.sent = "1";
     refreshMsgStatus();
-    startInflight(tid);
-    renderHeader();
   } catch (e) {
     state.pending.delete(tid);
+    if (state.inflight?.tid === tid) { state.inflight = null; state.turnClock = null; renderHeader(); }
     p.classList.add("failed");
     p.querySelector(".tick").textContent = "!";
     const retry = el("button", "retry", "Не отправлено · Повторить");
@@ -1973,6 +1974,7 @@ function turnClock(live, status) {
   const skew = turn.now ? Date.now() - turn.now * 1000 : 0;
   let start = turn.start ? Date.parse(turn.start) + skew : NaN;
   if (Number.isNaN(start)) start = status.secs != null ? Date.now() - status.secs * 1000 : prev ? prev.start : Date.now();
+  if (prev && prev.start < start) start = prev.start; // never run backwards
   state.turnClock = { tid: state.current, start, out: Math.max(turn.out || 0, status.tokens || 0) };
   tickWork();
 }
