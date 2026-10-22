@@ -249,9 +249,9 @@ async def terminal(thread_id: int) -> dict[str, Any]:
 
 def commands(thread_id: int | None, provider_name: str = "claude") -> dict[str, Any]:
     """Slash commands + skills the agent understands, for "/" autocomplete."""
-    # Lazy: catalog walks the Claude config dir.
-    from .. import command_catalog, window_query
-    from ..config import config
+    # Lazy: discovery walks the Claude config dir (cached 60 s by the catalog).
+    from .. import window_query
+    from ..cc_commands import discover_provider_commands
     from ..providers import get_provider_for_window
     from ..providers import registry as provider_registry
     from .service import find_binding
@@ -263,9 +263,7 @@ def commands(thread_id: int | None, provider_name: str = "claude") -> dict[str, 
         )
     else:
         provider = provider_registry.get(provider_name)
-    found = command_catalog.get_provider_commands(
-        provider, str(config.claude_config_dir)
-    )
+    found = discover_provider_commands(provider)
     return {
         "commands": [
             {

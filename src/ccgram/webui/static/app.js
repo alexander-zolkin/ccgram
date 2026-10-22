@@ -1840,18 +1840,26 @@ function renderLive(live, s) {
 }
 
 // ═══ Claude Code mode (Default / Accept edits / Plan / Bypass) ══════════════
-const MODE_RU = { Def: ["Обычный", "Спрашивает разрешения"], Edit: ["Правки без вопросов", "Изменяет файлы без подтверждения"], Plan: ["План", "Сначала план, потом действия"], Full: ["Полный доступ", "Без подтверждений (yolo)"] };
+// Labels from ccgram's scrape of the Claude Code status bar (none = default).
+const MODE_RU = {
+  Def: ["Обычный", "спрашивает разрешения на действия"],
+  Edit: ["Правки", "меняет файлы без подтверждения"],
+  Plan: ["План", "сначала составляет план, потом действует"],
+  Auto: ["Авто", "сама решает, о чём спрашивать"],
+  YOLO: ["Без вопросов", "ничего не спрашивает (yolo)"],
+};
 async function refreshMode(tid, cycle = false) {
   state.modeAt = Date.now();
   try {
     const r = await api(`/api/sessions/${tid}/mode`, cycle ? { body: {} } : {});
     if (tid !== state.current) return;
     const b = $("mode-btn");
-    const m = MODE_RU[r.mode];
+    const key = r.mode || "Def";
+    const m = MODE_RU[key];
     b.hidden = !m;
     if (m) {
       b.textContent = m[0];
-      b.dataset.mode = r.mode;
+      b.dataset.mode = key;
       b.dataset.tip = `Режим Claude Code: ${m[1]}. Нажми — следующий режим (как Shift+Tab)`;
       if (cycle) toast(`Режим: ${m[0].toLowerCase()} — ${m[1].toLowerCase()}`);
     }
