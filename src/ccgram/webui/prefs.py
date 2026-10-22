@@ -71,6 +71,16 @@ def set_tg_muted(on: bool) -> None:
     _save()
 
 
+def new_chat_telegram() -> bool:
+    """Whether new web chats get a Telegram topic (shared by every device)."""
+    return bool(_load().get("new_chat_telegram", True))
+
+
+def set_new_chat_telegram(on: bool) -> None:
+    _load()["new_chat_telegram"] = bool(on)
+    _save()
+
+
 def reset_for_testing() -> None:
     global _prefs
     _prefs = None

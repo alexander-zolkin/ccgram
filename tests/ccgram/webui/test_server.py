@@ -352,3 +352,24 @@ async def test_keep_route(client, monkeypatch):
     await _login(client)
     resp = await client.post("/api/sessions/42/keep", json={}, headers=POST_HEADERS)
     assert (await resp.json())["tid"] == 42
+
+
+async def test_settings_roundtrip(client, tmp_path, monkeypatch):
+    from ccgram import quiet_threads
+    from ccgram.webui import prefs
+
+    monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
+    prefs.reset_for_testing()
+    await _login(client)
+    resp = await client.get("/api/settings")
+    assert await resp.json() == {"tg_muted": False, "new_chat_telegram": True}
+    resp = await client.post(
+        "/api/settings",
+        json={"new_chat_telegram": False, "tg_muted": True},
+        headers=POST_HEADERS,
+    )
+    assert await resp.json() == {"tg_muted": True, "new_chat_telegram": False}
+    prefs.reset_for_testing()
+    assert prefs.new_chat_telegram() is False and prefs.tg_muted() is True
+    quiet_threads.reset_for_testing()
+    prefs.reset_for_testing()

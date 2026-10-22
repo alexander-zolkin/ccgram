@@ -1274,9 +1274,17 @@ function profileMenu() {
     { label: "Тёмная", icon: SVG.sun, check: theme === "dark", action: () => setTheme("dark") },
     "sep",
   ];
+  items.push({ heading: "Telegram" });
+  items.push({
+    label: "Новые чаты в Telegram",
+    sub: state.telegram ? "Каждый новый чат получает свой топик" : "Режим «только веб»: топики не создаются",
+    icon: SVG.tg,
+    check: state.telegram,
+    action: () => $("tg-toggle").click(),
+  });
   items.push({ heading: "Уведомления" });
   items.push({
-    label: "Telegram",
+    label: "Звук в Telegram",
     sub: state.tgMuted ? "Все топики без звука · настройки чатов сохранены" : "Звук по настройкам каждого чата",
     icon: state.tgMuted ? SVG.bellOff : SVG.tg,
     check: !state.tgMuted,
@@ -1374,7 +1382,12 @@ async function boot() {
   route();
   reportPresence();
   refreshPushState();
-  api("/api/settings").then((r) => { state.tgMuted = r.tg_muted; const s = currentSession(); if (s) renderSoundBtn(s); }).catch(() => {});
+  api("/api/settings").then((r) => {
+    state.tgMuted = r.tg_muted;
+    if (typeof r.new_chat_telegram === "boolean") { state.telegram = r.new_chat_telegram; store.set("kara-telegram", state.telegram ? "1" : "0"); renderToggle(); }
+    const s = currentSession();
+    if (s) renderSoundBtn(s);
+  }).catch(() => {});
 }
 
 $("login-form").onsubmit = async (ev) => {
@@ -1640,7 +1653,13 @@ $("profile-btn").onclick = () => {
   const r = $("profile-btn").getBoundingClientRect();
   openMenu(profileMenu(), { x: r.left, y: r.top - 8, top: r.top });
 };
-$("tg-toggle").onclick = () => { state.telegram = !state.telegram; store.set("kara-telegram", state.telegram ? "1" : "0"); renderToggle(); };
+$("tg-toggle").onclick = () => {
+  state.telegram = !state.telegram;
+  store.set("kara-telegram", state.telegram ? "1" : "0");
+  renderToggle();
+  // The server keeps the choice for every device and the home-screen app.
+  api("/api/settings", { body: { new_chat_telegram: state.telegram } }).catch(() => toast("Не сохранилось на сервере"));
+};
 $("effort-btn").onclick = () => {
   openMenu([{ heading: "Усилие для нового чата" }, ...EFFORTS.map(([id, label, sub]) => ({
     label, sub, check: state.effort === id,

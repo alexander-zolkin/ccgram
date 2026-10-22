@@ -216,6 +216,13 @@ async def _create(request: web.Request) -> web.Response:
     model = service.valid_model(body.get("model"))
     provider = service.valid_provider(body.get("provider"))
     effort = body.get("effort") if body.get("effort") in EFFORT_LEVELS else None
+    logger.info(
+        "webui create: web_only=%s provider=%s model=%s effort=%s",
+        bool(body.get("web_only")),
+        provider,
+        model,
+        effort,
+    )
     if body.get("web_only"):
         result = await service.create_web_only_session(
             str(body.get("text", "")), name, model, provider, effort
@@ -310,14 +317,23 @@ async def _pin(request: web.Request) -> web.Response:
 async def _settings(request: web.Request) -> web.Response:
     # Lazy: leaf modules.
     from .. import quiet_threads
-    from .prefs import set_tg_muted
+    from .prefs import new_chat_telegram, set_new_chat_telegram, set_tg_muted
 
     if request.method == "POST":
         body = await _json_body(request)
         if "tg_muted" in body:
             quiet_threads.set_all_muted(bool(body["tg_muted"]))
             set_tg_muted(bool(body["tg_muted"]))
-    return web.json_response({"tg_muted": quiet_threads.all_muted()})
+        if "new_chat_telegram" in body:
+            # Server-side on purpose: an iOS home-screen app has its own
+            # localStorage, so a browser-only choice silently reset there.
+            set_new_chat_telegram(bool(body["new_chat_telegram"]))
+    return web.json_response(
+        {
+            "tg_muted": quiet_threads.all_muted(),
+            "new_chat_telegram": new_chat_telegram(),
+        }
+    )
 
 
 async def _push_key(_request: web.Request) -> web.Response:
