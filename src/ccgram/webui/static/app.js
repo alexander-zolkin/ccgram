@@ -89,6 +89,8 @@ const SVG = {
   bellRing: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10 21h4M2.5 7.5A9 9 0 0 1 5 3M21.5 7.5A9 9 0 0 0 19 3"/></svg>',
   bellAuto: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10 21h4"/><path d="M10 12.5l2-5 2 5M10.6 11h2.8" stroke-width="1.5"/></svg>',
   out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>',
+  key: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3M14 9l2 2"/></svg>',
+  shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4" stroke-linecap="round"/></svg>',
   globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>',
   tgGone: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 5L3 11.5l5 1.8M21 5l-3 14-6.5-4.5M21 5L8 13.3v5.2l3.5-3.2M3 3l18 18"/></svg>',
   check2: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/></svg>',
@@ -139,11 +141,12 @@ document.addEventListener("mousedown", (ev) => { if (!$("menu").hidden && !$("me
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeMenu(); });
 window.addEventListener("resize", closeMenu);
 
-function confirmDialog(title, text, okLabel) {
+function confirmDialog(title, text, okLabel, danger = true) {
   return new Promise((resolve) => {
     $("confirm-title").textContent = title;
     $("confirm-text").textContent = text;
     $("confirm-ok").textContent = okLabel;
+    $("confirm-ok").className = `btn ${danger ? "danger-fill" : "primary"}`;
     const dlg = $("confirm");
     dlg.returnValue = "";
     dlg.onclose = () => resolve(dlg.returnValue === "ok");
@@ -1470,6 +1473,7 @@ function profileMenu() {
       ? { label: "Push на этом устройстве", sub: "Включён · нажми, чтобы выключить", icon: SVG.bell, check: true, action: disablePush }
       : { label: "Push на этом устройстве", sub: isStandalone() || !isIOS() ? "Выключен · включи, чтобы получать ответы при закрытом приложении" : "На iPhone — после «На экран Домой»", icon: SVG.bellOff, action: enablePush });
   }
+  items.push("sep", { label: "Безопасность", sub: "Пароль, ключи доступа, последние входы", icon: SVG.shield, action: openSecurity });
   items.push({ label: "Выйти", icon: SVG.out, action: async () => { await api("/api/logout", { body: {} }).catch(() => {}); showLogin(); } });
   return items;
 }
@@ -1554,8 +1558,192 @@ function showLogin() {
   state.es?.close();
   $("app").hidden = true;
   $("login").hidden = false;
-  $("password").focus();
+  showLoginMethods();
 }
+
+// ═══ login: passkey (Face ID / Touch ID / Windows Hello), Telegram, password ═
+const b64u = {
+  enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+  dec: (text) => Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (text.length % 4)) % 4)), (ch) => ch.charCodeAt(0)),
+};
+const hasWebAuthn = () => Boolean(window.isSecureContext && window.PublicKeyCredential && navigator.credentials);
+const keyWord = () => {
+  const ua = navigator.userAgent;
+  return /iPhone|iPad/.test(ua) ? "Face ID" : /Macintosh/.test(ua) ? "Touch ID" : /Windows/.test(ua) ? "Windows Hello" : /Android/.test(ua) ? "отпечатку" : "ключу доступа";
+};
+// The server speaks WebAuthn JSON (base64url); the browser wants ArrayBuffers.
+function credJSON(c) {
+  const r = c.response;
+  const out = { id: c.id, rawId: b64u.enc(c.rawId), type: c.type, clientExtensionResults: c.getClientExtensionResults?.() || {}, response: { clientDataJSON: b64u.enc(r.clientDataJSON) } };
+  if (c.authenticatorAttachment) out.authenticatorAttachment = c.authenticatorAttachment;
+  if (r.attestationObject) Object.assign(out.response, { attestationObject: b64u.enc(r.attestationObject), transports: r.getTransports?.() || [] });
+  if (r.authenticatorData) Object.assign(out.response, { authenticatorData: b64u.enc(r.authenticatorData), signature: b64u.enc(r.signature), ...(r.userHandle ? { userHandle: b64u.enc(r.userHandle) } : {}) });
+  return out;
+}
+const loginError = (e) => (e.message === "too many attempts" ? "Слишком много попыток — подожди 15 минут"
+  : e.message === "wrong password" ? "Неверный пароль"
+  : /key|ключ/i.test(e.message) ? "Ключ не подошёл — попробуй ещё раз или войди через Telegram" : e.message);
+
+async function showLoginMethods() {
+  let m = { password: true, passkey: false, telegram: false };
+  try { m = await api("/api/auth/methods"); } catch (_) { /* offline: show the password */ }
+  const key = m.passkey && hasWebAuthn();
+  $("passkey-login").hidden = !key;
+  $("passkey-label").textContent = `Войти по ${keyWord()}`;
+  $("tg-login").hidden = !m.telegram;
+  $("login-pass").hidden = !m.password;
+  $("password").required = m.password;
+  $("login-or").hidden = !(m.password && (key || m.telegram));
+  $("pass-submit").classList.toggle("primary", !key);
+  if (!key && m.password) $("password").focus();
+}
+
+async function afterLogin(viaKey) {
+  state.offerPasskey = !viaKey;
+  boot(await api("/api/me").catch(() => null));
+}
+
+$("passkey-login").onclick = async () => {
+  $("login-error").textContent = "";
+  try {
+    const begin = await api("/api/auth/passkey/login/options", { body: {} });
+    const o = begin.options;
+    const cred = await navigator.credentials.get({ publicKey: { ...o, challenge: b64u.dec(o.challenge), allowCredentials: (o.allowCredentials || []).map((c) => ({ ...c, id: b64u.dec(c.id) })) } });
+    await api("/api/auth/passkey/login", { body: { token: begin.token, credential: credJSON(cred) } });
+    store.set("kara-passkey", "1");
+    afterLogin(true);
+  } catch (e) {
+    if (e.name !== "NotAllowedError" && e.name !== "AbortError") $("login-error").textContent = loginError(e);
+  }
+};
+
+$("tg-login").onclick = async () => {
+  $("login-error").textContent = "";
+  let req;
+  try { req = await api("/api/auth/telegram", { body: {} }); } catch (e) {
+    $("login-error").textContent = e.message === "too many requests" ? "Запросы слишком часто — подожди минуту" : e.message;
+    return;
+  }
+  const wait = $("tg-wait");
+  wait.hidden = false;
+  wait.innerHTML = `<div class="tg-code">${esc(req.code)}</div><div>В группе «Кара» в Telegram пришёл запрос. Проверь, что там тот же код, и нажми «Впустить».</div><button type="button" class="link-btn" id="tg-cancel">Отмена</button>`;
+  state.tgLogin = req.id;
+  $("tg-cancel").onclick = () => { state.tgLogin = null; wait.hidden = true; };
+  while (state.tgLogin === req.id) {
+    await new Promise((r) => setTimeout(r, 2000));
+    if (state.tgLogin !== req.id) return;
+    let st;
+    try { st = (await api(`/api/auth/telegram/${req.id}`)).state; } catch (_) { continue; }
+    if (st === "pending") continue;
+    state.tgLogin = null;
+    wait.hidden = true;
+    if (st === "approved") { afterLogin(false); return; }
+    $("login-error").textContent = st === "denied" ? "Вход отклонён в Telegram" : "Запрос устарел — попробуй ещё раз";
+  }
+};
+
+async function addPasskey() {
+  const begin = await api("/api/auth/passkeys/options", { body: {} });
+  const o = begin.options;
+  const cred = await navigator.credentials.create({ publicKey: { ...o, challenge: b64u.dec(o.challenge), user: { ...o.user, id: b64u.dec(o.user.id) }, excludeCredentials: (o.excludeCredentials || []).map((c) => ({ ...c, id: b64u.dec(c.id) })) } });
+  const r = await api("/api/auth/passkeys", { body: { token: begin.token, credential: credJSON(cred) } });
+  store.set("kara-passkey", "1");
+  return r;
+}
+
+// After a password / Telegram login on a device that could use a key.
+async function offerPasskey() {
+  if (!state.offerPasskey || !hasWebAuthn() || store.get("kara-passkey") === "1") return;
+  state.offerPasskey = false;
+  if (!(await confirmDialog(`Входить по ${keyWord()}?`, "Добавлю ключ доступа для этого устройства — дальше вход в одно касание, без пароля.", "Добавить", false))) return;
+  try { await addPasskey(); toast(`Готово — теперь вход по ${keyWord()}`); } catch (e) { if (e.name !== "NotAllowedError") toast(e.message); }
+}
+
+const LOGIN_HOW = { password: "пароль", passkey: "ключ доступа", telegram: "Telegram" };
+function whenRu(ts) {
+  const d = new Date(ts * 1000);
+  const days = Math.round((new Date().setHours(0, 0, 0, 0) - new Date(d).setHours(0, 0, 0, 0)) / 864e5);
+  const day = days === 0 ? "сегодня" : days === 1 ? "вчера" : d.toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+  return `${day}, ${hhmm(d.getTime())}`;
+}
+
+async function openSecurity() {
+  const dlg = $("security");
+  let sec;
+  try { sec = await api("/api/security"); } catch (e) { toast(e.message); return; }
+  state.passProof = null;
+  const renderKeys = (keys) => {
+    sec.keys = keys;
+    $("keys-list").innerHTML = keys.length ? keys.map((k) => `<li><span class="key-ico">${SVG.key}</span><span class="key-main"><b>${esc(k.name)}</b><span class="muted">добавлен ${whenRu(k.created)}${k.last_used ? ` · вход ${whenRu(k.last_used)}` : ""}${k.synced ? " · синхронизируется между твоими устройствами" : ""}</span></span><button type="button" class="icon-btn small" data-del="${esc(k.id)}" data-tip="Удалить ключ">${SVG.trash}</button></li>`).join("") : '<li class="muted">Ключей пока нет</li>';
+    $("keys-list").querySelectorAll("[data-del]").forEach((b) => {
+      b.onclick = async () => {
+        if (!(await confirmDialog("Удалить ключ?", "С этого ключа войти больше не получится.", "Удалить"))) return;
+        try { renderKeys((await api(`/api/auth/passkeys/${b.dataset.del}/delete`, { body: {} })).keys); } catch (e) { toast(e.message); }
+      };
+    });
+    const proof = $("sec-proof-key");
+    proof.hidden = !keys.length || !hasWebAuthn();
+    proof.textContent = `Не помню пароль — подтвердить по ${keyWord()}`;
+  };
+  const renderInfo = () => {
+    $("sec-pass-state").textContent = sec.password_set_here
+      ? `Твой пароль, сменён ${whenRu(sec.password_changed)}. Хранится только его хеш.`
+      : "Сейчас действует пароль из настроек сервера. Задай свой — он заменит его.";
+    $("sec-tg").textContent = sec.telegram
+      ? "Включён: на новом устройстве нажми «Войти через Telegram» — в группе «Кара» придёт запрос с кодом, впускаешь кнопкой."
+      : "Недоступен: у бота не настроена группа.";
+    $("sec-logins").innerHTML = sec.logins.length
+      ? sec.logins.map((e) => `<li><span>${esc(whenRu(e.ts))}</span><span>${esc(LOGIN_HOW[e.method] || e.method)}</span><span class="muted">${esc(e.device || "")} · ${esc(e.ip || "")}</span></li>`).join("")
+      : '<li class="muted">Записей пока нет — журнал ведётся с сегодняшнего дня</li>';
+    $("sec-failed").textContent = sec.failed_24h ? `Неудачных попыток входа за сутки: ${sec.failed_24h}` : "Неудачных попыток за сутки не было";
+  };
+  renderKeys(sec.keys);
+  renderInfo();
+  $("sec-pass-form").hidden = true;
+  $("sec-pass-open").hidden = false;
+  ["sec-current", "sec-new", "sec-new2"].forEach((id) => { $(id).value = ""; });
+  $("sec-current").hidden = false;
+  $("sec-pass-open").onclick = () => { $("sec-pass-form").hidden = false; $("sec-pass-open").hidden = true; $("sec-current").focus(); };
+  $("sec-proof-key").onclick = async () => {
+    try {
+      const begin = await api("/api/auth/passkey/login/options", { body: {} });
+      const o = begin.options;
+      const cred = await navigator.credentials.get({ publicKey: { ...o, challenge: b64u.dec(o.challenge), allowCredentials: [] } });
+      state.passProof = { token: begin.token, credential: credJSON(cred) };
+      $("sec-current").hidden = true;
+      $("sec-proof-key").textContent = `✓ Подтверждено по ${keyWord()}`;
+      $("sec-new").focus();
+    } catch (e) { if (e.name !== "NotAllowedError") toast(e.message); }
+  };
+  $("sec-pass-save").onclick = async () => {
+    const next = $("sec-new").value;
+    if (next.length < 8) { toast("Пароль — от 8 символов"); return; }
+    if (next !== $("sec-new2").value) { toast("Пароли не совпадают"); return; }
+    const body = state.passProof ? { passkey: state.passProof, new: next } : { current: $("sec-current").value, new: next };
+    try {
+      sec = { ...sec, ...(await api("/api/security/password", { body })) };
+      state.passProof = null;
+      renderInfo();
+      $("sec-pass-form").hidden = true;
+      $("sec-pass-open").hidden = false;
+      toast("Пароль сменён — остальные устройства вышли");
+    } catch (e) { toast(e.message === "wrong password" ? "Текущий пароль не тот" : loginError(e)); }
+  };
+  $("keys-add").hidden = !hasWebAuthn();
+  $("keys-add").onclick = async () => {
+    try { renderKeys((await addPasskey()).keys); toast("Ключ добавлен"); } catch (e) { if (e.name === "InvalidStateError") toast("На этом устройстве ключ уже есть"); else if (e.name !== "NotAllowedError") toast(e.message); }
+  };
+  $("sec-signout").onclick = async () => {
+    if (!(await confirmDialog("Выйти на других устройствах?", "Все остальные браузеры и приложения выйдут. Это устройство останется в системе.", "Выйти везде"))) return;
+    try { await api("/api/security/sign-out-others", { body: {} }); toast("Готово — остальные устройства вышли"); } catch (e) { toast(e.message); }
+  };
+  dlg.showModal();
+}
+// Enter in a field must not close the dialog (a form with method="dialog").
+$("security").querySelector("form").addEventListener("submit", (ev) => {
+  if (!ev.submitter || ev.submitter.value !== "close") ev.preventDefault();
+  if (!ev.submitter && !$("sec-pass-form").hidden) $("sec-pass-save").click();
+});
 
 async function boot(me) {
   if (me && "hub" in me) store.set("kara-hub", me.hub ? "1" : "0");
@@ -1565,6 +1753,7 @@ async function boot(me) {
   await refreshSessions();
   connect();
   route();
+  offerPasskey();
   reportPresence();
   refreshPushState();
   api("/api/settings").then((r) => {
@@ -1586,10 +1775,9 @@ $("login-form").onsubmit = async (ev) => {
   try {
     await api("/api/login", { body: { password: $("password").value } });
     $("password").value = "";
-    boot(await api("/api/me").catch(() => null));
+    afterLogin(false);
   } catch (e) {
-    $("login-error").textContent = e.message === "wrong password" ? "Неверный пароль"
-      : e.message === "too many attempts" ? "Слишком много попыток — подожди 15 минут" : e.message;
+    $("login-error").textContent = loginError(e);
   }
 };
 window.addEventListener("hashchange", route);
@@ -2510,7 +2698,7 @@ function keepPending(p) {
 
 async function closePending(it) {
   const short = it.text.replace(/\s+/g, " ").slice(0, 180);
-  if (!(await confirmDialog("Дело сделано?", `${short}${it.text.length > 180 ? "…" : ""}\n\nУберу его в архив закрытых дел.`, "Закрыть"))) return;
+  if (!(await confirmDialog("Дело сделано?", `${short}${it.text.length > 180 ? "…" : ""}\n\nУберу его в архив закрытых дел.`, "Закрыть", false))) return;
   try { renderPending(keepPending(await api(`/api/hub/pending/${it.id}/close`, { body: {} }))); toast("Закрыто — дело в архиве"); } catch (e) { toast(e.message); loadHub(); }
 }
 

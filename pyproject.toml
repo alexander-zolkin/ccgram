@@ -32,6 +32,7 @@ dependencies = [
     "pathspec>=0.12",
     "aiohttp>=3.10",
     "pywebpush>=2.0",
+    "webauthn>=2.2",
 ]
 
 [project.urls]

@@ -35,6 +35,11 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/uploads``                   file for a session not created yet
 - ``GET  /api/models``                    Claude models for the picker
 - ``GET  /api/events``                    SSE: messages + session-list changes
+- ``GET  /api/auth/methods``              which logins are open (no session needed)
+- ``POST /api/auth/passkey/login/options``, ``/api/auth/passkey/login``  passkey login
+- ``POST /api/auth/telegram``, ``GET /api/auth/telegram/{id}``  approve in Telegram
+- ``POST /api/auth/passkeys``, ``/api/auth/passkeys/options|{id}/delete``  passkeys
+- ``GET  /api/security``, ``POST /api/security/password|sign-out-others``
 - ``GET  /api/hub``                       home page: now / reach / pending / memory
 - ``POST /api/hub/reach``                 probe every reach target now
 - ``POST /api/hub/pending/{id}/close|snooze``  close (to the done log) / postpone
@@ -60,9 +65,9 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from . import extras, hub, push, service
+from . import extras, hub, passkeys, push, security, service, tg_login
 from ..providers.claude import EFFORT_LEVELS
-from .auth import COOKIE_NAME, SESSION_TTL_S, LoginThrottle, check_password
+from .auth import COOKIE_NAME, SESSION_TTL_S, LoginThrottle
 from .auth import issue_cookie, verify_cookie
 from .bus import bus
 
@@ -116,11 +121,32 @@ def _is_https(request: web.Request) -> bool:
     return request.secure or request.headers.get("X-Forwarded-Proto") == "https"
 
 
+# Login endpoints, reachable without a session.
+_PUBLIC_API = {
+    "/api/login",
+    "/api/auth/methods",
+    "/api/auth/passkey/login/options",
+    "/api/auth/passkey/login",
+    "/api/auth/telegram",
+}
+
+
+def _public_api(path: str) -> bool:
+    return path in _PUBLIC_API or path.startswith("/api/auth/telegram/")
+
+
+def _relying_party(request: web.Request) -> tuple[str, str]:
+    """(rp id, origin) of the page: the host Caddy forwarded, scheme included."""
+    host = request.host
+    scheme = "https" if _is_https(request) else "http"
+    return host.split(":")[0], f"{scheme}://{host}"
+
+
 def _authed(request: web.Request) -> bool:
     return verify_cookie(
         request.cookies.get(COOKIE_NAME),
         request.app[_TOKEN_KEY],
-        request.app[_PASSWORD_KEY],
+        security.cookie_material(request.app[_PASSWORD_KEY]),
     )
 
 
@@ -129,7 +155,7 @@ async def _middleware(
     request: web.Request, handler: Callable[[web.Request], Awaitable[Any]]
 ) -> Any:
     path = request.path
-    if path.startswith("/api/") and path != "/api/login" and not _authed(request):
+    if path.startswith("/api/") and not _public_api(path) and not _authed(request):
         return web.json_response({"error": "login required"}, status=401)
     if request.method == "POST" and request.headers.get("X-CCGram") != "1":
         return web.json_response({"error": "missing X-CCGram header"}, status=403)
@@ -182,24 +208,14 @@ async def _service_worker(_request: web.Request) -> web.FileResponse:
 # ── auth ─────────────────────────────────────────────────────────────────────
 
 
-async def _login(request: web.Request) -> web.Response:
-    throttle = request.app[_THROTTLE_KEY]
-    client = _client_ip(request)
-    if throttle.blocked(client):
-        logger.warning("webui login blocked (throttle) client=%s", client)
-        return web.json_response({"error": "too many attempts"}, status=429)
-    body = await _json_body(request)
-    password = request.app[_PASSWORD_KEY]
-    if not check_password(str(body.get("password", "")), password):
-        throttle.record_failure(client)
-        logger.warning("webui login failed client=%s", client)
-        return web.json_response({"error": "wrong password"}, status=401)
-    throttle.reset(client)
-    logger.info("webui login ok client=%s", client)
-    resp = web.json_response({"ok": True})
+def _with_session(request: web.Request, payload: dict[str, Any]) -> web.Response:
+    resp = web.json_response(payload)
     resp.set_cookie(
         COOKIE_NAME,
-        issue_cookie(request.app[_TOKEN_KEY], password),
+        issue_cookie(
+            request.app[_TOKEN_KEY],
+            security.cookie_material(request.app[_PASSWORD_KEY]),
+        ),
         max_age=SESSION_TTL_S,
         httponly=True,
         secure=_is_https(request),
@@ -207,6 +223,173 @@ async def _login(request: web.Request) -> web.Response:
         path="/",
     )
     return resp
+
+
+def _device(request: web.Request) -> str:
+    return tg_login.device_label(request.headers.get("User-Agent", ""))
+
+
+async def _login(request: web.Request) -> web.Response:
+    throttle = request.app[_THROTTLE_KEY]
+    client = _client_ip(request)
+    if throttle.blocked(client):
+        logger.warning("webui login blocked (throttle) client=%s", client)
+        return web.json_response({"error": "too many attempts"}, status=429)
+    body = await _json_body(request)
+    ok = security.check_password(
+        str(body.get("password", "")), request.app[_PASSWORD_KEY]
+    )
+    security.record("password", ok, _device(request), client)
+    if not ok:
+        throttle.record_failure(client)
+        logger.warning("webui login failed client=%s", client)
+        return web.json_response({"error": "wrong password"}, status=401)
+    throttle.reset(client)
+    logger.info("webui login ok client=%s", client)
+    return _with_session(request, {"ok": True})
+
+
+# ── passkeys + Telegram approval ─────────────────────────────────────────────
+
+
+async def _auth_methods(_request: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "password": True,
+            "passkey": passkeys.count() > 0,
+            "telegram": tg_login.enabled(),
+        }
+    )
+
+
+async def _passkey_login_options(request: web.Request) -> web.Response:
+    rp_id, _origin = _relying_party(request)
+    return web.json_response(passkeys.login_options(rp_id))
+
+
+async def _passkey_login(request: web.Request) -> web.Response:
+    throttle = request.app[_THROTTLE_KEY]
+    client = _client_ip(request)
+    if throttle.blocked(client):
+        return web.json_response({"error": "too many attempts"}, status=429)
+    body = await _json_body(request)
+    rp_id, origin = _relying_party(request)
+    credential = body.get("credential")
+    if not isinstance(credential, dict):
+        raise service.WebUIError("no credential")
+    try:
+        key = passkeys.login(rp_id, origin, str(body.get("token", "")), credential)
+    except passkeys.PasskeyError as exc:
+        throttle.record_failure(client)
+        security.record("passkey", False, _device(request), client)
+        logger.warning("webui passkey login failed client=%s: %s", client, exc)
+        return web.json_response({"error": str(exc)}, status=401)
+    throttle.reset(client)
+    security.record("passkey", True, key["name"], client)
+    logger.info("webui passkey login ok client=%s key=%s", client, key["name"])
+    return _with_session(request, {"ok": True, "key": key})
+
+
+async def _telegram_login(request: web.Request) -> web.Response:
+    if not tg_login.enabled():
+        raise service.WebUIError("Telegram login is not available", 404)
+    try:
+        asked = await tg_login.start(
+            request.app[_BOT_KEY],
+            _client_ip(request),
+            request.headers.get("User-Agent", ""),
+        )
+    except tg_login.TooSoonError as exc:
+        return web.json_response(
+            {"error": "too many requests", "wait": exc.wait}, status=429
+        )
+    return web.json_response(asked)
+
+
+async def _telegram_login_poll(request: web.Request) -> web.Response:
+    state = tg_login.poll(request.match_info["id"])
+    if state == "approved":
+        security.record("telegram", True, _device(request), _client_ip(request))
+        logger.info("webui telegram login ok client=%s", _client_ip(request))
+        return _with_session(request, {"state": state})
+    return web.json_response({"state": state})
+
+
+async def _security(_request: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            **security.overview(),
+            "keys": passkeys.credentials(),
+            "telegram": tg_login.enabled(),
+        }
+    )
+
+
+async def _security_password(request: web.Request) -> web.Response:
+    """New password; proven by the current one or a fresh passkey touch."""
+    body = await _json_body(request)
+    throttle = request.app[_THROTTLE_KEY]
+    client = _client_ip(request)
+    if throttle.blocked(client):
+        return web.json_response({"error": "too many attempts"}, status=429)
+    proof = body.get("passkey")
+    if isinstance(proof, dict) and isinstance(proof.get("credential"), dict):
+        rp_id, origin = _relying_party(request)
+        try:
+            passkeys.login(
+                rp_id, origin, str(proof.get("token", "")), proof["credential"]
+            )
+        except passkeys.PasskeyError as exc:
+            throttle.record_failure(client)
+            raise service.WebUIError(str(exc), 401) from None
+    elif not security.check_password(
+        str(body.get("current", "")), request.app[_PASSWORD_KEY]
+    ):
+        throttle.record_failure(client)
+        raise service.WebUIError("wrong password", 401)
+    try:
+        security.set_password(str(body.get("new", "")))
+    except ValueError as exc:
+        raise service.WebUIError(str(exc)) from None
+    logger.info("webui password changed client=%s", client)
+    # The secret rotated: every other browser is out, this one gets a fresh cookie.
+    return _with_session(request, {"ok": True, **security.overview()})
+
+
+async def _security_sign_out_others(request: web.Request) -> web.Response:
+    security.sign_out_everywhere()
+    logger.info("webui signed out everywhere else client=%s", _client_ip(request))
+    return _with_session(request, {"ok": True})
+
+
+async def _passkey_options(request: web.Request) -> web.Response:
+    rp_id, _origin = _relying_party(request)
+    return web.json_response(passkeys.registration_options(rp_id))
+
+
+async def _passkey_add(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    rp_id, origin = _relying_party(request)
+    credential = body.get("credential")
+    if not isinstance(credential, dict):
+        raise service.WebUIError("no credential")
+    name = str(
+        body.get("name") or tg_login.device_label(request.headers.get("User-Agent", ""))
+    )
+    try:
+        key = passkeys.register(
+            rp_id, origin, str(body.get("token", "")), credential, name
+        )
+    except passkeys.PasskeyError as exc:
+        raise service.WebUIError(str(exc)) from None
+    logger.info("webui passkey added: %s", key["name"])
+    return web.json_response({"key": key, "keys": passkeys.credentials()})
+
+
+async def _passkey_delete(request: web.Request) -> web.Response:
+    if not passkeys.remove(request.match_info["id"]):
+        raise service.WebUIError("no such key", 404)
+    return web.json_response({"keys": passkeys.credentials()})
 
 
 async def _logout(_request: web.Request) -> web.Response:
@@ -677,13 +860,32 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_get("/api/models", _models)
     r.add_post("/api/sessions/{tid}/key", _key)
     r.add_get("/api/events", _events)
+    _add_auth_routes(r)
+    _add_hub_routes(r)
+    return app
+
+
+def _add_auth_routes(r: web.UrlDispatcher) -> None:
+    r.add_get("/api/auth/methods", _auth_methods)
+    r.add_post("/api/auth/passkey/login/options", _passkey_login_options)
+    r.add_post("/api/auth/passkey/login", _passkey_login)
+    r.add_post("/api/auth/telegram", _telegram_login)
+    r.add_get("/api/auth/telegram/{id}", _telegram_login_poll)
+    r.add_post("/api/auth/passkeys/options", _passkey_options)
+    r.add_post("/api/auth/passkeys", _passkey_add)
+    r.add_post("/api/auth/passkeys/{id}/delete", _passkey_delete)
+    r.add_get("/api/security", _security)
+    r.add_post("/api/security/password", _security_password)
+    r.add_post("/api/security/sign-out-others", _security_sign_out_others)
+
+
+def _add_hub_routes(r: web.UrlDispatcher) -> None:
     r.add_get("/api/hub", _hub)
     r.add_post("/api/hub/reach", _hub_reach)
     r.add_post("/api/hub/pending/{id}/{action}", _hub_pending)
     r.add_get("/api/hub/memory/search", _hub_memory_search)
     r.add_get("/api/hub/memory/file", _hub_memory_file)
     r.add_get("/hub/map/{tail:.*}", _hub_map)
-    return app
 
 
 _runner: web.AppRunner | None = None
