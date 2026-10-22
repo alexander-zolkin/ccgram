@@ -827,7 +827,7 @@ const TIP = {
   document.addEventListener("scroll", () => { tip.hidden = true; }, true);
   document.addEventListener("click", (ev) => {
     // Only for passive markers (flags, ticks): buttons keep doing their job.
-    const t = ev.target.closest?.(".s-flag[data-tip], .tick[data-tip]");
+    const t = ev.target.closest?.(".s-flag[data-tip], .tick[data-tip], .u-hit[data-tip]");
     if (t && matchMedia("(hover: none)").matches) { ev.preventDefault(); ev.stopPropagation(); toast(t.dataset.tip); }
   }, true);
 })();
@@ -2540,6 +2540,7 @@ const HUB_ICON = {
   map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2z"/><path d="M9 4v14M15 6v14"/></svg>',
   done: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L19.5 7"/></svg>',
   happened: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg>',
+  usage: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
   later: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="13" r="7.5"/><path d="M12 9.5V13l2.5 1.5M5 4L2.5 6.5M19 4l2.5 2.5"/></svg>',
 };
 
@@ -2590,6 +2591,7 @@ function applyHub(data) {
   renderReach(data.reach);
   renderPending(data.pending);
   renderHappened(data.happened, data.pending);
+  renderUsage(data.usage);
   if (data.memory) renderMemory(data.memory, data.map);
   $("hub-memory").hidden = !data.memory;
   $("hub-pending").hidden = !data.pending;
@@ -2608,6 +2610,7 @@ function hubSkeleton() {
   hub.innerHTML = `
     <div class="hub-grid"><article id="hub-now" class="hub-card"></article><article id="hub-reach" class="hub-card"></article></div>
     <article id="hub-events" class="hub-card" hidden></article>
+    <article id="hub-usage" class="hub-card" hidden></article>
     <article id="hub-pending" class="hub-card"></article>
     <article id="hub-memory" class="hub-card">
       <header class="hub-head">${HUB_ICON.memory}<h2>Что я помню</h2><span id="hub-mem-count" class="hub-sub"></span><span class="spacer"></span>
@@ -2669,6 +2672,64 @@ function renderReach(reach) {
       renderReach(reach);
     } catch (e) { toast(e.message); btn.classList.remove("spinning"); }
   };
+}
+
+// ═══ «Расход»: output tokens per day for a week + the chats that used most ═
+const WEEKDAY = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
+const niceMax = (v) => {
+  if (v <= 0) return 1000;
+  const p = 10 ** Math.floor(Math.log10(v));
+  const n = v / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
+};
+// A column with a 4px rounded data-end, square at the baseline.
+const colPath = (x, base, w, h) => {
+  if (h <= 0) return "";
+  const r = Math.min(4, w / 2, h);
+  return `M${x},${base}V${base - h + r}a${r},${r} 0 0 1 ${r},${-r}H${x + w - r}a${r},${r} 0 0 1 ${r},${r}V${base}Z`;
+};
+function usageChart(days) {
+  const W = 420, H = 160, left = 40, right = 6, top = 20, bottom = 24;
+  const plotW = W - left - right, plotH = H - top - bottom, base = top + plotH;
+  const max = niceMax(Math.max(...days.map((d) => d.out)));
+  const band = plotW / days.length;
+  const bw = Math.min(24, band * 0.6);
+  const peak = days.reduce((best, d, i) => (d.out > days[best].out ? i : best), 0);
+  const last = days.length - 1;
+  let svg = "";
+  for (const v of [0, max / 2, max]) {
+    const yy = base - (v / max) * plotH;
+    svg += `<line class="u-grid" x1="${left}" x2="${W - right}" y1="${yy}" y2="${yy}"/><text class="u-tick" x="${left - 6}" y="${yy + 4}" text-anchor="end">${v ? tokRu(v) : "0"}</text>`;
+  }
+  days.forEach((d, i) => {
+    const x = left + band * i + (band - bw) / 2;
+    const h = d.out ? Math.max(2, (d.out / max) * plotH) : 0;
+    const dt = new Date(`${d.date}T12:00:00`);
+    const name = i === last ? "сегодня" : WEEKDAY[dt.getDay()];
+    const tip = `${i === last ? "Сегодня" : `${WEEKDAY[dt.getDay()]} ${dt.toLocaleDateString("ru-RU", { day: "numeric", month: "numeric" })}`} · ${tokRu(d.out)} токенов · ${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}`;
+    svg += `<path class="u-col" d="${colPath(x, base, bw, h)}"/>`;
+    if (d.out && (i === last || i === peak)) svg += `<text class="u-val" x="${x + bw / 2}" y="${base - h - 6}" text-anchor="middle">${tokRu(d.out)}</text>`;
+    svg += `<text class="u-tick${i === last ? " now" : ""}" x="${x + bw / 2}" y="${H - 6}" text-anchor="middle">${name}</text>`;
+    svg += `<rect class="u-hit" x="${left + band * i}" y="${top - 14}" width="${band}" height="${plotH + 14}" data-tip="${esc(tip)}"/>`;
+  });
+  return `<svg class="u-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Токены ответа по дням за неделю">${svg}</svg>`;
+}
+
+function renderUsage(u) {
+  const card = $("hub-usage");
+  card.hidden = !u;
+  if (!u) return;
+  const top = u.chats[0]?.out || 1;
+  card.innerHTML = `
+    <header class="hub-head">${HUB_ICON.usage}<h2>Расход</h2><span class="hub-sub">за 7 дней ${tokRu(u.total)} токенов ответа</span></header>
+    <div class="u-cols">
+      <div>${usageChart(u.days)}
+        <details class="u-table"><summary>Таблицей</summary><table>${u.days.map((d) => `<tr><td>${esc(d.date.split("-").reverse().slice(0, 2).join("."))}</td><td>${tokRu(d.out)}</td><td>${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}</td></tr>`).join("")}</table></details>
+      </div>
+      <div><div class="hub-label">Больше всего</div>
+        ${u.chats.length ? `<ul class="u-chats">${u.chats.map((c) => `<li><a href="#${c.thread_id}">${esc(c.name)}</a><span class="u-num">${tokRu(c.out)}</span><span class="u-share"><i style="width:${Math.max(3, (c.out / top) * 100)}%"></i></span></li>`).join("")}</ul>` : '<div class="muted ev-none">За неделю чаты не работали</div>'}
+      </div>
+    </div>`;
 }
 
 const ALERT_DOT = { escalated: "err", "serial-flapper-suppressed": "warn", failed: "warn", flap: "ok", resolved: "ok" };

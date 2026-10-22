@@ -294,3 +294,38 @@ def test_interrupt_ends_the_turn_without_turn_duration(tmp_path):
     stop = _user([{"type": "text", "text": "[Request interrupted by user]"}], "u2")
     _write(p, [prompt, _usage([], "a1", "m1", 42), stop])
     assert transcript.current_turn(p) == {"start": None, "out": 0}
+
+
+def test_daily_stats_buckets_by_local_day(tmp_path):
+    from datetime import datetime, timedelta
+
+    p = tmp_path / "t.jsonl"
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def at(days, hour):
+        moment = midnight - timedelta(days=days) + timedelta(hours=hour)
+        return moment.astimezone().isoformat()
+
+    entries = []
+    for days, out, mid in (
+        (9, 500, "old"),
+        (2, 100, "m1"),
+        (2, 100, "m1"),
+        (1, 40, "m2"),
+        (0, 7, "m3"),
+    ):
+        e = _usage([{"type": "text", "text": "x"}], f"a{days}{mid}", mid, out)
+        e["timestamp"] = at(days, 10)
+        entries.append(e)
+    end = _turn_end(3000, "d1")
+    end["timestamp"] = at(1, 11)
+    entries.append(end)
+    _write(p, entries)
+    got = transcript.daily_stats(
+        p, (midnight - timedelta(days=6)).timestamp(), midnight.timestamp()
+    )
+
+    def day(n):
+        return (midnight - timedelta(days=n)).date().isoformat()
+
+    assert got == {day(2): {"out": 100, "turns": 0}, day(1): {"out": 40, "turns": 1}}

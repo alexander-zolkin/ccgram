@@ -153,6 +153,96 @@ def _day_stats(path: Path, since: float) -> dict[str, int]:
     return stats
 
 
+# ── usage: output tokens per day over a week, top chats ──────────────────────
+
+WEEK_DAYS = 7
+TOP_CHATS = 5
+USAGE_TTL_S = 60.0
+# path -> (the day it was computed on, the finished days of the week)
+_week_cache: dict[str, tuple[str, dict[str, dict[str, int]]]] = {}
+_usage_cache: tuple[float, dict[str, Any] | None] = (0.0, None)
+_usage_task: asyncio.Task[None] | None = None
+
+
+def _past_days(path: Path, start: float, midnight: float) -> dict[str, dict[str, int]]:
+    # Lazy: transcript is a leaf, keep it next to its user.
+    from . import transcript
+
+    today = date.today().isoformat()
+    hit = _week_cache.get(str(path))
+    if hit and hit[0] == today:
+        return hit[1]
+    days = transcript.daily_stats(path, start, midnight)
+    _week_cache[str(path)] = (today, days)
+    return days
+
+
+async def _compute_usage() -> dict[str, Any]:
+    # Lazy: service pulls the handler graph.
+    from . import service
+
+    midnight = _midnight()
+    start = (
+        datetime.fromtimestamp(midnight) - timedelta(days=WEEK_DAYS - 1)
+    ).timestamp()
+    sessions = await service.list_sessions()
+    days = [
+        (date.today() - timedelta(days=n)).isoformat()
+        for n in range(WEEK_DAYS - 1, -1, -1)
+    ]
+    totals = {d: {"out": 0, "turns": 0} for d in days}
+    chats = []
+    for s in sessions:
+        if s.get("last_activity", 0) < start:
+            continue
+        with contextlib.suppress(WebUIError):
+            tx, _provider = service._transcript_for(
+                service.find_binding(s["thread_id"])
+            )
+            if not tx:
+                continue
+            past = await asyncio.to_thread(_past_days, tx, start, midnight)
+            today = await asyncio.to_thread(_day_stats, tx, midnight)
+            per_day = dict(
+                past, **{days[-1]: {"out": today["out"], "turns": today["turns"]}}
+            )
+            out = 0
+            for day, stats in per_day.items():
+                if day in totals:
+                    totals[day]["out"] += stats["out"]
+                    totals[day]["turns"] += stats["turns"]
+                    out += stats["out"]
+            if out:
+                chats.append(
+                    {"thread_id": s["thread_id"], "name": s["name"], "out": out}
+                )
+    chats.sort(key=lambda c: -c["out"])
+    return {
+        "days": [{"date": d, **totals[d]} for d in days],
+        "chats": chats[:TOP_CHATS],
+        "total": sum(t["out"] for t in totals.values()),
+    }
+
+
+async def _refresh_usage() -> None:
+    global _usage_cache, _usage_task
+    try:
+        _usage_cache = (time.time(), await _compute_usage())
+    except Exception:  # noqa: BLE001 — a stale card beats a broken page
+        logger.exception("hub usage failed")
+    finally:
+        _usage_task = None
+
+
+def usage() -> dict[str, Any] | None:
+    """The last computed week; recomputed in the background when stale."""
+    global _usage_task
+    stamp, data = _usage_cache
+    if time.time() - stamp > USAGE_TTL_S and _usage_task is None:
+        _usage_task = asyncio.get_running_loop().create_task(_refresh_usage())
+    return data
+
+
 # ── reach: where the agent can get to ───────────────────────────────────────
 
 _reach: dict[str, dict[str, Any]] = {}
@@ -339,6 +429,7 @@ async def run() -> None:
                 await probe_all()
             if conf.get("calendar"):
                 await asyncio.to_thread(_refresh_calendar)
+            await _refresh_usage()
             if (conf.get("memory") or {}).get("dir"):
                 # Keeps the memory index warm: the first home-page load after
                 # a restart would otherwise walk ~1000 files (~2 s).
@@ -764,4 +855,5 @@ async def overview() -> dict[str, Any]:
         "memory": await asyncio.to_thread(memory_overview) if has_memory else None,
         "map": bool((conf.get("memory") or {}).get("map")),
         "happened": await asyncio.to_thread(happened),
+        "usage": usage(),
     }

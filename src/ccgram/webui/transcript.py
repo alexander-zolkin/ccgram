@@ -423,6 +423,53 @@ def day_stats(path: Path, since: float) -> dict[str, int]:
     return {"out": turn.tokens, "turns": turns, "ms": work_ms}
 
 
+WEEK_BACK = 256 * 1024 * 1024
+
+
+def daily_stats(path: Path, since: float, until: float) -> dict[str, dict[str, int]]:
+    """Output tokens and finished turns per local day for ``since <= ts < until``.
+
+    ``{"2026-10-22": {"out": …, "turns": …}}``; reads backwards from the end.
+    """
+    days: dict[str, tuple[_Turn, list[int]]] = {}
+    size = file_size(path)
+    try:
+        fh = path.open("rb")
+    except OSError:
+        return {}
+    with fh:
+        carry = b""
+        pos = size
+        while pos > 0 and size - pos < WEEK_BACK:
+            new = max(0, pos - CHUNK)
+            fh.seek(new)
+            lines = (fh.read(pos - new) + carry).split(b"\n")
+            pos = new
+            carry = lines.pop(0) if new > 0 else b""
+            for raw in reversed(lines):
+                stamp = _TS.search(raw)
+                when = _epoch(stamp.group(1)) if stamp else None
+                if when is None or when >= until:
+                    continue
+                if when < since:
+                    pos = 0
+                    break
+                if b'"usage"' not in raw and b"turn_duration" not in raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                day = datetime.fromtimestamp(when).date().isoformat()
+                turn, turns = days.setdefault(day, (_Turn(), [0]))
+                if _turn_end(entry):
+                    turns[0] += 1
+                turn.add(entry)
+    return {day: {"out": t.tokens, "turns": n[0]} for day, (t, n) in days.items()}
+
+
 def _merge_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fold tool_result items into their tool call when both are present."""
     calls = {it["id"]: it for it in items if it["kind"] == "tool" and it.get("id")}
