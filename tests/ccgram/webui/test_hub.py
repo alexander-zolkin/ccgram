@@ -1,5 +1,6 @@
 import json
 import time
+from pathlib import Path
 from datetime import date, timedelta
 
 import pytest
@@ -197,3 +198,60 @@ def test_alerts_latest_per_alert_with_the_verdict(tmp_path, monkeypatch):
         {"day": "today", "time": None, "title": "Отпуск"},
     ]
     hub._conf_cache = (-1.0, {})
+
+
+def test_drop_pointer_keeps_neighbours(tmp_path):
+    index = tmp_path / "n100" / "index.md"
+    index.parent.mkdir()
+    target = (tmp_path / "n100" / "b.md").resolve()
+    text = "\n".join(
+        [
+            "- [Only B](b.md) — gone line",
+            "- [A](a.md) · [B](b.md) · [C](c.md) — trio",
+            "- [B first](b.md) / [D](d.md) — pair",
+            "- [Other dir](../x/b.md) — not ours",
+            "- [A](a.md) — untouched",
+        ]
+    )
+    got = hub._drop_pointer(text, index, target).split("\n")
+    assert got == [
+        "- [A](a.md) · [C](c.md) — trio",
+        "- [D](d.md) — pair",
+        "- [Other dir](../x/b.md) — not ours",
+        "- [A](a.md) — untouched",
+    ]
+
+
+def test_save_and_forget_are_no_loss(store, tmp_path, monkeypatch):
+    backups = tmp_path / "bk"
+    (tmp_path / "hub.toml").write_text(
+        (tmp_path / "hub.toml")
+        .read_text(encoding="utf-8")
+        .replace("[memory]\n", f'[memory]\nbackups = "{backups}"\n'),
+        encoding="utf-8",
+    )
+    hub._conf_cache = (-1.0, {})
+    rel = "n100/reference_laptop.md"
+    opened = hub.memory_file(rel)
+    with pytest.raises(WebUIError) as stale:
+        hub.memory_save(rel, "new body", None, opened["mtime"] - 10)
+    assert stale.value.status == 409
+    saved = hub.memory_save(
+        rel, "Use `ssh laptop` from N100.", "SSH: «ноут»", opened["mtime"]
+    )
+    text = (store / rel).read_text(encoding="utf-8")
+    assert text.startswith('---\nname: laptop-ssh\ndescription: "SSH: «ноут»"\n---\n')
+    assert text.endswith("Use `ssh laptop` from N100.\n")
+    assert "Use `ssh laptop`." in Path(saved["backup"]).read_text(encoding="utf-8")
+
+    gone = hub.memory_forget(rel)
+    assert not (store / rel).exists()
+    assert (store / gone["archived"]).read_text(encoding="utf-8") == text
+    assert gone["unlinked"] == ["n100/index.md"]
+    assert "reference_laptop.md" not in (store / "n100" / "index.md").read_text(
+        encoding="utf-8"
+    )
+    log = (store / "_archive" / "forgotten.md").read_text(encoding="utf-8")
+    assert rel in log and "Laptop SSH" in log
+    assert len(list(backups.iterdir())) == 2  # the memory before the edit + the index
+    assert hub.memory_overview()["total"] == 1

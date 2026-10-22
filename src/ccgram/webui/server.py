@@ -46,6 +46,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/hub/reach``                 probe every reach target now
 - ``POST /api/hub/pending/{id}/close|snooze``  close (to the done log) / postpone
 - ``GET  /api/hub/memory/search?q=``, ``/api/hub/memory/file?path=``
+- ``POST /api/hub/memory/save|forget``     edit a memory / move it to the archive
 - ``GET  /hub/map/…``                     memory map site for the home-page iframe
 
 State-changing requests must carry ``X-CCGram: 1``; with no CORS headers
@@ -607,6 +608,27 @@ async def _hub_memory_search(request: web.Request) -> web.Response:
     return web.json_response(await asyncio.to_thread(hub.memory_search, query))
 
 
+async def _hub_memory_save(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    description = body.get("description")
+    return web.json_response(
+        await asyncio.to_thread(
+            hub.memory_save,
+            str(body.get("path", "")),
+            str(body.get("body", "")),
+            str(description) if description is not None else None,
+            float(body.get("mtime") or 0),
+        )
+    )
+
+
+async def _hub_memory_forget(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    return web.json_response(
+        await asyncio.to_thread(hub.memory_forget, str(body.get("path", "")))
+    )
+
+
 async def _hub_memory_file(request: web.Request) -> web.Response:
     rel = request.query.get("path", "")
     return web.json_response(await asyncio.to_thread(hub.memory_file, rel))
@@ -913,6 +935,8 @@ def _add_hub_routes(r: web.UrlDispatcher) -> None:
     r.add_post("/api/hub/pending/{id}/{action}", _hub_pending)
     r.add_get("/api/hub/memory/search", _hub_memory_search)
     r.add_get("/api/hub/memory/file", _hub_memory_file)
+    r.add_post("/api/hub/memory/save", _hub_memory_save)
+    r.add_post("/api/hub/memory/forget", _hub_memory_forget)
     r.add_get("/hub/map/{tail:.*}", _hub_map)
 
 

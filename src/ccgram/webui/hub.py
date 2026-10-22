@@ -9,6 +9,8 @@ paths and hosts live only in that file, never in the repo::
     pending = "pending.md"                        # "- [ ] YYYY-MM-DD — text"
     done = "_archive/pending-done.md"             # closed items appended here
     map = "/var/www/memory-map"                   # static site shown in an iframe
+    map_rebuild = "~/bin/build-map.sh"            # rerun after an edit / forget
+    backups = "~/memory-backups/hub-edits"        # copies taken before any write
 
     [[reach]]                                     # where the agent can get to
     name = "PC"
@@ -42,6 +44,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -60,6 +63,7 @@ TCP_TIMEOUT = 5.0
 SEARCH_LIMIT = 20
 MAX_SNOOZE_DAYS = 365
 RECENT_CHATS = 6
+MTIME_SLACK_S = 1e-3
 _SKIP_MEMORY = {"index.md", "MEMORY.md"}
 
 
@@ -684,6 +688,126 @@ def memory_file(rel: str) -> dict[str, Any]:
     m = _FRONT.match(text)
     doc = _doc(root, inside, _titles(root)) or {}
     return dict(_public(doc), body=text[m.end() :] if m else text)
+
+
+# ── memory: edit / forget (no-loss: backups, archive, an append-only log) ────
+
+_POINTER = r"\[[^\]]*\]\(([^)\s]+\.md)\)"
+_SEP = r"\s*(?:·|/|,|;)\s*"
+
+
+def _memory_path(rel: str) -> tuple[Path, Path]:
+    root = _memory_dir()
+    path = (root / rel).resolve()
+    try:
+        inside = path.relative_to(root)
+    except ValueError:
+        raise WebUIError("not in the memory store", 403) from None
+    if not _is_memory(inside) or not path.is_file():
+        raise WebUIError("no such memory", 404)
+    return root, path
+
+
+def _backup(root: Path, path: Path) -> Path:
+    conf = config().get("memory") or {}
+    base = _expand(conf.get("backups") or "~/memory-backups/hub-edits")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = base / f"{path.relative_to(root).as_posix().replace('/', '__')}.{stamp}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, dest)
+    return dest
+
+
+def _rebuild_map() -> None:
+    command = (config().get("memory") or {}).get("map_rebuild")
+    if command:
+        threading.Thread(
+            target=subprocess.run,
+            args=(os.path.expanduser(command),),
+            kwargs={"shell": True, "capture_output": True, "timeout": 300},  # noqa: S604
+            daemon=True,
+        ).start()
+
+
+def _set_description(front: str, description: str) -> str:
+    line = f"description: {json.dumps(description, ensure_ascii=False)}"
+    if re.search(r"^description:.*$", front, re.M):
+        return re.sub(r"^description:.*$", lambda _m: line, front, count=1, flags=re.M)
+    return f"{front}\n{line}" if front else line
+
+
+def memory_save(
+    rel: str, body: str, description: str | None, mtime: float
+) -> dict[str, Any]:
+    """Rewrite a memory's body (and description); refuses if it changed meanwhile."""
+    root, path = _memory_path(rel)
+    if abs(path.stat().st_mtime - mtime) > MTIME_SLACK_S:
+        raise WebUIError("it changed since you opened it — reload and edit again", 409)
+    text = path.read_text(encoding="utf-8")
+    m = _FRONT.match(text)
+    body = body.replace("\r\n", "\n").rstrip() + "\n"
+    if m:
+        front = m.group(1)
+        if description is not None:
+            front = _set_description(front, " ".join(description.split()))
+        new = f"---\n{front}\n---\n{body}"
+    else:
+        new = body
+    backup = _backup(root, path)
+    _write_atomic(path, new)
+    _rebuild_map()
+    return dict(memory_file(rel), backup=str(backup))
+
+
+def _drop_pointer(text: str, index: Path, target: Path) -> str:
+    """Remove links to ``target`` from an index, keeping other pointers on the line."""
+    out = []
+    for line in text.split("\n"):
+        links = list(re.finditer(_POINTER, line))
+        hits = [m for m in links if (index.parent / m.group(1)).resolve() == target]
+        if not hits:
+            out.append(line)
+            continue
+        if len(hits) == len(links):
+            continue  # the line pointed only at the forgotten memory
+        for m in reversed(hits):
+            link = re.escape(m.group(0))
+            line, n = re.subn(_SEP + link, "", line, count=1)
+            if not n:
+                line = re.sub(link + _SEP, "", line, count=1)
+        out.append(line)
+    return "\n".join(out)
+
+
+def memory_forget(rel: str) -> dict[str, Any]:
+    """Move the memory to ``_archive/forgotten-<date>/`` and unlink it from indexes."""
+    root, path = _memory_path(rel)
+    doc = _doc(root, path.relative_to(root), _titles(root)) or {}
+    day = date.today().isoformat()
+    dest = (
+        root
+        / "_archive"
+        / f"forgotten-{day}"
+        / path.relative_to(root).as_posix().replace("/", "__")
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    unlinked = []
+    for index in root.glob("*/index.md"):
+        text = index.read_text(encoding="utf-8")
+        new = _drop_pointer(text, index, path)
+        if new != text:
+            _backup(root, index)
+            _write_atomic(index, new)
+            unlinked.append(str(index.relative_to(root)))
+    os.replace(path, dest)
+    with (root / "_archive" / "forgotten.md").open("a", encoding="utf-8") as fh:
+        fh.write(
+            f"- {day} {rel} — «{doc.get('title', rel)}» forgotten via the web UI; "
+            f"file in {dest.relative_to(root)}; pointers dropped from {', '.join(unlinked) or 'no index'}\n"
+        )
+    _docs.pop(rel, None)
+    _rebuild_map()
+    return {"ok": True, "archived": str(dest.relative_to(root)), "unlinked": unlinked}
 
 
 def map_file(tail: str) -> Path:

@@ -2917,11 +2917,13 @@ async function speak(node, btn) {
 // ═══ sheet: the memory map (or one memory) over the page ═══════════════════
 function openSheet(title) {
   $("sheet-title").textContent = title;
+  syncSheetActions();
   $("sheet").hidden = false;
   document.body.classList.add("sheet-open");
 }
 function closeSheet() {
   $("sheet").hidden = true;
+  state.sheetPath = null;
   document.body.classList.remove("sheet-open");
 }
 $("sheet-close").onclick = closeSheet;
@@ -2932,11 +2934,13 @@ document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("sh
 function openMap(path) {
   const frame = $("sheet-frame");
   const hash = path ? `#file:${encodeURIComponent(path)}` : "";
+  state.sheetPath = path || null;
   $("sheet-body").hidden = true;
   frame.hidden = false;
   openSheet("Карта памяти");
   const win = frame.src ? frame.contentWindow : null;
-  if (!win || typeof win.fromHash !== "function") { frame.src = `/hub/map/index.html${hash}`; return; }
+  // After an edit / forget the map is rebuilt in the background: reload it.
+  if (!win || typeof win.fromHash !== "function" || state.mapStale) { state.mapStale = false; frame.src = `/hub/map/index.html?v=${Date.now()}${hash}`; return; }
   if (!hash) return;
   win.history.replaceState(null, "", hash);
   win.fromHash();
@@ -2944,15 +2948,74 @@ function openMap(path) {
 
 async function openMemory(path) {
   if (state.hubMap) { openMap(path); return; }
+  try { showMemoryText(await api(`/api/hub/memory/file?path=${encodeURIComponent(path)}`)); } catch (e) { toast(e.message); }
+}
+
+function showMemoryText(d) {
+  state.sheetPath = d.path;
+  $("sheet-frame").hidden = true;
+  const body = $("sheet-body");
+  body.hidden = false;
+  body.replaceChildren(renderMarkdown(d.body));
+  openSheet(d.title);
+}
+
+// The map tells which memory it shows; the sheet's buttons act on that one.
+window.addEventListener("message", (ev) => {
+  if (ev.origin !== location.origin || ev.data?.type !== "kara-memory") return;
+  state.sheetPath = ev.data.file || null;
+  syncSheetActions();
+});
+function syncSheetActions() {
+  const editing = Boolean($("sheet-body").querySelector(".mem-editor"));
+  $("sheet-edit").hidden = $("sheet-forget").hidden = !state.sheetPath || editing;
+}
+
+async function editMemory() {
+  const path = state.sheetPath;
+  if (!path) return;
+  let d;
+  try { d = await api(`/api/hub/memory/file?path=${encodeURIComponent(path)}`); } catch (e) { toast(e.message); return; }
+  const back = () => (state.hubMap ? openMap(path) : showMemoryText(d));
+  $("sheet-frame").hidden = true;
+  const body = $("sheet-body");
+  body.hidden = false;
+  body.innerHTML = `<div class="mem-editor">
+    <label>Описание<input id="me-desc" type="text"></label>
+    <label class="me-grow">Текст<textarea id="me-body" spellcheck="true"></textarea></label>
+    <div class="me-actions"><button type="button" id="me-save" class="btn primary small">Сохранить</button><button type="button" id="me-cancel" class="btn small">Отмена</button><span class="muted">Перед записью сохраню копию в ~/memory-backups</span></div></div>`;
+  $("me-desc").value = d.description || "";
+  $("me-body").value = d.body;
+  $("sheet-title").textContent = `Правка: ${d.title}`;
+  syncSheetActions();
+  $("me-body").focus();
+  $("me-cancel").onclick = back;
+  $("me-save").onclick = async () => {
+    try {
+      const saved = await api("/api/hub/memory/save", { body: { path, body: $("me-body").value, description: $("me-desc").value, mtime: d.mtime } });
+      state.mapStale = true;
+      toast("Сохранено — карта обновится через минуту");
+      showMemoryText(saved);
+      loadHub();
+    } catch (e) { toast(e.message); }
+  };
+}
+
+async function forgetMemory() {
+  const path = state.sheetPath;
+  if (!path) return;
+  const name = path.split("/").pop().replace(/\.md$/, "");
+  if (!(await confirmDialog(`Забыть «${name}»?`, "Запись уйдёт в архив памяти, указатели на неё уберу из оглавлений. Ничего не стирается — вернуть можно из архива.", "Забыть"))) return;
   try {
-    const d = await api(`/api/hub/memory/file?path=${encodeURIComponent(path)}`);
-    $("sheet-frame").hidden = true;
-    const body = $("sheet-body");
-    body.hidden = false;
-    body.replaceChildren(renderMarkdown(d.body));
-    openSheet(d.title);
+    const r = await api("/api/hub/memory/forget", { body: { path } });
+    state.mapStale = true;
+    closeSheet();
+    toast(`Забыла — запись в ${r.archived.split("/").slice(0, 2).join("/")}`);
+    loadHub();
   } catch (e) { toast(e.message); }
 }
+$("sheet-edit").onclick = editMemory;
+$("sheet-forget").onclick = forgetMemory;
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 api("/api/me").then(boot).catch(() => showLogin());
