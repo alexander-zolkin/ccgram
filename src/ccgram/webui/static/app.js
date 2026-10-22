@@ -2539,6 +2539,7 @@ const HUB_ICON = {
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.4-5.7L20 8.5M20 3.5v5h-5"/></svg>',
   map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2z"/><path d="M9 4v14M15 6v14"/></svg>',
   done: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L19.5 7"/></svg>',
+  happened: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg>',
   later: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="13" r="7.5"/><path d="M12 9.5V13l2.5 1.5M5 4L2.5 6.5M19 4l2.5 2.5"/></svg>',
 };
 
@@ -2588,6 +2589,7 @@ function applyHub(data) {
   renderNow(data.now);
   renderReach(data.reach);
   renderPending(data.pending);
+  renderHappened(data.happened, data.pending);
   if (data.memory) renderMemory(data.memory, data.map);
   $("hub-memory").hidden = !data.memory;
   $("hub-pending").hidden = !data.pending;
@@ -2605,6 +2607,7 @@ function hubSkeleton() {
   hub.dataset.built = "1";
   hub.innerHTML = `
     <div class="hub-grid"><article id="hub-now" class="hub-card"></article><article id="hub-reach" class="hub-card"></article></div>
+    <article id="hub-events" class="hub-card" hidden></article>
     <article id="hub-pending" class="hub-card"></article>
     <article id="hub-memory" class="hub-card">
       <header class="hub-head">${HUB_ICON.memory}<h2>Что я помню</h2><span id="hub-mem-count" class="hub-sub"></span><span class="spacer"></span>
@@ -2668,6 +2671,32 @@ function renderReach(reach) {
   };
 }
 
+const ALERT_DOT = { escalated: "err", "serial-flapper-suppressed": "warn", failed: "warn", flap: "ok", resolved: "ok" };
+function renderHappened(h, pending) {
+  const card = $("hub-events");
+  card.hidden = !h;
+  if (!h) return;
+  const a = h.alerts;
+  const now = new Date();
+  const nowHm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  const alertRows = a ? (a.items.length ? a.items.map((x) => `
+    <li><span class="rdot ${ALERT_DOT[x.kind] || ""}"></span><span class="ev-main"><b>${esc(x.name)}${x.instance && x.instance !== "unknown" ? ` · ${esc(x.instance)}` : ""}</b><span class="muted">${esc(x.label)} · ${hhmm(x.ts * 1000)}${x.count > 1 ? ` · ×${x.count}` : ""}</span>
+      ${x.verdict ? `<details class="ev-verdict"><summary>Мой разбор</summary><div>${esc(x.verdict)}</div></details>` : ""}</span></li>`).join("") : '<li class="muted">Тихо — алертов за сутки не было</li>') : "";
+  const cal = h.calendar;
+  const calRows = cal ? (cal.length ? cal.map((e) => `<li class="${e.time && e.time < nowHm ? "past" : ""}"><span class="ev-time">${esc(e.time || "весь день")}</span><span>${esc(e.title)}</span></li>`).join("") : '<li class="muted">В календаре на сегодня пусто</li>') : "";
+  const due = ((pending && pending.items) || []).filter((it) => it.days <= 0);
+  const late = due.filter((it) => it.days < 0).length;
+  card.innerHTML = `
+    <header class="hub-head">${HUB_ICON.happened}<h2>Что случилось</h2><span class="hub-sub">${a ? `за сутки: ${a.important} ${pluralRu(a.important, "важный", "важных", "важных")}, ${a.noise} шума` : ""}</span></header>
+    <div class="ev-cols">
+      ${a ? `<section><div class="hub-label">Алерты</div><ul class="ev-list">${alertRows}</ul></section>` : ""}
+      <section><div class="hub-label">Сегодня</div>${cal ? `<ul class="ev-cal">${calRows}</ul>` : ""}
+        ${due.length ? `<button type="button" class="link-btn ev-due">${due.length} ${pluralRu(due.length, "дело", "дела", "дел")} на сегодня${late ? ` · просрочено ${late}` : ""}</button>` : '<div class="muted ev-none">Дел на сегодня нет</div>'}</section>
+    </div>`;
+  const jump = card.querySelector(".ev-due");
+  if (jump) jump.onclick = () => $("hub-pending").scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+}
+
 function renderPending(p) {
   const items = (p && p.items) || [];
   const card = $("hub-pending");
@@ -2692,7 +2721,7 @@ function renderPending(p) {
 }
 
 function keepPending(p) {
-  if (state.hubData) state.hubData.pending = p;
+  if (state.hubData) { state.hubData.pending = p; renderHappened(state.hubData.happened, p); }
   return p;
 }
 

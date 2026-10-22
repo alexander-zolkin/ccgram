@@ -1,3 +1,4 @@
+import json
 import time
 from datetime import date, timedelta
 
@@ -117,3 +118,72 @@ async def test_overview_off_without_config(tmp_path, monkeypatch):
     monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
     hub._conf_cache = (-1.0, {})
     assert await hub.overview() == {"enabled": False}
+
+
+def test_alerts_latest_per_alert_with_the_verdict(tmp_path, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    stamp = lambda m: (now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z")  # noqa: E731
+    rows = [
+        {
+            "ts": (now - timedelta(days=2)).isoformat(),
+            "alertname": "Old",
+            "disposition": "escalated",
+        },
+        {
+            "ts": stamp(50),
+            "alertname": "Disk",
+            "instance": "n100",
+            "disposition": "flap",
+        },
+        {
+            "ts": stamp(40),
+            "alertname": "Down",
+            "instance": "nl2",
+            "disposition": "serial-flapper-suppressed",
+        },
+        {
+            "ts": stamp(30),
+            "alertname": "Down",
+            "instance": "nl2",
+            "disposition": "escalated",
+        },
+        {
+            "ts": stamp(30),
+            "disposition": "tg-delivery-failed",
+            "intended_text": "🚨 Down @ nl2\nVERDICT: CRITICAL",
+        },
+        "not json",
+    ]
+    log = tmp_path / "triage.jsonl"
+    log.write_text(
+        "\n".join(r if isinstance(r, str) else json.dumps(r) for r in rows),
+        encoding="utf-8",
+    )
+    cal = tmp_path / "cal.sh"
+    today = date.today().strftime("%d.%m.%Y")
+    cal.write_text(
+        f"#!/bin/sh\necho '  {today} 10:30 MSK — Митинг'\necho '  {today} (весь день) — Отпуск'\necho '  01.01.2020 09:00 MSK — Давно'\n",
+        encoding="utf-8",
+    )
+    cal.chmod(0o755)
+    monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
+    (tmp_path / "hub.toml").write_text(
+        f'[alerts]\nlog = "{log}"\n[calendar]\ncommand = "{cal}"\n', encoding="utf-8"
+    )
+    hub._conf_cache = (-1.0, {})
+    hub._calendar_cache = (0.0, [])
+    got = hub.happened()
+    a = got["alerts"]
+    assert (a["important"], a["noise"]) == (1, 2)
+    assert [(x["name"], x["kind"], x["count"]) for x in a["items"]] == [
+        ("Down", "escalated", 2),
+        ("Disk", "flap", 1),
+    ]
+    assert a["items"][0]["verdict"].startswith("🚨 Down")
+    assert got["calendar"] == [
+        {"time": "10:30", "title": "Митинг"},
+        {"time": None, "title": "Отпуск"},
+    ]
+    hub._conf_cache = (-1.0, {})

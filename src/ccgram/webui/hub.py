@@ -16,6 +16,12 @@ paths and hosts live only in that file, never in the repo::
     key = "~/.ssh/pc.key"
     access = "SSH: shell, files"
 
+    [alerts]                                      # alert triage log (JSON lines)
+    log = "/var/log/alert-triage.jsonl"
+
+    [calendar]                                    # prints "DD.MM.YYYY HH:MM … — title"
+    command = "~/bin/calendar.sh 1"
+
     [inventory]                                   # a fleet file, TCP-probed
     name = "VPN nodes"
     file = "~/fleet.toml"                         # [[servers]] host/label/scopes
@@ -602,6 +608,117 @@ def map_file(tail: str) -> Path:
     return path
 
 
+# ── what happened: alerts with the triage verdict, today's calendar ──────────
+
+ALERT_WINDOW_S = 86400
+ALERT_TAIL = 512 * 1024
+ALERT_ITEMS = 6
+CALENDAR_TTL_S = 600
+_ALERT_RU = {
+    "escalated": "важно — разобрала и написала тебе",
+    "serial-flapper-suppressed": "приглушено — моргает постоянно",
+    "flap": "моргнул и прошёл сам",
+    "resolved": "решилось",
+    "failed": "разбор не удался",
+}
+_NOISE = {"serial-flapper-suppressed", "flap", "resolved"}
+
+
+def _epoch(stamp: str) -> float:
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except AttributeError, ValueError:
+        return 0.0
+
+
+def alerts() -> dict[str, Any] | None:
+    path = (config().get("alerts") or {}).get("log")
+    if not path:
+        return None
+    try:
+        with _expand(path).open("rb") as fh:
+            size = fh.seek(0, 2)
+            fh.seek(max(0, size - ALERT_TAIL))
+            raw = fh.read().splitlines()
+    except OSError:
+        return {"items": [], "important": 0, "noise": 0}
+    since = time.time() - ALERT_WINDOW_S
+    rows = []
+    for line in raw:
+        with contextlib.suppress(ValueError):
+            row = json.loads(line)
+            if isinstance(row, dict) and _epoch(str(row.get("ts", ""))) >= since:
+                rows.append(row)
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    important = noise = 0
+    for i, row in enumerate(rows):
+        kind = row.get("disposition", "")
+        if kind not in _ALERT_RU:
+            continue
+        important += kind == "escalated"
+        noise += kind in _NOISE
+        verdict = ""
+        if kind == "escalated":  # the message it sent follows within seconds
+            for nxt in rows[i + 1 : i + 6]:
+                if nxt.get("intended_text"):
+                    verdict = str(nxt["intended_text"])
+                    break
+        key = (str(row.get("alertname", "")), str(row.get("instance", "")))
+        prev = latest.get(key)
+        latest[key] = {
+            "name": key[0],
+            "instance": key[1],
+            "kind": kind,
+            "label": _ALERT_RU[kind],
+            "ts": _epoch(str(row.get("ts", ""))),
+            "verdict": verdict or (prev or {}).get("verdict", ""),
+            "count": (prev or {}).get("count", 0) + 1,
+        }
+    items = sorted(latest.values(), key=lambda a: -a["ts"])[:ALERT_ITEMS]
+    return {"items": items, "important": important, "noise": noise}
+
+
+_CAL_LINE = re.compile(
+    r"^\s*(\d\d)\.(\d\d)\.(\d{4})\s+(?:(\d\d:\d\d)\s+\S+|\(весь день\))\s+—\s+(.+?)\s*$"
+)
+_calendar_cache: tuple[float, list[dict[str, Any]]] = (0.0, [])
+
+
+def calendar_today() -> list[dict[str, Any]] | None:
+    """Today's events from the configured read-only calendar command."""
+    global _calendar_cache
+    command = (config().get("calendar") or {}).get("command")
+    if not command:
+        return None
+    if time.time() - _calendar_cache[0] < CALENDAR_TTL_S:
+        return _calendar_cache[1]
+    try:
+        out = subprocess.run(
+            os.path.expanduser(command),
+            shell=True,  # noqa: S602 — the command comes from the local hub.toml
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout
+    except OSError, subprocess.SubprocessError:
+        return _calendar_cache[1]
+    today = date.today()
+    events = []
+    for line in out.splitlines():
+        m = _CAL_LINE.match(line)
+        if m and date(int(m[3]), int(m[2]), int(m[1])) == today:
+            events.append({"time": m[4], "title": m[5]})
+    _calendar_cache = (time.time(), events)
+    return events
+
+
+def happened() -> dict[str, Any] | None:
+    conf = config()
+    if not conf.get("alerts") and not conf.get("calendar"):
+        return None
+    return {"alerts": alerts(), "calendar": calendar_today()}
+
+
 # ── everything for the home page in one call ─────────────────────────────────
 
 
@@ -618,4 +735,5 @@ async def overview() -> dict[str, Any]:
         "pending": await asyncio.to_thread(pending) if has_memory else None,
         "memory": await asyncio.to_thread(memory_overview) if has_memory else None,
         "map": bool((conf.get("memory") or {}).get("map")),
+        "happened": await asyncio.to_thread(happened),
     }
