@@ -985,8 +985,104 @@ window.addEventListener("hashchange", route);
 $("composer").onsubmit = (ev) => { ev.preventDefault(); send(); };
 $("input").addEventListener("input", autosize);
 $("input").addEventListener("keydown", (ev) => {
+  if (handleFormatKey(ev)) return;
   if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing && !isMobile()) { ev.preventDefault(); send(); }
 });
+// ═══ composer formatting (Telegram Desktop shortcuts → Markdown) ════════════
+// ev.code, not ev.key: the shortcuts must work in the Russian layout too.
+const FORMAT_KEYS = {
+  KeyB: { mark: "**" },
+  KeyI: { mark: "_" },
+  KeyE: { mark: "`" },
+  "shift+KeyM": { mark: "`", block: "```" },
+  "shift+KeyX": { mark: "~~" },
+  "shift+KeyP": { mark: "||" },
+  KeyK: { link: true },
+  "shift+Period": { quote: true },
+  "shift+KeyN": { clear: true },
+};
+
+function replaceRange(ta, start, end, text, selStart, selEnd) {
+  ta.focus();
+  ta.setSelectionRange(start, end);
+  // execCommand keeps Ctrl+Z working; setRangeText is the fallback.
+  if (!document.execCommand("insertText", false, text)) ta.setRangeText(text, start, end, "end");
+  ta.setSelectionRange(selStart, selEnd);
+  autosize();
+}
+
+function toggleMark(ta, mark) {
+  const { selectionStart: a, selectionEnd: b, value: v } = ta;
+  const n = mark.length;
+  // Already wrapped (markers just outside or just inside the selection) → unwrap.
+  if (v.slice(a - n, a) === mark && v.slice(b, b + n) === mark) {
+    return replaceRange(ta, a - n, b + n, v.slice(a, b), a - n, b - n);
+  }
+  const sel = v.slice(a, b);
+  if (sel.length >= 2 * n && sel.startsWith(mark) && sel.endsWith(mark)) {
+    return replaceRange(ta, a, b, sel.slice(n, -n), a, b - 2 * n);
+  }
+  // Markers must hug the text: leave edge whitespace outside.
+  const core = sel.trim();
+  const lead = sel.slice(0, sel.length - sel.trimStart().length);
+  const trail = sel.slice(sel.trimEnd().length);
+  const start = a + lead.length;
+  replaceRange(ta, a, b, `${lead}${mark}${core}${mark}${trail}`, start + n, start + n + core.length);
+}
+
+function codeBlock(ta, fence) {
+  const { selectionStart: a, selectionEnd: b, value: v } = ta;
+  const sel = v.slice(a, b).replace(/^\n+|\n+$/g, "");
+  const pre = a > 0 && v[a - 1] !== "\n" ? "\n" : "";
+  const post = b < v.length && v[b] !== "\n" ? "\n" : "";
+  const head = `${pre}${fence}\n`;
+  replaceRange(ta, a, b, `${head}${sel}\n${fence}${post}`, a + head.length, a + head.length + sel.length);
+}
+
+function insertLink(ta) {
+  const { selectionStart: a, selectionEnd: b, value: v } = ta;
+  const sel = v.slice(a, b);
+  if (/^https?:\/\/\S+$/.test(sel)) return replaceRange(ta, a, b, `[](${sel})`, a + 1, a + 1);
+  const text = `[${sel}](https://)`;
+  const urlAt = a + sel.length + 3;
+  replaceRange(ta, a, b, text, sel ? urlAt : a + 1, sel ? urlAt + 8 : a + 1);
+}
+
+function toggleQuote(ta) {
+  const { selectionStart: a, selectionEnd: b, value: v } = ta;
+  const start = v.lastIndexOf("\n", a - 1) + 1;
+  let end = v.indexOf("\n", b);
+  if (end < 0) end = v.length;
+  const lines = v.slice(start, end).split("\n");
+  const quoted = lines.every((l) => l.startsWith("> "));
+  const out = lines.map((l) => (quoted ? l.slice(2) : `> ${l}`)).join("\n");
+  replaceRange(ta, start, end, out, start, start + out.length);
+}
+
+function clearFormatting(ta) {
+  const { selectionStart: a, selectionEnd: b, value: v } = ta;
+  const out = v.slice(a, b)
+    .replace(/^```[^\n]*\n?|\n?```$/gm, "")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/^> /gm, "")
+    .replace(/\*\*|~~|\|\||`|(?<!\w)_|_(?!\w)/g, "");
+  replaceRange(ta, a, b, out, a, a + out.length);
+}
+
+function handleFormatKey(ev) {
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return false;
+  const f = FORMAT_KEYS[(ev.shiftKey ? "shift+" : "") + ev.code];
+  if (!f) return false;
+  ev.preventDefault();
+  const ta = ev.currentTarget;
+  if (f.link) insertLink(ta);
+  else if (f.quote) toggleQuote(ta);
+  else if (f.clear) clearFormatting(ta);
+  else if (f.block && ta.value.slice(ta.selectionStart, ta.selectionEnd).includes("\n")) codeBlock(ta, f.block);
+  else toggleMark(ta, f.mark);
+  return true;
+}
+
 $("input").addEventListener("paste", (ev) => {
   const files = [...(ev.clipboardData?.files || [])];
   if (files.length) { ev.preventDefault(); uploadFiles(files); }
