@@ -43,6 +43,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import tomllib
 from datetime import date, datetime, timedelta
@@ -336,6 +337,8 @@ async def run() -> None:
             conf = config()
             if conf.get("reach") or conf.get("inventory"):
                 await probe_all()
+            if conf.get("calendar"):
+                await asyncio.to_thread(_refresh_calendar)
             if (conf.get("memory") or {}).get("dir"):
                 # Keeps the memory index warm: the first home-page load after
                 # a restart would otherwise walk ~1000 files (~2 s).
@@ -681,36 +684,49 @@ def alerts() -> dict[str, Any] | None:
 _CAL_LINE = re.compile(
     r"^\s*(\d\d)\.(\d\d)\.(\d{4})\s+(?:(\d\d:\d\d)\s+\S+|\(весь день\))\s+—\s+(.+?)\s*$"
 )
-_calendar_cache: tuple[float, list[dict[str, Any]]] = (0.0, [])
+_calendar_cache: tuple[float, list[dict[str, Any]] | None] = (0.0, None)
+_calendar_lock = threading.Lock()
 
 
-def calendar_soon() -> list[dict[str, Any]] | None:
-    """Today's and tomorrow's events from the read-only calendar command."""
+def _refresh_calendar() -> None:
+    """Run the calendar command (it can take ~10 s) and cache the result."""
     global _calendar_cache
     command = (config().get("calendar") or {}).get("command")
-    if not command:
-        return None
-    if time.time() - _calendar_cache[0] < CALENDAR_TTL_S:
-        return _calendar_cache[1]
+    if not command or not _calendar_lock.acquire(blocking=False):
+        return
     try:
         out = subprocess.run(
             os.path.expanduser(command),
             shell=True,  # noqa: S602 — the command comes from the local hub.toml
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=30,
         ).stdout
-    except OSError, subprocess.SubprocessError:
-        return _calendar_cache[1]
-    today = date.today()
-    days = {today: "today", today + timedelta(days=1): "tomorrow"}
-    events = []
-    for line in out.splitlines():
-        m = _CAL_LINE.match(line)
-        day = days.get(date(int(m[3]), int(m[2]), int(m[1]))) if m else None
-        if m and day:
-            events.append({"day": day, "time": m[4], "title": m[5]})
-    _calendar_cache = (time.time(), events)
+        today = date.today()
+        days = {today: "today", today + timedelta(days=1): "tomorrow"}
+        events = []
+        for line in out.splitlines():
+            m = _CAL_LINE.match(line)
+            day = days.get(date(int(m[3]), int(m[2]), int(m[1]))) if m else None
+            if m and day:
+                events.append({"day": day, "time": m[4], "title": m[5]})
+        _calendar_cache = (time.time(), events)
+    except OSError, subprocess.SubprocessError, ValueError:
+        logger.warning("hub calendar command failed", exc_info=True)
+    finally:
+        _calendar_lock.release()
+
+
+def calendar_soon() -> list[dict[str, Any]] | None:
+    """Today's and tomorrow's events; never waits for the (slow) command.
+
+    A stale cache is refreshed in the background; None until the first run.
+    """
+    if not (config().get("calendar") or {}).get("command"):
+        return None
+    stamp, events = _calendar_cache
+    if time.time() - stamp > CALENDAR_TTL_S:
+        threading.Thread(target=_refresh_calendar, daemon=True).start()
     return events
 
 
@@ -718,7 +734,10 @@ def happened() -> dict[str, Any] | None:
     conf = config()
     if not conf.get("alerts") and not conf.get("calendar"):
         return None
-    return {"alerts": alerts(), "calendar": calendar_soon()}
+    out: dict[str, Any] = {"alerts": alerts()}
+    if conf.get("calendar"):
+        out["calendar"] = calendar_soon()  # null = still loading
+    return out
 
 
 # ── everything for the home page in one call ─────────────────────────────────

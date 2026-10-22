@@ -173,7 +173,9 @@ def test_alerts_latest_per_alert_with_the_verdict(tmp_path, monkeypatch):
         f'[alerts]\nlog = "{log}"\n[calendar]\ncommand = "{cal}"\n', encoding="utf-8"
     )
     hub._conf_cache = (-1.0, {})
-    hub._calendar_cache = (0.0, [])
+    hub._calendar_cache = (0.0, None)
+    assert hub.happened()["calendar"] is None  # first call never waits ...
+    hub._refresh_calendar()  # ... the background run fills the cache
     got = hub.happened()
     a = got["alerts"]
     assert (a["important"], a["noise"]) == (1, 2)

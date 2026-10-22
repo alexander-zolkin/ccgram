@@ -2686,14 +2686,14 @@ function renderHappened(h, pending) {
   const calRow = (e) => `<li class="${e.day === "today" && e.time && e.time < nowHm ? "past" : ""}"><span class="ev-time">${esc(e.time || "весь день")}</span><span>${esc(e.title)}</span></li>`;
   const todayCal = (cal || []).filter((e) => e.day === "today");
   const tomorrowCal = (cal || []).filter((e) => e.day === "tomorrow");
-  const calRows = cal ? `${todayCal.length ? todayCal.map(calRow).join("") : '<li class="muted">В календаре на сегодня пусто</li>'}${tomorrowCal.length ? `<li class="ev-day">Завтра</li>${tomorrowCal.map(calRow).join("")}` : ""}` : "";
+  const calRows = cal === null ? '<li class="muted">Календарь загружается…</li>' : cal ? `${todayCal.length ? todayCal.map(calRow).join("") : '<li class="muted">В календаре на сегодня пусто</li>'}${tomorrowCal.length ? `<li class="ev-day">Завтра</li>${tomorrowCal.map(calRow).join("")}` : ""}` : "";
   const due = ((pending && pending.items) || []).filter((it) => it.days <= 0);
   const late = due.filter((it) => it.days < 0).length;
   card.innerHTML = `
     <header class="hub-head">${HUB_ICON.happened}<h2>Что случилось</h2><span class="hub-sub">${a ? `за сутки: ${a.important} ${pluralRu(a.important, "важный", "важных", "важных")}, ${a.noise} шума` : ""}</span></header>
     <div class="ev-cols">
       ${a ? `<section><div class="hub-label">Алерты</div><ul class="ev-list">${alertRows}</ul></section>` : ""}
-      <section><div class="hub-label">Сегодня</div>${cal ? `<ul class="ev-cal">${calRows}</ul>` : ""}
+      <section><div class="hub-label">Сегодня</div>${"calendar" in h && cal !== undefined ? `<ul class="ev-cal">${calRows}</ul>` : ""}
         ${due.length ? `<button type="button" class="link-btn ev-due">${due.length} ${pluralRu(due.length, "дело", "дела", "дел")} на сегодня${late ? ` · просрочено ${late}` : ""}</button>` : '<div class="muted ev-none">Дел на сегодня нет</div>'}</section>
     </div>`;
   const jump = card.querySelector(".ev-due");
