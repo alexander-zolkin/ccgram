@@ -1866,7 +1866,11 @@ async function probeTopic(tid) {
 
 // ═══ live status: what the agent is doing right now ═════════════════════════
 const STATUS_RU = [[/^(reading|read)\b/i, "Читает"], [/^(writing|write)\b/i, "Пишет"], [/^(editing|edit)\b/i, "Правит"], [/^(searching|search|grep)/i, "Ищет"], [/^(running|bash|execut)/i, "Выполняет"], [/^(thinking|reason)/i, "Думает"], [/^(testing|test)/i, "Тестирует"], [/^fetch/i, "Загружает"]];
-const STATUS_PART_RU = { thinking: "думает", "still thinking": "всё ещё думает", "thinking more": "думает дальше" };
+// "still thinking with xhigh effort" → "всё ещё думает · усилие xhigh"
+function thinkRu(part) {
+  const m = part.match(/^(still )?thinking( more)?(?: with (\w+) effort)?$/i);
+  return m && `${m[1] ? "всё ещё думает" : m[2] ? "думает дальше" : "думает"}${m[3] ? ` · усилие ${m[3]}` : ""}`;
+}
 // "Pondering… (1m 3s · ↓ 2.1k tokens · thinking)" → label + Claude Code's own turn clock and token count.
 function parseStatus(raw) {
   let text = String(raw || "").trim();
@@ -1879,7 +1883,7 @@ function parseStatus(raw) {
       const k = part.match(/^[↑↓]\s*([\d.,]+)\s*([kKmM]?)\s*tokens?$/);
       if (t && (t[1] || t[2] || t[3])) secs = (+t[1] || 0) * 3600 + (+t[2] || 0) * 60 + (+t[3] || 0);
       else if (k) tokens = parseFloat(k[1].replace(",", ".")) * ({ k: 1e3, m: 1e6 }[k[2].toLowerCase()] || 1);
-      else if (!/esc to interrupt|ctrl\+/i.test(part)) rest.push(STATUS_PART_RU[part.toLowerCase()] || part);
+      else if (!/esc to interrupt|ctrl\+/i.test(part)) rest.push(thinkRu(part) || part);
     }
     text = text.slice(0, paren.index) + (rest.length ? ` · ${rest.join(" · ")}` : "");
   }
