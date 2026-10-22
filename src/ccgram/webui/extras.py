@@ -188,6 +188,11 @@ _RULE = re.compile(r"^\s*─{8,}\s*$")
 _SPINNER_LINE = re.compile(r"^\s*[·✻✽✶✳✢*]\s+(\S.*….*)$")
 
 
+def _running(block: str | None) -> bool:
+    """A running spinner says "Verbing…"; "Baked for 19s · done" is a finished turn."""
+    return bool(block) and "…" in block.split("\n", 1)[0]
+
+
 async def pane_status(window_id: str) -> str | None:
     """The status block read straight off a pane no topic poller watches.
 
@@ -202,7 +207,7 @@ async def pane_status(window_id: str) -> str | None:
     if not text or extract_interactive_content(text):
         return None
     block = parse_status_block(text)
-    if block and "…" in block.split("\n", 1)[0]:
+    if _running(block):
         return block
     # Frames the parser skips: a plain "*" spinner, or a "⎿ Tip:" line wedged
     # between the status and the input box.
@@ -234,9 +239,13 @@ async def live(thread_id: int) -> dict[str, Any]:
     status = progress = raw = None
     ws = terminal_poll_state.peek_state(wid)
     result = ws.last_pyte_result if ws else None
-    if result is not None and not result.is_interactive and result.raw_text:
+    if result is not None and result.is_interactive:
+        pass  # a prompt is on screen: the prompt card shows it
+    elif result is not None and _running(result.raw_text):
         raw = result.raw_text
-    elif binding.web_only:
+    else:
+        # No poller watches web-only windows, and the poller's parser skips
+        # some frames (a "*" spinner, a "⎿ Tip:" line): read the pane.
         raw = await pane_status(wid)
     if raw:
         head, _, rest = raw.partition("\n")
