@@ -1999,9 +1999,10 @@ function renderLive(live, s) {
   const working = turnRunning(s);
   if ($("working").hidden === working) renderHeader();
   if (!working) state.turnClock = null;
-  if (!live || !working) { box.hidden = true; if (working) $("working-text").textContent = "Кара работает…"; tickWork(); refreshMsgStatus(); return; }
+  const idleText = s && s.state === "dead" ? "Бужу сессию…" : "Кара работает…";
+  if (!live || !working) { box.hidden = true; if (working) $("working-text").textContent = idleText; tickWork(); refreshMsgStatus(); return; }
   const status = parseStatus(live.status);
-  $("working-text").textContent = status.text || live.wait || "Кара работает…";
+  $("working-text").textContent = status.text || live.wait || idleText;
   turnClock(live, status);
   const agents = live.subagents || [];
   $("live-agents").innerHTML = agents.length
