@@ -669,6 +669,7 @@ function showHome() {
   renderCwd();
   $("input").placeholder = "Как я могу помочь?";
   setTitle("Кара");
+  updateLed();
   renderToggle();
   renderSessions();
   loadModels();
@@ -937,11 +938,45 @@ function renderHeader() {
   $("disclaimer").textContent = s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
   setTitle(`${working ? "⏳ " : ""}${s.name} — Кара`);
   refreshMsgStatus();
+  updateLed();
 }
 
 function setTitle(base) {
   const n = state.unread.size;
   document.title = n ? `(${n}) ${base}` : base;
+}
+
+// ═══ favicon LED ════════════════════════════════════════════════════════════
+// The tab icon follows the open chat: steady ring = idle, spinning amber arc =
+// working, pulsing red = a question or permission prompt waits for an answer.
+// Chrome doesn't animate SVG favicons, so the frames are swapped from here.
+function ledFrame(color, angle, dim) {
+  const arc = angle == null ? "" : ` stroke-linecap="round" stroke-dasharray="70 30.53" transform="rotate(${angle} 32 32)"`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#262624"/><g opacity="${dim ? 0.45 : 1}"><circle cx="32" cy="32" r="16" fill="none" stroke="${color}" stroke-opacity=".16" stroke-width="14"/><circle cx="32" cy="32" r="22.5" fill="none" stroke="${color}" stroke-opacity=".4" stroke-width="1.5"/><circle cx="32" cy="32" r="16" fill="none" stroke="${color}" stroke-width="5.5"${arc}/></g></svg>`;
+  return "data:image/svg+xml," + encodeURIComponent(svg);
+}
+const LED_FRAMES = {
+  working: { ms: 100, frames: Array.from({ length: 12 }, (_, i) => ledFrame("#f2b544", i * 30)) },
+  attention: { ms: 600, frames: [ledFrame("#f0614c"), ledFrame("#f0614c", null, true)] },
+};
+let ledMode = "idle";
+let ledTimer = null;
+
+function setLed(mode) {
+  if (mode === ledMode) return;
+  ledMode = mode;
+  clearInterval(ledTimer);
+  const link = document.querySelector('link[rel="icon"]');
+  const anim = LED_FRAMES[mode];
+  if (!anim) { link.href = "/static/icon.svg"; return; }
+  let i = 0;
+  link.href = anim.frames[0];
+  ledTimer = setInterval(() => { i = (i + 1) % anim.frames.length; link.href = anim.frames[i]; }, anim.ms);
+}
+
+function updateLed() {
+  const s = currentSession();
+  setLed(!s ? "idle" : !$("prompt-card").hidden ? "attention" : s.state === "active" ? "working" : "idle");
 }
 
 // ═══ notifications per chat ═════════════════════════════════════════════════
@@ -1126,10 +1161,21 @@ async function pollPane() {
         $("prompt-card").hidden = !inter;
         if (inter) renderPrompt(inter);
         renderMeta(data.meta);
+        updateLed();
+      }
+    } catch (_) { /* transient */ }
+  } else if (s.state !== "dead") {
+    // A background tab still watches for prompts, so the favicon can call you back.
+    try {
+      const data = await api(`/api/sessions/${tid}/pane`);
+      if (tid === state.current) {
+        $("prompt-card").hidden = !data.interactive;
+        if (data.interactive) renderPrompt(data.interactive);
+        updateLed();
       }
     } catch (_) { /* transient */ }
   }
-  const fast = !$("pane").hidden || (s && s.state === "active") || !$("prompt-card").hidden;
+  const fast = !document.hidden && (!$("pane").hidden || (s && s.state === "active") || !$("prompt-card").hidden);
   state.paneTimer = setTimeout(pollPane, fast ? 2000 : 6000);
 }
 
