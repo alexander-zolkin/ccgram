@@ -2419,7 +2419,7 @@ function renderMemory(mem, hasMap) {
   state.memToday = mem.today;
   state.hubMap = hasMap;
   $("hub-map-btn").hidden = !hasMap;
-  $("hub-mem-count").textContent = `${mem.total} ${pluralRu(mem.total, "запись", "записи", "записей")} · ${mem.domains} ${pluralRu(mem.domains, "раздел", "раздела", "разделов")}`;
+  $("hub-mem-count").innerHTML = `${mem.total} ${pluralRu(mem.total, "запись", "записи", "записей")}<span class="wide"> · ${mem.domains} ${pluralRu(mem.domains, "раздел", "раздела", "разделов")}</span>`;
   if (!$("hub-mem-q").value.trim()) showToday();
 }
 

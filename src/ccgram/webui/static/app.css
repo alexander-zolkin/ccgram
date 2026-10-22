@@ -509,7 +509,7 @@ input:focus { border-color: var(--accent); }
 .hub-card { background: var(--panel); border-radius: 16px; box-shadow: var(--shadow); padding: 14px 16px 12px; min-width: 0; }
 .hub-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; min-height: 30px; }
 .hub-head > svg { width: 18px; height: 18px; flex: none; color: var(--accent); }
-.hub-head h2 { margin: 0; font: 500 16.5px/1.3 var(--serif); }
+.hub-head h2 { margin: 0; font: 500 16.5px/1.3 var(--serif); white-space: nowrap; }
 .hub-head .btn.small { gap: 5px; padding: 4px 10px; font-size: 13px; }
 .hub-head .btn.small svg { width: 15px; height: 15px; }
 .hub-sub { font-size: 12.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
@@ -584,6 +584,7 @@ body.sheet-open { overflow: hidden; }
 @media (max-width: 720px) {
   .hub { margin-top: 22px; }
   .hub-grid { grid-template-columns: 1fr; }
+  .hub-sub .wide { display: none; }
   .hub-card { padding: 12px 14px 10px; }
   .pdate { width: 66px; }
   .rstat { max-width: 42%; }
