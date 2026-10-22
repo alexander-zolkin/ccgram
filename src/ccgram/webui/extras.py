@@ -6,13 +6,14 @@ service stays small; everything here reads ccgram's existing in-memory state
 
 Notification mode ("notify_mode", persisted in webui_prefs.json):
 
-- ``each`` — ccgram's default: every Telegram message rings (subject to the
-  per-topic sound modes) and Web Push fires on every finished reply.
-- ``done`` — a turn is one notification. Every Telegram message of the turn
-  goes out silently; when the agent stops (Stop hook) the topic gets a single
-  ringing "✅ Готово" ping (the previous ping is deleted, so they never pile
-  up) and Web Push delivers the turn's last reply once. A permission request
-  rings the same way — it needs an answer, so it is never deferred.
+- ``done`` (default) — a turn is one notification. Every Telegram message of
+  the turn goes out silently except the reply that ends it (the transcript's
+  ``stop_reason`` marks it — see ``quiet_threads.final_reply``), which rings
+  as usual; when the agent stops (Stop hook) Web Push delivers that reply
+  once. A permission request needs an answer, so it is never deferred: the
+  topic gets a ringing "⏳ …" ping, deleted again when the turn ends.
+- ``each`` — ccgram's own behaviour: every Telegram message rings (subject to
+  the per-topic sound modes) and Web Push fires on every finished reply.
 """
 
 from __future__ import annotations
@@ -37,10 +38,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 NOTIFY_MODES = ("each", "done")
+DEFAULT_NOTIFY_MODE = "done"
 PROBE_EVERY_S = 600.0
 BROWSE_MAX_DIRS = 400
 
-_notify_mode = "each"
+_notify_mode = DEFAULT_NOTIFY_MODE
 _last_ping: dict[tuple[int, int], int] = {}  # (chat, thread) → ping message id
 _last_reply: dict[int, tuple[str, str]] = {}  # thread → (title, text), "done" mode
 _probed_at: dict[int, float] = {}
@@ -55,7 +57,7 @@ def notify_mode() -> str:
 
 def set_notify_mode(mode: str) -> None:
     global _notify_mode
-    _notify_mode = mode if mode in NOTIFY_MODES else "each"
+    _notify_mode = mode if mode in NOTIFY_MODES else DEFAULT_NOTIFY_MODE
     quiet_threads.set_turn_quiet(_notify_mode == "done")
 
 
@@ -93,6 +95,14 @@ def _title(chat_id: int | None, thread_id: int) -> str:
     return (registry.get(thread_id) or {}).get("name") or "Кара"
 
 
+async def _drop_ping(client: TelegramClient, chat_id: int, thread_id: int) -> None:
+    old = _last_ping.pop((chat_id, thread_id), None)
+    if old:
+        # Already gone / too old to delete: nothing to clean up.
+        with contextlib.suppress(Exception):
+            await client.delete_message(chat_id, old)
+
+
 async def _ping(
     client: TelegramClient, chat_id: int, thread_id: int, text: str
 ) -> None:
@@ -100,11 +110,7 @@ async def _ping(
     # Lazy: the send path pulls the messaging pipeline.
     from ..handlers.messaging_pipeline.message_sender import rate_limit_send_message
 
-    old = _last_ping.pop((chat_id, thread_id), None)
-    if old:
-        # Already gone / too old to delete: nothing to clean up.
-        with contextlib.suppress(Exception):
-            await client.delete_message(chat_id, old)
+    await _drop_ping(client, chat_id, thread_id)
     msg = await rate_limit_send_message(
         client, chat_id, text, message_thread_id=thread_id, disable_notification=False
     )
@@ -122,9 +128,9 @@ async def on_stop(window_id: str, client: TelegramClient) -> None:
 
         for chat_id, thread_id in _targets(window_id):
             title, text = _last_reply.pop(thread_id, ("", ""))
-            tg_ok = quiet_threads.mode(thread_id) != "off"
-            if chat_id and tg_ok and not quiet_threads.all_muted():
-                await _ping(client, chat_id, thread_id, "✅ Готово")
+            if chat_id:
+                # The final reply itself rang; a "⏳" ping is answered by now.
+                await _drop_ping(client, chat_id, thread_id)
             push.notify_reply(
                 thread_id, title or _title(chat_id, thread_id), text or "Готово"
             )
@@ -646,4 +652,4 @@ def reset_for_testing() -> None:
     _last_ping.clear()
     _last_reply.clear()
     _probed_at.clear()
-    set_notify_mode("each")
+    set_notify_mode(DEFAULT_NOTIFY_MODE)

@@ -366,18 +366,18 @@ async def test_settings_roundtrip(client, tmp_path, monkeypatch):
     resp = await client.get("/api/settings")
     got = await resp.json()
     assert got["tg_muted"] is False and got["new_chat_telegram"] is True
-    assert got["notify_mode"] == "each"
+    assert got["notify_mode"] == "done"  # only a turn's last reply rings
     resp = await client.post(
         "/api/settings",
-        json={"new_chat_telegram": False, "tg_muted": True, "notify_mode": "done"},
+        json={"new_chat_telegram": False, "tg_muted": True, "notify_mode": "each"},
         headers=POST_HEADERS,
     )
     got = await resp.json()
     assert got["tg_muted"] is True and got["new_chat_telegram"] is False
-    assert got["notify_mode"] == "done" and quiet_threads.is_quiet(-1, 5)
+    assert got["notify_mode"] == "each" and quiet_threads.is_quiet(-1, 5)
     prefs.reset_for_testing()
     assert prefs.new_chat_telegram() is False and prefs.tg_muted() is True
-    assert prefs.notify_mode() == "done"
+    assert prefs.notify_mode() == "each"
     from ccgram.webui import extras
 
     extras.reset_for_testing()

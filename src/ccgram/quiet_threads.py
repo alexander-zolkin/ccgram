@@ -14,7 +14,12 @@ back with ``load_modes`` at startup.
 
 from __future__ import annotations
 
-from typing import Any
+import contextlib
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _quiet: set[tuple[int, int]] = set()
 _modes: dict[int, str] = {}  # thread id → "on" | "off"; absent = "auto"
@@ -23,8 +28,10 @@ _modes: dict[int, str] = {}  # thread id → "on" | "off"; absent = "auto"
 # so a topic muted on its own stays muted.
 _all_muted = False
 # "Notify when the turn is done" (web UI setting): every message of a turn is
-# silent; the web UI sends one ringing ping when the agent stops.
+# silent except the reply that ends it, which rings as usual.
 _turn_quiet = False
+# Set while that final reply is being sent (see ``final_reply``).
+_final: ContextVar[bool] = ContextVar("quiet_threads_final", default=False)
 MODES = ("auto", "on", "off")
 
 
@@ -81,11 +88,21 @@ def set_turn_quiet(on: bool) -> None:
     _turn_quiet = bool(on)
 
 
+@contextlib.contextmanager
+def final_reply(on: bool = True) -> Iterator[None]:
+    """Sends inside carry the reply that ends a turn: exempt from ``_turn_quiet``."""
+    token = _final.set(on)
+    try:
+        yield
+    finally:
+        _final.reset(token)
+
+
 def is_quiet(chat_id: Any, thread_id: Any) -> bool:
     key = _key(chat_id, thread_id)
     if key is None:
         return False
-    if _all_muted or _turn_quiet:
+    if _all_muted or (_turn_quiet and not _final.get()):
         return True
     explicit = _modes.get(key[1])
     if explicit is not None:

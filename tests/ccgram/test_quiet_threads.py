@@ -89,3 +89,22 @@ def test_global_mute_keeps_topic_modes():
     assert quiet_threads.apply(-100, {"message_thread_id": 9})["disable_notification"]
     quiet_threads.reset_for_testing()
     assert not quiet_threads.all_muted()
+
+
+def test_final_reply_rings_through_turn_quiet_only():
+    quiet_threads.reset_for_testing()
+    kw = {"message_thread_id": 7}
+    quiet_threads.set_turn_quiet(True)
+    assert quiet_threads.apply(-100, dict(kw))["disable_notification"] is True
+    with quiet_threads.final_reply():
+        assert "disable_notification" not in quiet_threads.apply(-100, dict(kw))
+        quiet_threads.mark_web(-100, 7)  # read in the browser: stays silent
+        assert quiet_threads.apply(-100, dict(kw))["disable_notification"] is True
+        quiet_threads.set_mode(7, "on")
+        assert "disable_notification" not in quiet_threads.apply(-100, dict(kw))
+        quiet_threads.set_all_muted(True)
+        assert quiet_threads.apply(-100, dict(kw))["disable_notification"] is True
+    with quiet_threads.final_reply(False):
+        quiet_threads.set_all_muted(False)
+        assert quiet_threads.apply(-100, dict(kw))["disable_notification"] is True
+    quiet_threads.reset_for_testing()

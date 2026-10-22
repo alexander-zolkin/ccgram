@@ -692,6 +692,7 @@ class TranscriptReader:
                 tool_use_id=entry.tool_use_id,
                 role=entry.role,
                 tool_name=entry.tool_name,
+                turn_end=entry.turn_end,
             )
             for entry in agent_messages
             if entry.text

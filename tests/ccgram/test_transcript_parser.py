@@ -68,6 +68,26 @@ class TestAnsiStripping:
         assert len(result) == 1
         assert result[0].text == "hello world"
 
+    def test_turn_end_marks_only_the_closing_text(self):
+        def say(blocks, stop):
+            return {
+                "type": "assistant",
+                "message": {"content": blocks, "stop_reason": stop},
+            }
+
+        entries = [
+            say([{"type": "text", "text": "смотрю"}], "tool_use"),
+            say(
+                [{"type": "tool_use", "id": "T1", "name": "Bash", "input": {}}],
+                "tool_use",
+            ),
+            say([{"type": "thinking", "thinking": "ok"}], "end_turn"),
+            say([{"type": "text", "text": "готово"}], "end_turn"),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries, {})
+        marked = [(e.content_type, e.text) for e in result if e.turn_end]
+        assert marked == [("text", "готово")]
+
     def test_ansi_stripped_from_user_text_block(self):
         entries = [
             {

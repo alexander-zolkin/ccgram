@@ -65,6 +65,7 @@ class AgentMessage:
     tool_use_id: str | None = None
     tool_name: str | None = None
     timestamp: str | None = None
+    turn_end: bool = False  # the reply that ends the turn (Claude only)
 
 
 @dataclass(frozen=True, slots=True)

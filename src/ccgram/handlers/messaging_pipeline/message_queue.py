@@ -19,6 +19,7 @@ from telegram import MessageEntity
 from telegram.error import RetryAfter, TelegramError
 from telegramify_markdown import utf16_len
 
+from ... import quiet_threads
 from ...config import config
 from ...entity_formatting import convert_to_entities
 from ...delivery_contract import (
@@ -405,6 +406,7 @@ async def _merge_content_tasks(
     current_length = sum(utf16_len(part) for part in merged_parts)
     oldest_enqueued_monotonic = first.enqueued_monotonic
     latest_source_checkpoint = first.source_checkpoint
+    turn_end = first.turn_end
     merge_count = 0
 
     async with lock:
@@ -436,6 +438,7 @@ async def _merge_content_tasks(
                     latest_source_checkpoint or task.source_checkpoint,
                     task.source_checkpoint,
                 )
+            turn_end = turn_end or task.turn_end
             merge_count += 1
 
         for item in remaining:
@@ -459,6 +462,7 @@ async def _merge_content_tasks(
             source_session_id=first.source_session_id,
             source_checkpoint=latest_source_checkpoint,
             enqueued_monotonic=oldest_enqueued_monotonic,
+            turn_end=turn_end,
         ),
         merge_count,
     )
@@ -757,13 +761,14 @@ async def _process_text_batch(
 ) -> DeliveryOutcome:
     """Deliver a rendered text batch as one Telegram message."""
     plain_text, entities = _render_text_batch(task.parts)
-    sent = await rate_limit_send_formatted_message(
-        client,
-        chat_id,
-        plain_text,
-        entities,
-        **send_kwargs(task.thread_id),
-    )
+    with quiet_threads.final_reply(task.turn_end):
+        sent = await rate_limit_send_formatted_message(
+            client,
+            chat_id,
+            plain_text,
+            entities,
+            **send_kwargs(task.thread_id),
+        )
     return DeliveryOutcome.DELIVERED if sent else DeliveryOutcome.FAILED
 
 
@@ -840,9 +845,11 @@ async def _process_content_task(
         else:
             first_part = False
 
-        sent = await rate_limit_send_message(
-            client, chat_id, part, **send_kwargs(task.thread_id)
-        )
+        # Only the first message of a long final reply rings.
+        with quiet_threads.final_reply(task.turn_end and last_msg_id is None):
+            sent = await rate_limit_send_message(
+                client, chat_id, part, **send_kwargs(task.thread_id)
+            )
 
         if sent:
             last_msg_id = sent.message_id
@@ -884,6 +891,7 @@ async def enqueue_content_message(
     source_session_id: str | None = None,
     source_checkpoint: int | None = None,
     is_backlog_notice: bool = False,
+    turn_end: bool = False,
 ) -> bool:
     """Enqueue a content message task and report whether it entered the queue."""
     if _is_ghost_window_task_at_enqueue(window_id):
@@ -910,6 +918,7 @@ async def enqueue_content_message(
             else (receipt.checkpoint if receipt is not None else None)
         ),
         is_backlog_notice=is_backlog_notice,
+        turn_end=turn_end,
     )
     queue.put_nowait(task)
     return True

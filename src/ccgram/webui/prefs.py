@@ -82,7 +82,7 @@ def set_new_chat_telegram(on: bool) -> None:
 
 
 def notify_mode() -> str:
-    return str(_load().get("notify_mode", "each"))
+    return str(_load().get("notify_mode", "done"))
 
 
 def set_notify_mode(mode: str) -> None:

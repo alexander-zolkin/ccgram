@@ -255,6 +255,65 @@ class TestMergeContentTasks:
         assert merged is first
 
 
+class TestTurnEndRings:
+    """With "notify when done" only the reply that ends a turn may ring."""
+
+    @pytest.fixture(autouse=True)
+    def _turn_quiet(self):
+        from ccgram import quiet_threads
+
+        quiet_threads.reset_for_testing()
+        quiet_threads.set_turn_quiet(True)
+        yield
+        quiet_threads.reset_for_testing()
+
+    @staticmethod
+    def _recorder(calls):
+        from ccgram import quiet_threads
+
+        async def send(_client, chat_id, *_a, **kw):
+            calls.append(quiet_threads.is_quiet(chat_id, kw.get("message_thread_id")))
+            return type("Sent", (), {"message_id": len(calls)})()
+
+        return send
+
+    async def test_final_reply_rings_first_part_only(self, bot) -> None:
+        calls: list[bool] = []
+        mod = "ccgram.handlers.messaging_pipeline.message_queue"
+        with patch(f"{mod}.rate_limit_send_message", self._recorder(calls)):
+            await _process_content_task(bot, 1, _content_task("шаг"))
+            final = ContentTask(
+                window_id="@0",
+                parts=("итог 1/2", "итог 2/2"),
+                thread_id=42,
+                chat_id=-1001,
+                turn_end=True,
+            )
+            await _process_content_task(bot, 1, final)
+        assert calls == [True, False, True]  # quiet, rings, quiet
+
+    async def test_merged_batch_with_the_final_reply_rings(
+        self, bot, queue, lock
+    ) -> None:
+        calls: list[bool] = []
+        queue.put_nowait(
+            ContentTask(
+                window_id="@0",
+                parts=("итог",),
+                thread_id=42,
+                chat_id=-1001,
+                turn_end=True,
+            )
+        )
+        mod = "ccgram.handlers.messaging_pipeline.message_queue"
+        with patch(f"{mod}.rate_limit_send_formatted_message", self._recorder(calls)):
+            assert (
+                await _handle_content_task(bot, 1, _content_task("шаг"), queue, lock)
+                == 1
+            )
+        assert calls == [False]
+
+
 class TestActualTextBatching:
     async def test_consecutive_text_tasks_use_one_formatted_api_call(
         self, bot, queue, lock

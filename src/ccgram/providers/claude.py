@@ -199,6 +199,7 @@ class ClaudeProvider:
                 tool_use_id=e.tool_use_id,
                 tool_name=e.tool_name,
                 timestamp=e.timestamp,
+                turn_end=e.turn_end,
             )
             for e in parsed
         ]

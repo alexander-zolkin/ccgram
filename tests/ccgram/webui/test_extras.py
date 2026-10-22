@@ -9,11 +9,11 @@ from ccgram.webui.service import WebUIError
 
 @pytest.fixture(autouse=True)
 def _reset():
-    extras.reset_for_testing()
     quiet_threads.reset_for_testing()
+    extras.reset_for_testing()  # re-applies the default mode's turn-quiet
     yield
-    extras.reset_for_testing()
     quiet_threads.reset_for_testing()
+    extras.reset_for_testing()
 
 
 class FakeClient:
@@ -51,23 +51,27 @@ def wired(monkeypatch):
 
 async def test_each_mode_stop_does_nothing(wired):
     sent, pushed = wired
+    extras.set_notify_mode("each")
     await extras.on_stop("@1", FakeClient())
     assert sent == [] and pushed == []
     assert not quiet_threads.is_quiet(-100, 7)
 
 
-async def test_done_mode_one_ringing_ping_per_turn(wired):
+async def test_done_is_the_default_and_only_the_final_reply_rings(wired):
     sent, pushed = wired
-    extras.set_notify_mode("done")
-    assert quiet_threads.is_quiet(-100, 7)  # turn messages go out silent
+    assert extras.notify_mode() == "done"
+    assert quiet_threads.is_quiet(-100, 7)  # turn messages go out silent ...
+    with quiet_threads.final_reply():
+        assert not quiet_threads.is_quiet(-100, 7)  # ... except the last reply
     extras.remember_reply(7, "Чат", "первый ответ")
     extras.remember_reply(7, "Чат", "итоговый ответ")
     client = FakeClient()
+    await extras.on_attention("@1", "Approval needed: Bash", client)
+    assert sent == [(-100, 7, "⏳ Approval needed: Bash", False)]
     await extras.on_stop("@1", client)
-    assert sent == [(-100, 7, "✅ Готово", False)]
-    assert pushed == [(7, "Чат", "итоговый ответ"), (-3, "t-3", "Готово")]
-    await extras.on_stop("@1", client)
-    assert client.deleted == [(-100, 100)]  # the previous ping is replaced
+    assert len(sent) == 1  # no extra "done" message: the reply itself rang
+    assert client.deleted == [(-100, 100)]  # the answered "⏳" ping goes away
+    assert pushed[-2:] == [(7, "Чат", "итоговый ответ"), (-3, "t-3", "Готово")]
 
 
 async def test_done_mode_respects_muted_topic_and_global_mute(wired):
@@ -82,6 +86,7 @@ async def test_done_mode_respects_muted_topic_and_global_mute(wired):
 
 async def test_attention_rings_in_done_mode_and_pushes(wired):
     sent, pushed = wired
+    extras.set_notify_mode("each")
     await extras.on_attention("@1", "Approval needed: Bash", FakeClient())
     assert sent == []  # "each": the interactive prompt itself rings
     assert [p[2] for p in pushed] == ["⏳ Approval needed: Bash"] * 2

@@ -32,6 +32,9 @@ class ParsedMessage:
     tool_name: str | None = None  # For tool_use messages
 
 
+_TURN_END_REASONS = frozenset({"end_turn", "stop_sequence", "max_tokens", "refusal"})
+
+
 @dataclass
 class ParsedEntry:
     """A single parsed message entry ready for display."""
@@ -46,6 +49,8 @@ class ParsedEntry:
     tool_name: str | None = (
         None  # For tool_use entries, the tool name (e.g. "AskUserQuestion")
     )
+    # CCGRAM-HOTFIX:webui-extras — text of the API message that ended the turn
+    turn_end: bool = False
 
 
 @dataclass
@@ -757,9 +762,15 @@ class TranscriptParser:
             state.last_cmd_name = None
 
             if msg_type == "assistant":
-                result.extend(
-                    cls._handle_assistant_entry(content, state, entry_timestamp, cwd)
+                produced = cls._handle_assistant_entry(
+                    content, state, entry_timestamp, cwd
                 )
+                # CCGRAM-HOTFIX:webui-extras — no tool call follows this reply,
+                # so the turn is over: it may ring when the rest stays silent.
+                if message.get("stop_reason") in _TURN_END_REASONS:
+                    for entry in produced:
+                        entry.turn_end = entry.content_type == "text"
+                result.extend(produced)
             elif msg_type == "user":
                 result.extend(cls._handle_user_entry(content, state, entry_timestamp))
 

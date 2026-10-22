@@ -278,6 +278,7 @@ async def handle_new_message(msg: NewMessage, client: TelegramClient) -> None:  
                 thread_id=thread_id,
                 chat_id=chat_id,
                 source_session_id=msg.session_id,
+                turn_end=msg.turn_end,
             )
 
             await _update_window_offset(user_id, window_id)

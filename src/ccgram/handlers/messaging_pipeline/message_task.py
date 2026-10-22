@@ -40,6 +40,9 @@ class ContentTask:
     source_checkpoint: int | None = None
     enqueued_monotonic: float = field(default_factory=time.monotonic, compare=False)
     is_backlog_notice: bool = False
+    # CCGRAM-HOTFIX:webui-extras — the reply that ends the turn; it rings even
+    # when the rest of the turn goes out silent ("notify when done").
+    turn_end: bool = False
 
 
 @dataclass(frozen=True, slots=True)
