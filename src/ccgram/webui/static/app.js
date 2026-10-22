@@ -344,7 +344,7 @@ const state = {
   fetchTimer: null,
   paneTimer: null,
   attachments: [],
-  pending: new Map(),     // session id → text shown until the transcript has it
+  pending: new Map(),     // session id → {text, at} shown until the transcript has it
   providers: null,          // [{id, name, models, default}]
   provider: store.get("kara-provider") || "claude",
   model: store.get("kara-model") || "",
@@ -397,10 +397,10 @@ const TICK = {
 };
 
 // A just-sent message: shown at once, before the server answers (Telegram style).
-function pendingNode(text) {
+function pendingNode(text, at = Date.now()) {
   const n = userNode({ text });
   n.classList.add("pending");
-  n.querySelector(".msg-time").textContent = hhmm(Date.now());
+  n.querySelector(".msg-time").textContent = hhmm(at);
   n.querySelector(".tick").innerHTML = TICK.clock;
   return n;
 }
@@ -668,6 +668,7 @@ function showHome() {
   resetThread("");
   $("greet-text").textContent = greeting();
   loadDraft();
+  syncSendBtn();
   $("title-btn").hidden = true;
   $("pane-btn").hidden = true;
   $("sound-btn").hidden = true;
@@ -726,7 +727,7 @@ async function openSession(tid) {
     resetThread(state.structured && data.start > 0 ? '<div class="loader-row">Загружаю ранние сообщения при прокрутке…</div>' : "");
     $("thread").appendChild(buildBlocks(data.items, null));
     const pending = state.pending.get(tid);
-    if (pending) { const p = pendingNode(pending); p.querySelector(".tick").innerHTML = TICK.sent; $("thread").appendChild(p); }
+    if (pending) { const p = pendingNode(pending.text, pending.at); p.querySelector(".tick").innerHTML = TICK.sent; p.dataset.sent = "1"; $("thread").appendChild(p); }
     replay($("thread"), "fade");
     refreshMsgStatus();
     markLast();
@@ -955,7 +956,13 @@ function renderHeader() {
   const shown = working && s.state === "idle" ? "active" : s.state;
   const label = STATE_LABEL[shown] || "";
   $("chat-state").innerHTML = label ? `<span class="dot ${esc(shown)}"></span><span>${esc(label)}</span>` : "";
-  $("working").hidden = !working;
+  if ($("working").hidden === working) {
+    // The working line takes room from the thread: keep the last bubble in view.
+    const stick = nearBottom();
+    $("working").hidden = !working;
+    if (stick) toBottom();
+  }
+  syncSendBtn();
   renderSoundBtn(s);
   $("gone-card").hidden = !s.topic_deleted;
   $("disclaimer").textContent = s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
@@ -1208,8 +1215,34 @@ function autosize() {
   const t = $("input");
   t.style.height = "auto";
   t.style.height = Math.min(t.scrollHeight, window.innerHeight * 0.4) + "px";
-  $("send-btn").disabled = !t.value.trim() && !state.attachments.length;
+  syncSendBtn();
 }
+
+const SEND_ICON = {
+  send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg>',
+  stop: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>',
+};
+// While a turn runs and there is nothing to send, the send button stops it
+// (Esc in Claude Code); typing turns it back into send — a message typed
+// mid-turn is queued by Claude Code.
+function syncSendBtn() {
+  const btn = $("send-btn");
+  const empty = !$("input").value.trim() && !state.attachments.length;
+  const stop = empty && state.current != null && turnRunning(currentSession());
+  if (btn.classList.contains("stop") !== stop) {
+    btn.classList.toggle("stop", stop);
+    btn.innerHTML = stop ? SEND_ICON.stop : SEND_ICON.send;
+    btn.setAttribute("aria-label", stop ? "Остановить" : "Отправить");
+    if (stop) btn.dataset.tip = "Остановить — как Esc в Claude Code"; else delete btn.dataset.tip;
+  }
+  btn.disabled = empty && !stop;
+}
+$("send-btn").addEventListener("click", (ev) => {
+  if (!$("send-btn").classList.contains("stop")) return;
+  ev.preventDefault();
+  sendKey("Escape");
+  toast("Останавливаю…");
+});
 
 function renderAttachments() {
   const box = $("attachments");
@@ -1278,7 +1311,7 @@ async function sendTo(tid, message, node) {
   p.classList.remove("failed");
   p.querySelector(".retry")?.remove();
   p.querySelector(".tick").innerHTML = TICK.clock;
-  state.pending.set(tid, message);
+  state.pending.set(tid, { text: message, at: Date.now() });
   startInflight(tid); // the clock starts on the click, like Claude Code's own
   renderHeader();
   if (s && s.state === "dead") $("working-text").textContent = "Бужу сессию…";
@@ -1298,7 +1331,7 @@ async function sendTo(tid, message, node) {
     p.appendChild(retry);
     toast(`❌ ${e.message}`);
   } finally {
-    $("working-text").textContent = "Кара работает…";
+    $("working-text").textContent = workVerb();
   }
 }
 
@@ -1316,7 +1349,7 @@ async function send() {
       const res = await api("/api/sessions", { body: { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort, cwd: state.cwd || undefined, worktree: state.worktree || undefined } });
       if (state.worktree) { state.worktree = false; renderCwd(); }
       clearComposer();
-      state.pending.set(res.thread_id, message);
+      state.pending.set(res.thread_id, { text: message, at: Date.now() });
       startInflight(res.thread_id);
       await refreshSessions();
       location.hash = `#${res.thread_id}`;
@@ -1328,7 +1361,7 @@ async function send() {
   } catch (e) {
     toast(`❌ ${e.message}`);
   } finally {
-    $("working-text").textContent = "Кара работает…";
+    $("working-text").textContent = workVerb();
     if (state.current == null) $("working").hidden = true;
     autosize();
     $("input").focus();
@@ -1459,7 +1492,7 @@ function profileMenu() {
   items.push({ heading: "Уведомления" });
   items.push({
     label: "Когда уведомлять",
-    sub: state.notifyMode === "done" ? "Один раз — когда задача готова (и если нужно разрешение)" : "На каждое сообщение",
+    sub: state.notifyMode === "done" ? "Только последнее сообщение — когда задача готова (и если нужно разрешение)" : "На каждое сообщение",
     icon: state.notifyMode === "done" ? SVG.check2 : SVG.bell,
     action: () => setNotifyMode(state.notifyMode === "done" ? "each" : "done"),
   });
@@ -1768,7 +1801,7 @@ async function boot(me) {
   refreshPushState();
   api("/api/settings").then((r) => {
     state.tgMuted = r.tg_muted;
-    state.notifyMode = r.notify_mode || "each";
+    state.notifyMode = r.notify_mode || "done";
     state.webMuted = Boolean(r.web_muted);
     state.webOff = new Set(r.web_off || []);
     state.stt = Boolean(r.stt);
@@ -2037,7 +2070,6 @@ $("sound-btn").onclick = () => {
   openMenu(soundMenu(s), { x: r.right - 260, y: r.bottom + 4, top: r.top }, $("sound-btn"));
 };
 $("pane-btn").onclick = () => { $("pane").hidden = !$("pane").hidden; pollPane(); };
-$("stop-btn").onclick = () => sendKey("Escape");
 $("gone-keep").onclick = async () => {
   const s = currentSession();
   if (!s) return;
@@ -2137,7 +2169,17 @@ function turnRunning(s) {
   const f = state.inflight;
   return Boolean(f && f.tid === s.thread_id && Date.now() - f.at < INFLIGHT_MS);
 }
+// Like Claude Code's spinner word: one per turn, picked at random.
+const WORK_VERBS = ["Думает", "Соображает", "Колдует", "Прикидывает", "Вникает", "Разбирается", "Мозгует", "Кумекает", "Шуршит", "Корпит", "Размышляет", "Смекает", "Распутывает", "Химичит", "Мудрит", "Ворожит", "Шаманит", "Докапывается", "Нащупывает", "Сопоставляет"];
+function workVerb(turnStart) {
+  const w = state.workVerb;
+  const fresh = !w || w.tid !== state.current || (turnStart && w.start && w.start !== turnStart);
+  if (fresh) state.workVerb = { tid: state.current, start: turnStart || "", text: `${WORK_VERBS[Math.floor(Math.random() * WORK_VERBS.length)]}…` };
+  else if (turnStart && !w.start) w.start = turnStart;
+  return state.workVerb.text;
+}
 function startInflight(tid) {
+  state.workVerb = null;
   state.inflight = { tid, at: Date.now(), seen: false };
   state.turnClock = { tid, start: Date.now(), out: 0 };
 }
@@ -2199,10 +2241,12 @@ function renderLive(live, s) {
   const working = turnRunning(s);
   if ($("working").hidden === working) renderHeader();
   if (!working) state.turnClock = null;
-  const idleText = s && s.state === "dead" ? "Бужу сессию…" : "Кара работает…";
+  const idleText = s && s.state === "dead" ? "Бужу сессию…" : workVerb(live?.turn?.start);
   if (!live || !working) { box.hidden = true; if (working) $("working-text").textContent = idleText; tickWork(); refreshMsgStatus(); return; }
   const status = parseStatus(live.status);
-  $("working-text").textContent = status.text || live.wait || idleText;
+  // Claude Code's own whimsical word ("Combobulating…") reads as ours, in Russian.
+  const text = status.text.replace(/^[A-Za-z'’-]+…/, idleText);
+  $("working-text").textContent = text || live.wait || idleText;
   turnClock(live, status);
   const agents = live.subagents || [];
   $("live-agents").innerHTML = agents.length
@@ -2505,7 +2549,7 @@ $("mic-btn").onclick = toggleMic;
 async function setNotifyMode(mode) {
   try {
     state.notifyMode = (await api("/api/settings", { body: { notify_mode: mode } })).notify_mode;
-    toast(state.notifyMode === "done" ? "Уведомлю один раз — когда задача готова. Промежуточные сообщения приходят без звука" : "Уведомления на каждое сообщение");
+    toast(state.notifyMode === "done" ? "Звенит только последнее сообщение — когда задача готова. Промежуточные приходят без звука" : "Уведомления на каждое сообщение");
   } catch (e) { toast(e.message); }
 }
 
@@ -2513,6 +2557,7 @@ async function setNotifyMode(mode) {
 const MSG_STATUS = {
   sending: "Отправляется…",
   sent: "Доставлено в сессию — модель ещё не прочитала",
+  queued: "Claude Code отдаст его модели на следующем шаге, работу не прерывает",
   read: "Прочитано моделью",
   working: "Прочитано — Кара работает над этим",
 };
@@ -2524,7 +2569,7 @@ function refreshMsgStatus() {
   if (!last) return;
   let st = "read";
   if (last.classList.contains("failed")) return;
-  if (last.classList.contains("pending")) st = last.dataset.sent ? "sent" : "sending";
+  if (last.classList.contains("pending")) st = !last.dataset.sent ? "sending" : turnRunning(currentSession()) ? "queued" : "sent";
   else {
     const s = currentSession();
     let answered = false;
@@ -2534,7 +2579,7 @@ function refreshMsgStatus() {
   last.classList.add("latest");
   last.dataset.status = st;
   const label = last.querySelector(".u-status") || last.querySelector(".u-meta").insertBefore(el("span", "u-status"), last.querySelector(".u-meta").firstChild);
-  label.textContent = { sending: "отправляется", sent: "доставлено", read: "прочитано", working: "прочитано · в работе" }[st];
+  label.textContent = { sending: "отправляется", sent: "доставлено", queued: "в очереди", read: "прочитано", working: "прочитано · в работе" }[st];
   last.querySelector(".tick").dataset.tip = MSG_STATUS[st];
 }
 
@@ -2887,7 +2932,7 @@ async function startPending(it, btn) {
     const c = currentChoice();
     const effort = c?.provider.id === "claude" && state.effort ? state.effort : undefined;
     const res = await api(`/api/hub/pending/${it.id}/start`, { body: { web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort } });
-    state.pending.set(res.thread_id, res.text);
+    state.pending.set(res.thread_id, { text: res.text, at: Date.now() });
     startInflight(res.thread_id);
     await refreshSessions();
     location.hash = `#${res.thread_id}`;

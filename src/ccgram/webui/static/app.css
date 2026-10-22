@@ -193,8 +193,8 @@ input:focus { border-color: var(--accent); }
 
 .u-msg { align-self: flex-end; max-width: 80%; background: var(--user-bg); border-radius: 18px; padding: 10px 16px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; }
 .u-msg { position: relative; }
-.u-meta { display: flex; justify-content: flex-end; align-items: center; gap: 4px; font-size: 11.5px; color: var(--faint); margin: 2px -6px -4px 0; height: 0; opacity: 0; overflow: hidden; transition: opacity .15s, height .15s; }
-.u-msg:hover .u-meta, .u-msg.pending .u-meta { height: 16px; opacity: 1; }
+/* Time on every bubble, as in Telegram: "when did I ask that?" */
+.u-meta { display: flex; justify-content: flex-end; align-items: center; gap: 4px; font-size: 11.5px; color: var(--faint); margin: 2px -6px -4px 0; height: 16px; overflow: hidden; }
 .u-meta .msg-time { margin: 0; font-size: 11.5px; }
 .u-meta .tick { display: inline-grid; place-items: center; color: var(--accent); }
 .u-meta .tick svg { width: 15px; height: 13px; }
@@ -382,6 +382,8 @@ input:focus { border-color: var(--accent); }
 .send-btn { transition: transform .12s ease, opacity .15s; }
 .send-btn:active:not(:disabled) { transform: scale(.88); }
 .send-btn:disabled { opacity: .4; cursor: default; background: var(--accent); }
+.send-btn.stop, .send-btn.stop:hover { background: var(--text); color: var(--bg); }
+.send-btn.stop svg { width: 14px; height: 14px; }
 .attachments { display: flex; flex-wrap: wrap; gap: 8px; }
 .attachments:not(:empty) { margin-bottom: 10px; }
 .att-card { position: relative; display: flex; align-items: center; gap: 8px; border: .5px solid var(--border-strong); border-radius: 10px; padding: 6px 28px 6px 8px; max-width: 220px; background: var(--raised); font-size: 12.5px; }
@@ -522,11 +524,10 @@ input:focus { border-color: var(--accent); }
 .pk-empty { padding: 12px 8px; font-size: 13px; }
 .picker-check { display: flex; gap: 8px; align-items: center; font-size: 13.5px; margin-bottom: 10px; }
 .picker-check input { width: auto; }
-.u-msg.latest .u-meta { height: 16px; opacity: 1; }
 .u-status { margin-right: 4px; }
-.u-msg[data-status="sending"] .u-status, .u-msg[data-status="sent"] .u-status { color: var(--faint); }
+.u-msg[data-status="sending"] .u-status, .u-msg[data-status="sent"] .u-status, .u-msg[data-status="queued"] .u-status { color: var(--faint); }
 .u-msg[data-status="working"] .u-status { color: var(--accent); }
-.u-msg[data-status="sent"] .tick { color: var(--faint); }
+.u-msg[data-status="sent"] .tick, .u-msg[data-status="queued"] .tick { color: var(--faint); }
 
 /* ── motion ── */
 @keyframes fade-in { from { opacity: 0; } }

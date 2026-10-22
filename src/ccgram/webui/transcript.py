@@ -247,10 +247,39 @@ def _parse_assistant(content: Any, ts: Any, uuid: str) -> list[dict[str, Any]]:
     return items
 
 
+def _parse_queued(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """A message typed while a turn runs: Claude Code queues it and hands it
+    to the model at the next step, recorded as a ``queued_command``
+    attachment (written then; its timestamp is when it was sent) instead of
+    a ``user`` entry."""
+    att = entry.get("attachment")
+    if not isinstance(att, dict) or att.get("type") != "queued_command":
+        return []
+    human = (att.get("origin") or {}).get("kind") == "human"
+    if (att.get("commandMode") or ("prompt" if human else "")) != "prompt":
+        return []  # background task notifications and the like
+    prompt = att.get("prompt")
+    if isinstance(prompt, list):
+        prompt = "\n".join(
+            b.get("text", "")
+            for b in prompt
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    if not isinstance(prompt, str) or not prompt.strip() or _PLUMBING.match(prompt):
+        return []
+    text = _PASTED.sub("\n", prompt).strip("\n")
+    ts, uuid = entry.get("timestamp"), entry.get("uuid", "")
+    return [{"kind": "user", "text": text, "ts": ts, "uuid": uuid, "queued": True}]
+
+
 def parse_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
     """Turn one JSONL entry into zero or more UI items."""
     kind = entry.get("type")
-    if kind not in ("user", "assistant") or entry.get("isSidechain"):
+    if entry.get("isSidechain"):
+        return []
+    if kind == "attachment":
+        return _parse_queued(entry)
+    if kind not in ("user", "assistant"):
         return []
     message = entry.get("message") or {}
     content, ts, uuid = (

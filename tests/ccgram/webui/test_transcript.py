@@ -110,6 +110,29 @@ def test_paste_wrappers_are_not_shown():
     assert item["text"] == "смотри\nДело:\n> текст\nчто это?"
 
 
+def test_message_typed_mid_turn_shows_where_the_model_got_it():
+    def queued(prompt, mode, kind):
+        return {
+            "type": "attachment",
+            "uuid": "q1",
+            "timestamp": "2026-10-22T23:41:48.241Z",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": prompt,
+                "commandMode": mode,
+                "origin": {"kind": kind},
+            },
+        }
+
+    (item,) = transcript.parse_entry(queued("а если один вопрос?", "prompt", "human"))
+    assert item["kind"] == "user" and item["text"] == "а если один вопрос?"
+    assert item["queued"] and item["ts"] == "2026-10-22T23:41:48.241Z"
+    note = "<task-notification>\n<task-id>x</task-id>\n</task-notification>"
+    assert transcript.parse_entry(queued(note, "task-notification", "task")) == []
+    other = {"type": "attachment", "attachment": {"type": "hook_success"}}
+    assert transcript.parse_entry(other) == []
+
+
 def test_after_returns_late_result_standalone(tmp_path):
     p = tmp_path / "t.jsonl"
     call = _assistant(
