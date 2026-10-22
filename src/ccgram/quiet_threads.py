@@ -18,6 +18,10 @@ from typing import Any
 
 _quiet: set[tuple[int, int]] = set()
 _modes: dict[int, str] = {}  # thread id → "on" | "off"; absent = "auto"
+# Global "Telegram silent" switch from the web UI. Deliberately separate from
+# the per-topic modes: flipping it back on restores every topic's own mode,
+# so a topic muted on its own stays muted.
+_all_muted = False
 MODES = ("auto", "on", "off")
 
 
@@ -60,10 +64,21 @@ def load_modes(modes: dict[int, str]) -> None:
         set_mode(tid, m)
 
 
+def set_all_muted(on: bool) -> None:
+    global _all_muted
+    _all_muted = bool(on)
+
+
+def all_muted() -> bool:
+    return _all_muted
+
+
 def is_quiet(chat_id: Any, thread_id: Any) -> bool:
     key = _key(chat_id, thread_id)
     if key is None:
         return False
+    if _all_muted:
+        return True
     explicit = _modes.get(key[1])
     if explicit is not None:
         return explicit == "off"
@@ -78,5 +93,7 @@ def apply(chat_id: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def reset_for_testing() -> None:
+    global _all_muted
     _quiet.clear()
     _modes.clear()
+    _all_muted = False

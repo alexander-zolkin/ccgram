@@ -127,7 +127,13 @@ def _send_all(payload: dict[str, Any]) -> None:
     # Lazy: pywebpush pulls requests + cryptography.
     from pywebpush import WebPushException, webpush
 
+    # Lazy: py_vapid comes with pywebpush.
+    from py_vapid import Vapid02
+
     private_pem, _ = _keys()
+    # webpush() takes a Vapid object, a file path or base64 DER — not PEM text.
+    # Vapid02 signs as "vapid t=…,k=…" (RFC 8292), which Apple's push requires.
+    vapid = Vapid02.from_pem(private_pem.encode())
     gone: list[str] = []
     data = json.dumps(payload, ensure_ascii=False)
     for sub in list(_load()["subscriptions"]):
@@ -135,7 +141,7 @@ def _send_all(payload: dict[str, Any]) -> None:
             webpush(
                 subscription_info=sub,
                 data=data,
-                vapid_private_key=private_pem,
+                vapid_private_key=vapid,
                 vapid_claims={"sub": _SUBJECT},
                 ttl=_TTL_S,
                 timeout=10,

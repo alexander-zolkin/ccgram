@@ -62,6 +62,15 @@ def set_sound_mode(session_id: int, mode: str) -> None:
     _save()
 
 
+def tg_muted() -> bool:
+    return bool(_load().get("tg_muted", False))
+
+
+def set_tg_muted(on: bool) -> None:
+    _load()["tg_muted"] = bool(on)
+    _save()
+
+
 def reset_for_testing() -> None:
     global _prefs
     _prefs = None

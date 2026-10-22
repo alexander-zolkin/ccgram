@@ -882,6 +882,7 @@ function setTitle(base) {
 function soundInfo(s) {
   const mode = s.sound || "auto";
   if (s.web_only) return mode === "off" ? { icon: SVG.bellOff, title: "Уведомления выключены" } : { icon: SVG.bell, title: "Уведомления включены" };
+  if (state.tgMuted && mode !== "off") return { icon: SVG.bellOff, title: "Telegram заглушён целиком (меню профиля). Режим чата вернётся, когда включишь" };
   if (mode === "on") return { icon: SVG.bellRing, title: "Telegram: всегда со звуком" };
   if (mode === "off") return { icon: SVG.bellOff, title: "Без звука — ни в Telegram, ни в браузере" };
   return { icon: SVG.bellAuto, title: s.quiet_now ? "Авто: сейчас тихо — ты пишешь из веба" : "Авто: со звуком" };
@@ -891,12 +892,12 @@ function renderSoundBtn(s) {
   const b = $("sound-btn");
   b.hidden = s.sound === undefined; // backend without sound modes
   const info = soundInfo(s);
-  if (b.dataset.mode !== `${s.sound}|${s.quiet_now}|${s.web_only}`) {
-    b.dataset.mode = `${s.sound}|${s.quiet_now}|${s.web_only}`;
+  if (b.dataset.mode !== `${s.sound}|${s.quiet_now}|${s.web_only}|${state.tgMuted}`) {
+    b.dataset.mode = `${s.sound}|${s.quiet_now}|${s.web_only}|${state.tgMuted}`;
     b.innerHTML = info.icon;
   }
   b.title = info.title;
-  b.classList.toggle("muted-bell", s.sound === "off");
+  b.classList.toggle("muted-bell", s.sound === "off" || (state.tgMuted && !s.web_only));
 }
 
 async function setSound(s, mode) {
@@ -919,7 +920,7 @@ function soundMenu(s) {
     ];
   }
   return [
-    { heading: "Уведомления этого чата" },
+    { heading: state.tgMuted ? "Этот чат · сейчас весь Telegram без звука" : "Уведомления этого чата" },
     { label: "Авто", sub: "Тихо в Telegram, пока пишешь отсюда", icon: SVG.bellAuto, check: mode === "auto", action: () => setSound(s, "auto") },
     { label: "Всегда со звуком", sub: "Telegram звенит на каждый ответ", icon: SVG.bellRing, check: mode === "on", action: () => setSound(s, "on") },
     { label: "Без звука", sub: "Ни Telegram, ни браузер не беспокоят", icon: SVG.bellOff, check: mode === "off", action: () => setSound(s, "off") },
@@ -1262,6 +1263,14 @@ function profileMenu() {
     { label: "Тёмная", icon: SVG.sun, check: theme === "dark", action: () => setTheme("dark") },
     "sep",
   ];
+  items.push({ heading: "Уведомления" });
+  items.push({
+    label: "Telegram",
+    sub: state.tgMuted ? "Все топики без звука · настройки чатов сохранены" : "Звук по настройкам каждого чата",
+    icon: state.tgMuted ? SVG.bellOff : SVG.tg,
+    check: !state.tgMuted,
+    action: () => setTgMuted(!state.tgMuted),
+  });
   if (pushSupported()) {
     items.push(state.pushOn
       ? { label: "Уведомления включены", sub: "Нажми, чтобы выключить на этом устройстве", icon: SVG.bell, check: true, action: disablePush }
@@ -1269,6 +1278,15 @@ function profileMenu() {
   }
   items.push({ label: "Выйти", icon: SVG.out, action: async () => { await api("/api/logout", { body: {} }).catch(() => {}); showLogin(); } });
   return items;
+}
+
+async function setTgMuted(on) {
+  try {
+    state.tgMuted = (await api("/api/settings", { body: { tg_muted: on } })).tg_muted;
+    toast(on ? "Telegram замолчал целиком — заглушённые чаты так и останутся заглушёнными" : "Telegram снова звенит — по настройкам каждого чата");
+    const s = currentSession();
+    if (s) renderSoundBtn(s);
+  } catch (e) { toast(e.message); }
 }
 
 // ═══ web push ════════════════════════════════════════════════════════════════
@@ -1345,6 +1363,7 @@ async function boot() {
   route();
   reportPresence();
   refreshPushState();
+  api("/api/settings").then((r) => { state.tgMuted = r.tg_muted; const s = currentSession(); if (s) renderSoundBtn(s); }).catch(() => {});
 }
 
 $("login-form").onsubmit = async (ev) => {

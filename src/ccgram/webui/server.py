@@ -20,6 +20,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``GET  /api/sessions/{tid}/file?path=`` an upload of the session (.ccgram-uploads only)
 - ``GET  /api/search?q=``                  full-text search over all transcripts
 - ``GET  /api/push/key``, ``POST /api/push/(un)subscribe``  Web Push devices
+- ``GET/POST /api/settings``               {tg_muted}: silence every Telegram topic
 - ``POST /api/presence``                   "this tab is visible" (mutes push)
 - ``POST /api/sessions/{tid}/detach``     delete the topic, keep the session
 - ``POST /api/sessions/{tid}/keep``       keep a session whose topic was deleted
@@ -306,6 +307,19 @@ async def _pin(request: web.Request) -> web.Response:
     )
 
 
+async def _settings(request: web.Request) -> web.Response:
+    # Lazy: leaf modules.
+    from .. import quiet_threads
+    from .prefs import set_tg_muted
+
+    if request.method == "POST":
+        body = await _json_body(request)
+        if "tg_muted" in body:
+            quiet_threads.set_all_muted(bool(body["tg_muted"]))
+            set_tg_muted(bool(body["tg_muted"]))
+    return web.json_response({"tg_muted": quiet_threads.all_muted()})
+
+
 async def _push_key(_request: web.Request) -> web.Response:
     return web.json_response({"key": push.public_key()})
 
@@ -466,6 +480,8 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/sound", _sound)
     r.add_get("/api/sessions/{tid}/file", _file)
     r.add_get("/api/search", _search)
+    r.add_get("/api/settings", _settings)
+    r.add_post("/api/settings", _settings)
     r.add_get("/api/push/key", _push_key)
     r.add_post("/api/push/subscribe", _push_subscribe)
     r.add_post("/api/push/unsubscribe", _push_unsubscribe)
@@ -500,9 +516,10 @@ async def start_webui(bot: Bot | Any) -> None:
     try:
         # Lazy: leaf modules, only needed once the UI is actually enabled.
         from .. import quiet_threads
-        from .prefs import sound_modes
+        from .prefs import sound_modes, tg_muted
 
         quiet_threads.load_modes(sound_modes())
+        quiet_threads.set_all_muted(tg_muted())
         app = build_app(
             bot=bot,
             bot_token=config.telegram_bot_token,

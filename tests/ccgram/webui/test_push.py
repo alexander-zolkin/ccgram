@@ -85,3 +85,47 @@ async def test_notify_reply_skips_when_watched_or_unsubscribed(monkeypatch):
 
     await asyncio.sleep(0.05)
     assert calls == [{"title": "Чат", "body": "long reply", "tag": "t5", "url": "/#5"}]
+
+
+def test_send_all_signs_with_the_stored_key(monkeypatch):
+    """Real VAPID signing path (only the HTTP post is faked)."""
+    import pywebpush
+
+    posted = []
+
+    class Resp:
+        status_code = 201
+        text = ""
+        headers: dict = {}
+
+    def fake_post(url, data=None, headers=None, timeout=None, **kw):
+        posted.append((url, headers))
+        return Resp()
+
+    # A real p256dh/auth pair so the payload encryption runs for real.
+    import base64
+    import os as _os
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    pub = (
+        ec.generate_private_key(ec.SECP256R1())
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+        )
+    )
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()  # noqa: E731
+    push.subscribe(
+        {
+            "endpoint": "https://push.example/x",
+            "keys": {"p256dh": b64(pub), "auth": b64(_os.urandom(16))},
+        }
+    )
+    monkeypatch.setattr(pywebpush.requests, "post", fake_post)
+    push._send_all({"title": "Кара", "body": "hi"})
+    ((url, headers),) = posted
+    assert url == "https://push.example/x"
+    assert headers["content-encoding"] == "aes128gcm"
+    assert headers["authorization"].startswith("vapid t=")

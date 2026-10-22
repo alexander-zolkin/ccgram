@@ -73,3 +73,19 @@ def test_sound_modes_persist(tmp_path, monkeypatch):
     prefs.reset_for_testing()
     assert prefs.sound_modes() == {5: "off"}
     prefs.reset_for_testing()
+
+
+def test_global_mute_keeps_topic_modes():
+    quiet_threads.reset_for_testing()
+    kw = {"message_thread_id": 7}
+    quiet_threads.set_mode(9, "off")  # a topic muted on its own
+    quiet_threads.set_mode(7, "on")
+    quiet_threads.set_all_muted(True)
+    assert quiet_threads.apply(-100, dict(kw))["disable_notification"] is True
+    assert quiet_threads.mode(7) == "on" and quiet_threads.mode(9) == "off"
+    quiet_threads.set_all_muted(False)
+    assert "disable_notification" not in quiet_threads.apply(-100, dict(kw))
+    # the separately muted topic is still muted after un-muting everything
+    assert quiet_threads.apply(-100, {"message_thread_id": 9})["disable_notification"]
+    quiet_threads.reset_for_testing()
+    assert not quiet_threads.all_muted()
