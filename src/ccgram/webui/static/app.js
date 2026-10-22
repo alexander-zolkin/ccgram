@@ -482,6 +482,20 @@ function summaryNode(it) {
   return n;
 }
 
+// "Baked for 19s" in Claude Code: how long a finished turn took, what it wrote.
+const secsRu = (sec) => (sec < 60 ? `${sec} с` : sec < 3600 ? `${Math.floor(sec / 60)} мин${sec % 60 ? ` ${sec % 60} с` : ""}` : `${Math.floor(sec / 3600)} ч ${Math.floor((sec % 3600) / 60)} мин`);
+const clock = (sec) => { const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = String(sec % 60).padStart(2, "0"); return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
+const tokRu = (n) => (n < 1000 ? String(Math.round(n)) : n < 1e4 ? `${(n / 1000).toFixed(1).replace(".", ",")}k` : n < 1e6 ? `${Math.round(n / 1000)}k` : `${(n / 1e6).toFixed(1).replace(".", ",")}M`);
+
+function turnNode(it) {
+  const sec = Math.max(1, Math.round((it.ms || 0) / 1000));
+  const n = el("div", "turn-stat");
+  const out = it.out ? ` · ${tokRu(it.out)} токенов` : "";
+  n.innerHTML = `<span class="spark-end"></span><span>${esc(secsRu(sec) + out)}</span>`;
+  n.dataset.tip = `Ход занял ${secsRu(sec)}` + (it.out ? `; модель написала ${it.out.toLocaleString("ru-RU")} токенов (с размышлениями)` : "");
+  return n;
+}
+
 function itemKey(it) {
   if (it.kind === "tool") return "t:" + it.id;
   if (it.kind === "tool_result") return null;
@@ -526,7 +540,7 @@ function buildBlocks(items, continueFrom, live = false) {
       if (host && !host._filled) { host._fill(it); host._filled = true; continue; }
     }
     steps = null;
-    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode }[it.kind]?.(it) || assistantNode(it);
+    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode, turn: turnNode }[it.kind]?.(it) || assistantNode(it);
     // The transcript copy replaces the pending bubble in place: no re-entry.
     if ((it.kind === "user" || it.kind === "bash" || it.kind === "command") && clearPending()) node.classList.add("swap");
     frag.appendChild(node);
@@ -1852,18 +1866,56 @@ async function probeTopic(tid) {
 
 // ═══ live status: what the agent is doing right now ═════════════════════════
 const STATUS_RU = [[/^(reading|read)\b/i, "Читает"], [/^(writing|write)\b/i, "Пишет"], [/^(editing|edit)\b/i, "Правит"], [/^(searching|search|grep)/i, "Ищет"], [/^(running|bash|execut)/i, "Выполняет"], [/^(thinking|reason)/i, "Думает"], [/^(testing|test)/i, "Тестирует"], [/^fetch/i, "Загружает"]];
-function statusLabel(raw) {
-  const text = String(raw || "").replace(/\s*\(([^)]*)\)\s*$/, (m, inner) => (/\d/.test(inner) ? ` · ${inner.replace(/esc to interrupt/i, "").replace(/[·,]\s*$/, "").trim()}` : m)).trim();
-  for (const [re, ru] of STATUS_RU) if (re.test(text)) return `${ru}: ${text}`;
-  return text;
+const STATUS_PART_RU = { thinking: "думает", "still thinking": "всё ещё думает", "thinking more": "думает дальше" };
+// "Pondering… (1m 3s · ↓ 2.1k tokens · thinking)" → label + Claude Code's own turn clock and token count.
+function parseStatus(raw) {
+  let text = String(raw || "").trim();
+  let secs = null, tokens = null;
+  const paren = text.match(/\s*\(([^)]*)\)\s*$/);
+  if (paren) {
+    const rest = [];
+    for (const part of paren[1].split("·").map((p) => p.trim()).filter(Boolean)) {
+      const t = part.match(/^(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?$/);
+      const k = part.match(/^[↑↓]\s*([\d.,]+)\s*([kKmM]?)\s*tokens?$/);
+      if (t && (t[1] || t[2] || t[3])) secs = (+t[1] || 0) * 3600 + (+t[2] || 0) * 60 + (+t[3] || 0);
+      else if (k) tokens = parseFloat(k[1].replace(",", ".")) * ({ k: 1e3, m: 1e6 }[k[2].toLowerCase()] || 1);
+      else if (!/esc to interrupt|ctrl\+/i.test(part)) rest.push(STATUS_PART_RU[part.toLowerCase()] || part);
+    }
+    text = text.slice(0, paren.index) + (rest.length ? ` · ${rest.join(" · ")}` : "");
+  }
+  for (const [re, ru] of STATUS_RU) if (re.test(text)) { text = `${ru}: ${text}`; break; }
+  return { text, secs, tokens };
 }
+
+// The working line's clock ticks locally between polls.
+function turnClock(live, status) {
+  const prev = state.turnClock && state.turnClock.tid === state.current ? state.turnClock : null;
+  const turn = live.turn || {};
+  const skew = turn.now ? Date.now() - turn.now * 1000 : 0;
+  let start = turn.start ? Date.parse(turn.start) + skew : NaN;
+  if (Number.isNaN(start)) start = status.secs != null ? Date.now() - status.secs * 1000 : prev ? prev.start : Date.now();
+  state.turnClock = { tid: state.current, start, out: Math.max(turn.out || 0, status.tokens || 0) };
+  tickWork();
+}
+function tickWork() {
+  const meta = $("working-meta");
+  const c = state.turnClock;
+  if (!c || c.tid !== state.current || $("working").hidden) { meta.hidden = true; return; }
+  const sec = Math.max(0, Math.round((Date.now() - c.start) / 1000));
+  meta.hidden = false;
+  meta.textContent = clock(sec) + (c.out ? ` · ${tokRu(c.out)} ток.` : "");
+  meta.dataset.tip = `Ход идёт ${secsRu(sec)}` + (c.out ? `; написано ${Math.round(c.out).toLocaleString("ru-RU")} токенов` : "");
+}
+setInterval(tickWork, 1000);
 
 function renderLive(live, s) {
   const box = $("live");
   const working = s && s.state === "active";
-  if (!live || !working) { box.hidden = true; if (working) $("working-text").textContent = "Кара работает…"; refreshMsgStatus(); return; }
-  if (live.status) $("working-text").textContent = statusLabel(live.status);
-  else $("working-text").textContent = live.wait || "Кара работает…";
+  if (!working) state.turnClock = null;
+  if (!live || !working) { box.hidden = true; if (working) $("working-text").textContent = "Кара работает…"; tickWork(); refreshMsgStatus(); return; }
+  const status = parseStatus(live.status);
+  $("working-text").textContent = status.text || live.wait || "Кара работает…";
+  turnClock(live, status);
   const agents = live.subagents || [];
   $("live-agents").innerHTML = agents.length
     ? `<span class="la-ico">${ICONS.bot}</span><span>${agents.length === 1 ? "Субагент" : `Субагентов: ${agents.length}`} — ${agents.map((a) => `<b>${esc(a)}</b>`).join(", ")}</span>`

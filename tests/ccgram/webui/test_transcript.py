@@ -220,3 +220,68 @@ def test_last_usage_and_search(tmp_path):
     assert [h["role"] for h in hits] == ["user", "assistant"]
     assert transcript.search(p, "нет такого") == []
     assert transcript.last_usage(tmp_path / "missing.jsonl") is None
+
+
+def _usage(blocks, uuid, mid, out):
+    entry = _assistant(blocks, uuid)
+    entry["message"].update(id=mid, usage={"input_tokens": 2, "output_tokens": out})
+    return entry
+
+
+def _turn_end(ms, uuid):
+    return {
+        "type": "system",
+        "subtype": "turn_duration",
+        "durationMs": ms,
+        "uuid": uuid,
+    }
+
+
+def test_turn_stats_sum_tokens_per_message(tmp_path):
+    p = tmp_path / "t.jsonl"
+    _write(
+        p,
+        [
+            _user("первый", "u1"),
+            _usage([{"type": "thinking", "thinking": ""}], "a1", "m1", 300),
+            _usage([{"type": "text", "text": "ответ"}], "a2", "m1", 300),
+            _tool_result("T1", "ok", "r1"),
+            _usage([{"type": "text", "text": "ещё"}], "a3", "m2", 50),
+            _turn_end(19583, "d1"),
+            _user("второй", "u2"),
+            _usage([{"type": "text", "text": "коротко"}], "a4", "m3", 7),
+            _turn_end(1200, "d2"),
+        ],
+    )
+    turns = [it for it in transcript.read_tail(p, 50)["items"] if it["kind"] == "turn"]
+    assert [(t["ms"], t["out"]) for t in turns] == [(19583, 350), (1200, 7)]
+
+
+def test_turn_end_in_a_later_poll_reads_back(tmp_path):
+    p = tmp_path / "t.jsonl"
+    head = [
+        _user("привет", "u1"),
+        _usage([{"type": "text", "text": "a"}], "a1", "m1", 120),
+    ]
+    _write(p, head)
+    first = transcript.read_after(p, 0)
+    assert transcript.current_turn(p)["out"] == 120
+    assert transcript.current_turn(p)["start"] is None  # no timestamp in fixture
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(_line(_usage([{"type": "text", "text": "b"}], "a2", "m2", 30)))
+        fh.write(_line(_turn_end(5000, "d1")))
+    later = transcript.read_after(p, first["end"])
+    (turn,) = [it for it in later["items"] if it["kind"] == "turn"]
+    assert turn["out"] == 150
+    assert transcript.current_turn(p) == {"start": None, "out": 0}
+
+
+def test_current_turn_reports_prompt_time(tmp_path):
+    p = tmp_path / "t.jsonl"
+    prompt = _user("сделай", "u1")
+    prompt["timestamp"] = "2026-10-22T18:44:00.658Z"
+    _write(p, [_turn_end(10, "d0"), prompt, _usage([], "a1", "m1", 42)])
+    assert transcript.current_turn(p) == {
+        "start": "2026-10-22T18:44:00.658Z",
+        "out": 42,
+    }

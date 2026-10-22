@@ -258,6 +258,98 @@ def parse_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
     return _parse_assistant(content, ts, uuid)
 
 
+# ── turn stats ───────────────────────────────────────────────────────────────
+# Claude Code closes every turn with a ``system``/``turn_duration`` entry. The
+# tokens a turn produced are summed per API message id: each content block of
+# one message is its own entry and repeats that message's usage.
+
+TURN_BACK = 4 * 1024 * 1024
+_PROMPT_KINDS = ("user", "bash", "command")
+
+
+class _Turn:
+    def __init__(self, complete: bool = False, start: Any = None) -> None:
+        self.out: dict[str, int] = {}
+        self.complete = complete  # the turn's beginning was seen
+        self.start = start  # timestamp of the prompt that began it
+
+    def add(self, entry: dict[str, Any]) -> None:
+        msg = entry.get("message")
+        if entry.get("type") != "assistant" or entry.get("isSidechain"):
+            return
+        if not isinstance(msg, dict):
+            return
+        usage = msg.get("usage")
+        if usage:
+            mid = msg.get("id") or entry.get("uuid", "")
+            self.out[mid] = max(
+                self.out.get(mid, 0), int(usage.get("output_tokens") or 0)
+            )
+
+    def merge(self, older: _Turn) -> None:
+        for mid, n in older.out.items():
+            self.out[mid] = max(self.out.get(mid, 0), n)
+        self.complete, self.start = older.complete, older.start
+
+    @property
+    def tokens(self) -> int:
+        return sum(self.out.values())
+
+
+def _turn_end(entry: dict[str, Any]) -> bool:
+    return entry.get("type") == "system" and entry.get("subtype") == "turn_duration"
+
+
+def _is_prompt(entry: dict[str, Any], items: list[dict[str, Any]]) -> bool:
+    return entry.get("type") == "user" and any(
+        it["kind"] in _PROMPT_KINDS for it in items
+    )
+
+
+def _turn_back(path: Path, offset: int) -> _Turn:
+    """The part of the turn that lies before byte ``offset``, read backwards."""
+    turn = _Turn()
+    try:
+        fh = path.open("rb")
+    except OSError:
+        return turn
+    with fh:
+        carry = b""
+        pos = offset
+        while pos > 0 and offset - pos < TURN_BACK:
+            new = max(0, pos - CHUNK)
+            fh.seek(new)
+            lines = (fh.read(pos - new) + carry).split(b"\n")
+            pos = new
+            carry = lines.pop(0) if new > 0 else b""
+            for raw in reversed(lines):
+                # Most lines are tool output: skip them without parsing.
+                if not (
+                    b'"usage"' in raw or b'"user"' in raw or b"turn_duration" in raw
+                ):
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if _turn_end(entry):
+                    turn.complete = True
+                    return turn
+                if _is_prompt(entry, parse_entry(entry)):
+                    turn.complete, turn.start = True, entry.get("timestamp")
+                    return turn
+                turn.add(entry)
+    return turn
+
+
+def current_turn(path: Path) -> dict[str, Any]:
+    """The turn in progress: when its prompt was sent, tokens produced so far."""
+    turn = _turn_back(path, file_size(path))
+    return {"start": turn.start, "out": turn.tokens}
+
+
 def _merge_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fold tool_result items into their tool call when both are present."""
     calls = {it["id"]: it for it in items if it["kind"] == "tool" and it.get("id")}
@@ -270,15 +362,42 @@ def _merge_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _parse_lines(lines: list[bytes]) -> list[dict[str, Any]]:
+def _parse_lines(
+    lines: list[bytes], path: Path | None = None, offset: int = 0
+) -> list[dict[str, Any]]:
+    """UI items of ``lines``, which start at byte ``offset`` of ``path``.
+
+    A turn that began before ``offset`` gets its earlier tokens from a
+    backwards read, so a poll that only sees ``turn_duration`` still has them.
+    """
     items: list[dict[str, Any]] = []
+    turn = _Turn()
     for raw in lines:
         try:
             entry = json.loads(raw)
         except ValueError:
             continue
-        if isinstance(entry, dict):
-            items.extend(parse_entry(entry))
+        if not isinstance(entry, dict):
+            continue
+        if _turn_end(entry):
+            if not turn.complete and path is not None:
+                turn.merge(_turn_back(path, offset))
+            items.append(
+                {
+                    "kind": "turn",
+                    "ms": int(entry.get("durationMs") or 0),
+                    "out": turn.tokens if turn.complete else None,
+                    "ts": entry.get("timestamp"),
+                    "uuid": entry.get("uuid", ""),
+                }
+            )
+            turn = _Turn(complete=True)
+            continue
+        parsed = parse_entry(entry)
+        if _is_prompt(entry, parsed):
+            turn = _Turn(complete=True, start=entry.get("timestamp"))
+        turn.add(entry)
+        items.extend(parsed)
     return items
 
 
@@ -294,7 +413,7 @@ def read_after(path: Path, after: int) -> dict[str, Any]:
     if cut < 0:
         return {"items": [], "end": after}
     complete = data[: cut + 1]
-    items = _merge_results(_parse_lines(complete.splitlines()))
+    items = _merge_results(_parse_lines(complete.splitlines(), path, after))
     return {"items": items, "end": after + len(complete)}
 
 
@@ -332,7 +451,7 @@ def read_tail(path: Path, limit: int, before: int | None = None) -> dict[str, An
                 carry, body, start = data[: nl + 1], data[nl + 1 :], new + nl + 1
             else:
                 carry, body, start = b"", data, 0
-            items = _parse_lines(body.splitlines()) + items
+            items = _parse_lines(body.splitlines(), path, start) + items
     merged = _merge_results(items)
     return {"items": merged[-limit:] if limit else merged, "start": start, "end": end}
 

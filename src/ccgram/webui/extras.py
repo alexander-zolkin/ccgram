@@ -189,10 +189,15 @@ async def live(thread_id: int) -> dict[str, Any]:
     # Lazy: polling + task state pull the handler graph.
     from ..claude_task_state import claude_task_state, get_subagent_names
     from ..handlers.polling.polling_state import terminal_poll_state
-    from .service import find_binding
+    from . import transcript
+    from .service import _transcript_for, find_binding
 
     binding = find_binding(thread_id)
     wid = binding.window_id
+    tx, _provider = _transcript_for(binding)
+    turn = await asyncio.to_thread(transcript.current_turn, tx) if tx else None
+    if turn:
+        turn["now"] = time.time()  # the browser's clock may be off
     status = progress = None
     ws = terminal_poll_state.peek_state(wid)
     result = ws.last_pyte_result if ws else None
@@ -213,6 +218,7 @@ async def live(thread_id: int) -> dict[str, Any]:
         "subagents": list(get_subagent_names(wid)),
         "todos": todos,
         "wait": claude_task_state.get_wait_header(wid),
+        "turn": turn,
     }
 
 

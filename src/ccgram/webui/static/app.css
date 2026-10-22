@@ -286,6 +286,9 @@ input:focus { border-color: var(--accent); }
 @keyframes shimmer { to { background-position: -200% 0; } }
 .spark, .spark-end { display: inline-block; background: var(--accent); -webkit-mask: url("/static/spark.svg") center / contain no-repeat; mask: url("/static/spark.svg") center / contain no-repeat; }
 .spark { width: 16px; height: 16px; animation: spin 2.4s linear infinite; }
+.w-meta { flex: none; font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+.turn-stat { display: flex; align-items: center; gap: 6px; width: fit-content; font-size: 12px; color: var(--faint); margin: -6px 2px 18px; font-variant-numeric: tabular-nums; }
+.turn-stat .spark-end { width: 12px; height: 12px; margin: 0; opacity: .7; }
 .gone-card { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; border: .5px solid var(--border-strong); background: var(--raised); border-radius: 14px; padding: 9px 12px; margin-bottom: 10px; font-size: 14px; }
 .gone-card > span:first-child { flex: 1; min-width: 200px; }
 .gone-actions { display: flex; gap: 6px; }
