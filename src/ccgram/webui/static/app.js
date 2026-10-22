@@ -941,6 +941,8 @@ async function deleteSession(s) {
 async function refreshSessions() {
   state.sessions = (await api("/api/sessions")).sessions;
   renderSessions();
+  // "Мои дела" links items to chats by id: names and states come from here.
+  if (state.current == null && state.hubData?.pending && $("hub-pending")) renderPending(state.hubData.pending);
 }
 
 function renderHeader() {
@@ -2550,6 +2552,8 @@ const HUB_ICON = {
   happened: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg>',
   usage: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
   diary: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h11a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6z"/><path d="M6 3v18M10 8h5M10 12h5"/></svg>',
+  start: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5.5v13l10.5-6.5z"/></svg>',
+  chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5a7.5 7.5 0 0 1-11 6.6L4 19.5l1.4-4.6A7.5 7.5 0 1 1 20 11.5z"/></svg>',
   later: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="13" r="7.5"/><path d="M12 9.5V13l2.5 1.5M5 4L2.5 6.5M19 4l2.5 2.5"/></svg>',
 };
 
@@ -2839,13 +2843,21 @@ function renderPending(p) {
     ${items.length ? `<ul class="pend-list">${items.map((it) => {
       const [, m, d] = it.date.split("-");
       const cls = it.days < 0 ? "late" : it.days === 0 ? "today" : "";
+      const chat = it.chat != null && sessionById(it.chat);
+      const go = chat
+        ? `<button type="button" class="icon-btn small" data-act="open" data-tip="Открыть чат по этому делу">${HUB_ICON.chat}</button>`
+        : `<button type="button" class="icon-btn small" data-act="start" data-tip="Взяться — новый чат с контекстом дела">${HUB_ICON.start}</button>`;
       return `<li class="pend ${cls}" data-id="${it.id}"><span class="pdate"><b>${d}.${m}</b><span>${dueRu(it.days)}</span></span>
-        <span class="ptext">${inlineMd(it.text)}</span>
-        <span class="pacts"><button type="button" class="icon-btn small" data-act="done" data-tip="Сделано — убрать в архив">${HUB_ICON.done}</button><button type="button" class="icon-btn small" data-act="later" data-tip="Отложить">${HUB_ICON.later}</button></span></li>`;
+        <span class="pbody"><span class="ptext">${inlineMd(it.text)}</span>${chat ? `<a class="hub-chip pchat" href="#${chat.thread_id}"><span class="dot ${esc(chat.state)}"></span>${esc(chat.name)}${STATE_LABEL[chat.state] ? `<span class="muted">· ${esc(STATE_LABEL[chat.state])}</span>` : ""}</a>` : ""}</span>
+        <span class="pacts">${go}<button type="button" class="icon-btn small" data-act="done" data-tip="Сделано — убрать в архив">${HUB_ICON.done}</button><button type="button" class="icon-btn small" data-act="later" data-tip="Отложить">${HUB_ICON.later}</button></span></li>`;
     }).join("")}</ul>` : '<div class="hub-empty">Обещанных дел нет — всё закрыто.</div>'}`;
   card.querySelectorAll(".ptext").forEach((t) => { t.onclick = (ev) => { if (!ev.target.closest("a")) t.classList.toggle("open"); }; });
   card.querySelectorAll(".pend").forEach((row) => {
     const it = items.find((x) => x.id === row.dataset.id);
+    const start = row.querySelector('[data-act="start"]');
+    if (start) start.onclick = () => startPending(it, start);
+    const open = row.querySelector('[data-act="open"]');
+    if (open) open.onclick = () => { location.hash = `#${it.chat}`; };
     row.querySelector('[data-act="done"]').onclick = () => closePending(it);
     row.querySelector('[data-act="later"]').onclick = (ev) => {
       const btn = ev.currentTarget;
@@ -2863,6 +2875,28 @@ async function closePending(it) {
   const short = it.text.replace(/\s+/g, " ").slice(0, 180);
   if (!(await confirmDialog("Дело сделано?", `${short}${it.text.length > 180 ? "…" : ""}\n\nУберу его в архив закрытых дел.`, "Закрыть", false))) return;
   try { renderPending(keepPending(await api(`/api/hub/pending/${it.id}/close`, { body: {} }))); toast("Закрыто — дело в архиве"); } catch (e) { toast(e.message); loadHub(); }
+}
+
+// A chat for the item, set up like the composer's (Telegram or not, model,
+// effort); the server writes its first message from the item and its memories.
+async function startPending(it, btn) {
+  btn.disabled = true;
+  btn.classList.add("busy");
+  toast(state.telegram ? "Создаю чат и топик…" : "Создаю чат…");
+  try {
+    const c = currentChoice();
+    const effort = c?.provider.id === "claude" && state.effort ? state.effort : undefined;
+    const res = await api(`/api/hub/pending/${it.id}/start`, { body: { web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort } });
+    state.pending.set(res.thread_id, res.text);
+    startInflight(res.thread_id);
+    await refreshSessions();
+    location.hash = `#${res.thread_id}`;
+  } catch (e) {
+    toast(`❌ ${e.message}`);
+    btn.disabled = false;
+    btn.classList.remove("busy");
+    loadHub();
+  }
 }
 
 async function snoozePending(it, days) {

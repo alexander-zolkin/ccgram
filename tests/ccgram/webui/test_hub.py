@@ -74,6 +74,69 @@ def test_snooze_counts_from_today_when_overdue(store):
         hub.snooze_pending(moved[0]["id"], 0)
 
 
+def test_task_brief_links_memories_and_the_chat_survives_a_snooze(store):
+    late, later = hub.pending()["items"]
+    brief = hub.task_brief(late["id"])
+    text = brief["text"]
+    assert "Срок был" in text and "> **overdue** thing [[laptop-ssh]]" in text
+    assert "- `n100/reference_laptop.md` — SSH to the Fedora laptop" in text
+    assert "`pending.md`" in text and "`_archive/pending-done.md`" in text
+    assert "Ссылок на память в пункте нет" in hub.task_brief(later["id"])["text"]
+
+    hub.link_task(brief["key"], 42)
+    assert [it["chat"] for it in hub.pending()["items"]] == [42, None]
+    moved = hub.snooze_pending(late["id"], 30)["items"]
+    assert [it["chat"] for it in moved] == [None, 42]  # same text, same chat
+
+    hub.close_pending(moved[1]["id"])
+    hub.link_task(hub.task_brief(moved[0]["id"])["key"], 43)
+    links = json.loads((store.parent / "hub_tasks.json").read_text(encoding="utf-8"))
+    assert [v["thread_id"] for v in links.values()] == [43]  # closed item dropped
+
+
+def test_task_brief_finds_a_memory_by_file_name_too(store):
+    pending = store / "pending.md"
+    pending.write_text(
+        f"- [ ] {date.today()} — STT [[project-stt]] and [[nope]]\n", encoding="utf-8"
+    )
+    (item,) = hub.pending()["items"]
+    text = hub.task_brief(item["id"])["text"]
+    assert "Срок — сегодня." in text
+    assert "- `n100/project_stt.md` — local Whisper" in text and "nope`" not in text
+
+
+async def test_start_opens_a_chat_with_the_brief(store, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from ccgram.webui import service
+    from ccgram.webui.server import build_app
+
+    made = []
+
+    async def fake_web_only(text, name, model, provider, effort, cwd, resume_id):
+        made.append((text, provider, effort))
+        return {"thread_id": -5, "window_id": "@9", "name": "веб"}
+
+    monkeypatch.setattr(service, "create_web_only_session", fake_web_only)
+    headers = {"X-CCGram": "1"}
+    app = build_app(bot=object(), bot_token="1:x", password="pw")
+    async with TestClient(TestServer(app)) as c:
+        await c.post("/api/login", json={"password": "pw"}, headers=headers)
+        late = hub.pending()["items"][0]
+        body = {"web_only": True, "provider": "claude", "effort": "high"}
+        resp = await c.post(
+            f"/api/hub/pending/{late['id']}/start", json=body, headers=headers
+        )
+        assert resp.status == 200, await resp.text()
+        got = await resp.json()
+        assert got["thread_id"] == -5 and got["text"] == made[0][0]
+        assert made[0][1:] == ("claude", "high")
+        assert "reference_laptop.md" in made[0][0]
+        assert hub.pending()["items"][0]["chat"] == -5
+        resp = await c.post("/api/hub/pending/nope/start", json=body, headers=headers)
+        assert resp.status == 409 and len(made) == 1
+
+
 def test_memory_search_titles_and_archive_excluded(store):
     hits = hub.memory_search("laptop")["results"]
     assert [h["path"] for h in hits] == [

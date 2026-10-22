@@ -612,6 +612,13 @@ input:focus { border-color: var(--accent); }
 .pdate span { font-size: 11.5px; color: var(--muted); }
 .pend.late .pdate b, .pend.late .pdate span { color: var(--err); }
 .pend.today .pdate b, .pend.today .pdate span { color: var(--accent); }
+.pbody { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.pchat { align-self: flex-start; font-size: 12.5px; padding: 2px 10px 2px 9px; }
+.pchat .dot { flex: none; }
+.pchat .dot:not(.idle):not(.active) { background: var(--faint); }
+.pchat .muted { color: var(--muted); }
+.pacts [data-act="start"]:hover, .pacts [data-act="open"]:hover { color: var(--accent); }
+.icon-btn.busy svg { animation: pulse 1.2s infinite; }
 .ptext { flex: 1; min-width: 0; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
 .ptext.open { display: block; }
 .ptext code { font: 12.5px var(--mono); background: var(--code-bg); padding: 1px 4px; border-radius: 4px; }

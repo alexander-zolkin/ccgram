@@ -36,7 +36,9 @@ paths and hosts live only in that file, never in the repo::
 
 Sections: ``now`` (working chats, today's tokens), ``reach`` (probed every
 five minutes in the background), ``pending`` (close / snooze write the
-markdown back) and ``memory`` (search, today's changes, one file).
+markdown back; «Взяться» opens a chat whose first message is built from the
+item and the memories it links) and ``memory`` (search, today's changes, one
+file).
 """
 
 from __future__ import annotations
@@ -597,18 +599,21 @@ def pending() -> dict[str, Any]:
     except OSError:
         return {"items": []}
     today = date.today()
+    links = _task_links()
     items = []
     for line in lines:
         m = _ITEM.match(line.strip())
         if not m:
             continue
         due = date.fromisoformat(m.group(1))
+        chat = links.get(_task_key(m.group(2))) or {}
         items.append(
             {
                 "id": _item_id(line.strip()),
                 "date": m.group(1),
                 "days": (due - today).days,
                 "text": m.group(2),
+                "chat": chat.get("thread_id"),
             }
         )
     items.sort(key=lambda it: it["date"])
@@ -656,6 +661,115 @@ def snooze_pending(item_id: str, days: int) -> dict[str, Any]:
     lines[idx] = f"{indent}- [ ] {new_date} — {m.group(2)}"
     _write_atomic(path, "\n".join(lines))
     return pending()
+
+
+# ── «Взяться»: a chat that opens with everything the item needs ──────────────
+
+_WIKI = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
+_TYPE_PREFIX = re.compile(r"^(?:user|feedback|project|reference)_")
+TASK_BRIEF = """\
+Берёмся за дело из «Моих дел». {due}
+
+> {text}
+
+{context}
+
+Сначала разберись: прочитай это, поищи связанное в памяти и проверь, как \
+обстоят дела сейчас, — пока только чтение. Потом коротко: как ты понимаешь \
+задачу, что уже сделано и что осталось. Если без моих ответов не начать — \
+задай вопросы; если всё ясно — бери в работу, но рискованное и необратимое \
+только после моего «да». Другие дела из списка здесь не поднимай. Когда \
+закончим, закрой пункт: перенеси его строку из `{pending}` в `{done}` с итогом."""
+
+
+def _tasks_path() -> Path:
+    return _base() / "hub_tasks.json"
+
+
+def _task_key(text: str) -> str:
+    # The text, not the line: a snoozed item keeps its chat.
+    return hashlib.sha1(text.strip().encode()).hexdigest()[:12]
+
+
+def _task_links() -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(_tasks_path().read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def link_task(key: str, thread_id: int) -> None:
+    """Remember the item's chat; links of items no longer open are dropped."""
+    open_keys = {_task_key(it["text"]) for it in pending()["items"]}
+    links = {k: v for k, v in _task_links().items() if k in open_keys}
+    links[key] = {"thread_id": thread_id, "at": time.time()}
+    _write_atomic(_tasks_path(), json.dumps(links, ensure_ascii=False, indent=1))
+
+
+def _shown(path: Path) -> str:
+    home = os.path.expanduser("~")
+    text = str(path)
+    return "~" + text[len(home) :] if text.startswith(home + os.sep) else text
+
+
+def _linked_docs(text: str) -> list[dict[str, Any]]:
+    """Memories behind the item's ``[[name]]`` links (name, file stem or slug)."""
+    names = list(dict.fromkeys(n.strip().lower() for n in _WIKI.findall(text)))
+    if not names:
+        return []
+    by_name: dict[str, dict[str, Any]] = {}
+    for doc in _all_docs(_memory_dir()):
+        stem = Path(doc["path"]).stem.lower()
+        slug = _TYPE_PREFIX.sub("", stem).replace("_", "-")
+        for alias in (doc["_name"].lower(), stem, stem.replace("_", "-"), slug):
+            if alias:
+                by_name.setdefault(alias, doc)
+    found = [by_name[n] for n in names if n in by_name]
+    return list({d["path"]: d for d in found}.values())
+
+
+def _clip(text: str, limit: int = 200) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _due_ru(due: date) -> str:
+    days = (due - date.today()).days
+    when = due.strftime("%d.%m")
+    if days < 0:
+        return f"Срок был {when} — уже прошёл."
+    if days == 0:
+        return "Срок — сегодня."
+    if days == 1:
+        return f"Срок — завтра, {when}."
+    return f"Срок — {when}."
+
+
+def task_brief(item_id: str) -> dict[str, Any]:
+    """The first message of the item's chat and the key that links them."""
+    _path, lines, idx = _take_line(item_id)
+    m = _ITEM.match(lines[idx].strip())
+    assert m is not None  # _take_line only returns matching lines
+    text = m.group(2)
+    conf = config().get("memory") or {}
+    root = _memory_dir()
+    docs = _linked_docs(text)
+    if docs:
+        context = f"Что про это есть в памяти (`{_shown(root)}/`):\n" + "\n".join(
+            f"- `{d['path']}`"
+            + (f" — {_clip(d['description'])}" if d["description"] else "")
+            for d in docs
+        )
+    else:
+        context = f"Ссылок на память в пункте нет — поищи сама (`{_shown(root)}/`)."
+    brief = TASK_BRIEF.format(
+        due=_due_ru(date.fromisoformat(m.group(1))),
+        text=text,
+        context=context,
+        pending=conf.get("pending", "pending.md"),
+        done=conf.get("done", "_archive/pending-done.md"),
+    )
+    return {"text": brief, "key": _task_key(text)}
 
 
 # ── memory: what the assistant knows ─────────────────────────────────────────
@@ -713,6 +827,7 @@ def _doc(root: Path, rel: Path, titles: dict[str, str]) -> dict[str, Any] | None
         "description": _front_field(front, "description"),
         "type": _front_field(front, "type"),
         "mtime": mtime,
+        "_name": _front_field(front, "name"),
         "_meta": "",
         "_body": body.lower(),
     }

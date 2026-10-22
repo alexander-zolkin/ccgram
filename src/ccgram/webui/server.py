@@ -417,7 +417,11 @@ async def _sessions(_request: web.Request) -> web.Response:
 
 
 async def _create(request: web.Request) -> web.Response:
-    body = await _json_body(request)
+    return web.json_response(await _launch(request, await _json_body(request)))
+
+
+async def _launch(request: web.Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Start a session as the new-chat composer asks (``POST /api/sessions``)."""
     name = body.get("name") if isinstance(body.get("name"), str) else None
     model = service.valid_model(body.get("model"))
     provider = service.valid_provider(body.get("provider"))
@@ -439,21 +443,19 @@ async def _create(request: web.Request) -> web.Response:
         resume_id,
     )
     if body.get("web_only"):
-        result = await service.create_web_only_session(
+        return await service.create_web_only_session(
             str(body.get("text", "")), name, model, provider, effort, cwd, resume_id
         )
-    else:
-        result = await service.create_session(
-            request.app[_BOT_KEY],  # type: ignore[arg-type]
-            str(body.get("text", "")),
-            name,
-            model,
-            provider,
-            effort,
-            cwd,
-            resume_id,
-        )
-    return web.json_response(result)
+    return await service.create_session(
+        request.app[_BOT_KEY],  # type: ignore[arg-type]
+        str(body.get("text", "")),
+        name,
+        model,
+        provider,
+        effort,
+        cwd,
+        resume_id,
+    )
 
 
 async def _messages(request: web.Request) -> web.Response:
@@ -578,6 +580,14 @@ async def _hub_pending(request: web.Request) -> web.Response:
     if action == "close":
         return web.json_response(await asyncio.to_thread(hub.close_pending, item))
     body = await _json_body(request)
+    if action == "start":
+        # A chat for the item, set up like the composer's (Telegram or not,
+        # model, effort); its first message carries the item's context.
+        brief = await asyncio.to_thread(hub.task_brief, item)
+        launch = {k: body.get(k) for k in ("web_only", "provider", "model", "effort")}
+        result = await _launch(request, {**launch, "text": brief["text"]})
+        await asyncio.to_thread(hub.link_task, brief["key"], result["thread_id"])
+        return web.json_response({**result, "text": brief["text"]})
     days = body.get("days")
     if action != "snooze" or not isinstance(days, int):
         raise service.WebUIError("unknown action")
