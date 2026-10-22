@@ -163,7 +163,11 @@ async def on_attention(window_id: str, header: str, client: TelegramClient) -> N
 # carries a fingerprint of the exact prompt it was shown for; the key goes
 # in only while that same prompt is still on screen.
 
-ANSWERABLE = ("PermissionPrompt", "ExitPlanMode")
+# Claude Code 2.1's file-write prompt parses as SelectionUI; the question
+# line is what makes any of them a yes/no permission prompt.
+ANSWERABLE = ("PermissionPrompt", "ExitPlanMode", "SelectionUI")
+PROMPT_CONTEXT_LINES = 6
+_QUESTION = re.compile(r"\b(do you want to|would you like to)\b", re.I)
 PROMPT_WAIT_S = 2.0
 _OPTION = re.compile(r"^\s*(?:[❯›>]\s*)?(\d)\.\s+(.+?)\s*$")
 _YES = re.compile(r"^(yes|да)\b", re.I)
@@ -181,15 +185,26 @@ def prompt_options(content: str) -> list[tuple[str, str]]:
 
 
 def prompt_fingerprint(name: str, content: str) -> str:
-    """Stable across repaints: selection markers and spacing don't count."""
+    """The question, its options and what it is about, stable across repaints.
+
+    Selection markers and spacing don't count; nor does older screen text
+    above the prompt that some parsers include.
+    """
     lines = [re.sub(r"^\s*[❯›>]\s*", "", ln).strip() for ln in content.splitlines()]
-    text = name + "\n" + "\n".join(ln for ln in lines if ln)
+    lines = [ln for ln in lines if ln]
+    asked = [i for i, ln in enumerate(lines) if _QUESTION.search(ln)]
+    if asked:
+        # From the tool call the prompt is about ("● Write(…)"), else a few lines.
+        q = asked[-1]
+        tool = [i for i in range(max(0, q - 40), q) if lines[i].startswith("●")]
+        lines = lines[tool[-1] if tool else max(0, q - PROMPT_CONTEXT_LINES) :]
+    text = name + "\n" + "\n".join(lines)
     return hashlib.sha256(text.encode()).hexdigest()[:24]
 
 
 def prompt_answers(name: str, content: str) -> dict[str, str] | None:
     """Keys for «Разрешить» / «Отклонить», or None when not a yes/no prompt."""
-    if name not in ANSWERABLE:
+    if name not in ANSWERABLE or not _QUESTION.search(content):
         return None
     options = prompt_options(content)
     yes = [key for key, label in options if _YES.match(label)]

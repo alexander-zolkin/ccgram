@@ -162,6 +162,12 @@ async def _no_sleep(_seconds):
 
 
 PERMISSION = "Bash command\n\n  rm -rf build\n\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again for rm commands\n  3. No, and tell Claude what to do differently (esc)"
+WRITE = (
+    "✻ Crunched for 5s · done 11:49 PM\n\n● Write(/tmp/x/perm-probe.txt)\n\n Create file\n /tmp/x/perm-probe.txt\n"
+    "  1 тест\n Do you want to create perm-probe.txt?\n ❯ 1. Yes\n"
+    "   2. Yes, and switch to accept edits (auto-approve file edits and common file\n"
+    "      commands) for this session (shift+tab)\n   3. No\n Esc to cancel · Tab to amend"
+)
 PLAN = "Would you like to proceed?\n❯ 1. Yes, and auto-accept edits\n  2. Yes, and manually approve edits\n  3. No, keep planning"
 
 
@@ -171,6 +177,16 @@ def test_prompt_answers_pick_the_narrowest_yes():
         "deny": "3",
     }
     assert extras.prompt_answers("ExitPlanMode", PLAN) == {"allow": "2", "deny": "3"}
+    assert extras.prompt_answers("SelectionUI", WRITE) == {"allow": "1", "deny": "3"}
+    assert (
+        extras.prompt_answers("SelectionUI", "Pick a theme\n❯ 1. Yes\n  2. No") is None
+    )
+    older = WRITE.replace(
+        "Crunched for 5s", "Baked for 9s"
+    )  # screen text above changed
+    assert extras.prompt_fingerprint("SelectionUI", older) == extras.prompt_fingerprint(
+        "SelectionUI", WRITE
+    )
     assert extras.prompt_answers("AskUserQuestion", PERMISSION) is None
     assert (
         extras.prompt_answers(
