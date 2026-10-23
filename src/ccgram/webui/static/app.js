@@ -1345,7 +1345,12 @@ function route() {
   $("cmd-palette").hidden = true;
   const hash = location.hash.slice(1);
   if (hash.startsWith("c-")) { showDraft(hash); return; }
-  const id = /^-?\d+$/.test(hash) ? parseInt(hash, 10) : REMOTE_ID.test(hash) ? hash : NaN;
+  let id = /^-?\d+$/.test(hash) ? parseInt(hash, 10) : REMOTE_ID.test(hash) ? hash : NaN;
+  // Kara Hub opened by an old link / push (a Telegram thread id): its session.
+  if (state.karaHub && typeof id === "number" && !Number.isNaN(id)) {
+    const s = state.sessions.find((x) => x.tg_thread === id);
+    if (s) { history.replaceState(null, "", `#${s.thread_id}`); id = s.thread_id; }
+  }
   if (typeof id === "string" || !Number.isNaN(id)) openSession(id);
   else showHome();
 }
