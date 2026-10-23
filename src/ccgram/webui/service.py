@@ -399,6 +399,29 @@ async def entries(
     return {"items": items, "start": 0, "end": 0, "structured": False}
 
 
+async def _effort(window_id: str, tx: Path) -> str | None:
+    """The effort a Claude session runs at: its last ``/effort``, else the
+    ``--effort`` it was launched with, else Claude Code's saved default (what a
+    launch without the flag picks up). None when Claude is not in the pane."""
+    level = await asyncio.to_thread(transcript.last_effort, tx)
+    if level:
+        return level
+    fg = await tmux_manager.foreground(window_id)
+    argv = fg.argv if fg else []
+    if not any(Path(a).name == "claude" for a in argv[:2]):
+        return None
+    for i, arg in enumerate(argv):
+        if arg == "--effort" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--effort="):
+            return arg.split("=", 1)[1]
+    try:
+        saved = json.loads((Path.home() / ".claude" / "settings.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return saved.get("effortLevel") if isinstance(saved, dict) else None
+
+
 async def pane(thread_id: int) -> dict[str, Any]:
     # Lazy: terminal parser is only needed when a pane is inspected.
     from ..terminal_parser import extract_interactive_content
@@ -406,8 +429,10 @@ async def pane(thread_id: int) -> dict[str, Any]:
     binding = find_binding(thread_id)
     text = await tmux_manager.capture_pane(binding.window_id)
     interactive = extract_interactive_content(text) if text else None
-    tx, _provider = _transcript_for(binding)
+    tx, provider = _transcript_for(binding)
     meta = await asyncio.to_thread(transcript.last_usage, tx) if tx else None
+    if meta is not None and (provider or "claude") == "claude":
+        meta["effort"] = await _effort(binding.window_id, tx)
     return {
         "alive": text is not None,
         "meta": meta,

@@ -1148,11 +1148,12 @@ function soundMenu(s) {
 
 function effortMenu(s) {
   const info = $("chat-meta").hidden ? "" : $("chat-meta").dataset.info;
+  const now = $("chat-meta").hidden ? "" : $("chat-meta").dataset.effort;
   return [
     ...(info ? [{ heading: info }, "sep"] : []),
     { heading: "Усилие этой сессии" },
     ...EFFORTS.filter(([id]) => id).map(([id, label, sub]) => ({
-      label, sub, action: async () => {
+      label, sub, check: id === now, action: async () => {
         try {
           await api(`/api/sessions/${s.thread_id}/send`, { body: { text: `/effort ${id}` } });
           toast(`Усилие: ${label.toLowerCase()}`);
@@ -1230,7 +1231,10 @@ function renderMeta(meta) {
   const cap = oneM ? 1000000 : 200000;
   const pct = Math.min(100, Math.round((meta.context / cap) * 100));
   box.hidden = false;
-  box.title = `${meta.model} · контекст ${meta.context.toLocaleString("ru-RU")} из ${kTokens(cap)} токенов`;
+  // The effort the session runs at (its last /effort, else its launch): the menu ticks it.
+  box.dataset.effort = meta.effort || "";
+  const effort = EFFORTS.find(([id]) => id && id === meta.effort);
+  box.title = `${meta.model} · контекст ${meta.context.toLocaleString("ru-RU")} из ${kTokens(cap)} токенов${effort ? ` · усилие: ${effort[1].toLowerCase()}` : ""}`;
   // Phones show only the ring; the tap menu heads with this line.
   box.dataset.info = `${prettyModel(meta.model)} · контекст ${kTokens(meta.context)} из ${kTokens(cap)} (${pct}%)`;
   box.innerHTML = `<span class="m-name">${esc(prettyModel(meta.model))}</span><span class="ctx${pct >= 80 ? " hot" : ""}"><span class="ctx-bar"><i style="width:${pct}%"></i></span><span class="ctx-ring" style="--p:${pct}"></span><span class="ctx-n">${kTokens(meta.context)}</span></span>`;

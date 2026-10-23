@@ -411,3 +411,20 @@ def test_daily_stats_buckets_by_local_day(tmp_path):
         return (midnight - timedelta(days=n)).date().isoformat()
 
     assert got == {day(2): {"out": 100, "turns": 0}, day(1): {"out": 40, "turns": 1}}
+
+
+def test_last_effort_reads_only_what_was_appended(tmp_path):
+    p = tmp_path / "t.jsonl"
+    said = "<local-command-stdout>Set effort level to {} (saved)</local-command-stdout>"
+    quoted = _tool_result("t1", said.format("low"), "r1")  # inside tool output
+    _write(p, [_user("hi", "u1"), quoted])
+    assert transcript.last_effort(p) is None
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(_line(_user(said.format("high"), "u2")))
+        fh.write(json.dumps(_user(said.format("max"), "u3"))[:40])  # half a line
+    assert transcript.last_effort(p) == "high"
+    blocks = [{"type": "text", "text": said.format("medium")}]
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write("\n" + _line(_user(blocks, "u4")))
+    assert transcript.last_effort(p) == "medium"
+    assert transcript.last_effort(tmp_path / "missing.jsonl") is None

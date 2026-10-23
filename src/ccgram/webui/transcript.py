@@ -724,6 +724,68 @@ def last_usage(path: Path, window: int = 512 * 1024) -> dict[str, Any] | None:
     return None
 
 
+# ``/effort high`` answers "Set effort level to high (…)" as a user message's
+# text. The same words inside a tool's output or a prompt don't count, so only
+# lines that mention them are parsed, and then checked for that shape.
+_EFFORT_HINT = b"Set effort level to "
+_EFFORT_SET = re.compile(r"<local-command-stdout>Set effort level to ([a-z]+)")
+_effort_seen: dict[str, tuple[int, str | None]] = {}
+
+
+def _effort_said(raw: bytes) -> str | None:
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(entry, dict) or entry.get("type") != "user":
+        return None
+    if entry.get("isSidechain"):
+        return None
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+    else:
+        return None
+    found = [m.group(1) for t in texts if (m := _EFFORT_SET.match(t))]
+    return found[-1] if found else None
+
+
+def last_effort(path: Path) -> str | None:
+    """The level the last ``/effort`` in this transcript set (None = never ran).
+
+    Remembers how far it has read, so a long transcript is scanned once and
+    every later call reads only what was appended."""
+    key = str(path)
+    offset, level = _effort_seen.get(key, (0, None))
+    try:
+        with path.open("rb") as fh:
+            if fh.seek(0, 2) < offset:
+                offset, level = 0, None  # the file was replaced
+            fh.seek(offset)
+            buf = b""
+            for chunk in iter(lambda: fh.read(CHUNK), b""):
+                buf += chunk
+                end = buf.rfind(b"\n") + 1  # only complete lines
+                pos = buf.find(_EFFORT_HINT, 0, end)
+                while pos != -1:
+                    start = buf.rfind(b"\n", 0, pos) + 1
+                    stop = buf.find(b"\n", pos)
+                    level = _effort_said(buf[start:stop]) or level
+                    pos = buf.find(_EFFORT_HINT, stop, end)
+                offset += end
+                buf = buf[end:]
+    except OSError:
+        return None
+    _effort_seen[key] = (offset, level)
+    return level
+
+
 def search(path: Path, needle: str, limit: int = 3) -> list[dict[str, Any]]:
     """Up to ``limit`` user/assistant messages containing ``needle`` (lowercase)."""
     hits: list[dict[str, Any]] = []
