@@ -227,3 +227,118 @@ def test_chat_stats_read_only_what_was_appended(tmp_path, monkeypatch):
         fh.write('{"half a line')
     assert costs.chat_stats(path)["cost"] == pytest.approx(2.0)
     assert costs._chat_files[str(path)].offset < path.stat().st_size  # the tail waits
+
+
+def test_other_providers_are_priced_at_their_list_prices():
+    # OpenClaw's own bill for this gpt-5.4 reply: $0.044097
+    parts = (14_766, 402, 4_608, 0, 0)
+    assert costs.Tally().add_parts("gpt-5.4", parts) == pytest.approx(0.044097)
+    assert costs.price("gpt-5.4-mini") == costs.PRICES["gpt-5.4-mini"]
+    assert costs.price("grok-4.20-0309-reasoning") == costs.PRICES["grok-4.20"]
+    assert costs.price("meta-llama/llama-3.3-70b-instruct:free") == costs.FREE
+    assert costs.price("google/gemini-2.5-pro") == costs.PRICES["gemini-2.5-pro"]
+    assert costs.price("gemini-3.1-flash") is None
+    who = {m: costs.provider(m) for m in ("claude-opus-5-5[1m]", "gpt-5.5", "grok-4-1-fast", "gemini-3-flash-preview", "coder-model", "qwen/qwen3-235b:free", "mystery")}  # fmt: skip
+    assert list(who.values()) == ["anthropic", "openai", "xai", "google", "alibaba", "alibaba", "other"]  # fmt: skip
+
+
+def _rollout(cwd, *events, model="gpt-5.4"):
+    def count(stamp, total, last):
+        keys = ("input_tokens", "cached_input_tokens", "output_tokens")
+        info = {
+            "total_token_usage": dict(zip(keys, total, strict=True)),
+            "last_token_usage": dict(zip(keys, last, strict=True)),
+        }
+        return {
+            "timestamp": stamp,
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": info},
+        }
+
+    return [
+        {"timestamp": NOW, "type": "session_meta", "payload": {"cwd": cwd}},
+        {"timestamp": NOW, "type": "turn_context", "payload": {"model": model}},
+        *(count(*e) for e in events),
+    ]
+
+
+def test_codex_rollout_counts_each_request_once(tmp_path):
+    t = lambda s: f"2026-10-20T10:00:{s:02d}.000Z"  # noqa: E731
+    events = [
+        (t(1), (1_000_000, 0, 0), (1_000_000, 0, 0)),  # first: its own request
+        (t(2), (1_000_000, 0, 0), (1_000_000, 0, 0)),  # the same total again
+        (t(3), (3_000_000, 1_000_000, 100_000), (2_000_000, 1_000_000, 100_000)),
+        (t(4), (500_000, 0, 0), (500_000, 0, 0)),  # the total went back
+    ]
+    live, backup = tmp_path / "live" / "2026" / "10", tmp_path / "backup"
+    _write(live / "rollout-a.jsonl", _rollout("/w", *events))
+    _write(backup / "rollout-a.jsonl", _rollout("/w", *events[:1]))  # a shorter copy
+    _write(live / "rollout-p.jsonl", _rollout("/home/me/private/x", *events))
+    files = costs._codex_files([tmp_path / "live", backup])
+    assert [f.parent.name for f in files] == ["10", "10"]  # the longer copy
+    rows = costs._codex_rows(live / "rollout-a.jsonl", "/home/me/private")
+    assert [r[3] for r in rows] == [
+        (1_000_000, 0, 0, 0, 0),
+        (1_000_000, 100_000, 1_000_000, 0, 0),  # cached input split off
+        (500_000, 0, 0, 0, 0),
+    ]
+    assert {r[2] for r in rows} == {"gpt-5.4"} and rows[0][1] == "2026-10-20"
+    assert costs._codex_rows(live / "rollout-p.jsonl", "/home/me/private") == []
+
+
+def test_spend_adds_every_machine_and_reads_a_file_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    costs.reset_for_testing()
+    out = {"output_tokens": 50_000}  # $1 on opus-5-5
+    _write(
+        tmp_path / "projects" / "-w" / "s1.jsonl", [_say("a", "claude-opus-5-5", out)]
+    )
+    oc = {"input": 0, "output": 80_000, "cacheRead": 0, "cacheWrite": 0}  # $2 on 4.6
+    reply = {"role": "assistant", "provider": "anthropic", "model": "claude-opus-4-6"}
+    reply = {**reply, "responseId": "r", "usage": oc}
+    _write(
+        tmp_path / "openclaw" / "s.jsonl",
+        [{"type": "message", "id": "r", "timestamp": NOW, "message": reply}],
+    )
+    period = costs._build_period(
+        Path("/nowhere/private"),
+        born=None,
+        history=[tmp_path / "openclaw"],
+        archive=[],
+        store=None,
+    )
+    laptop = tmp_path / "laptop"
+    twice = _say("b", "claude-opus-5-5", out)
+    _write(laptop / "claude" / "-p" / "s2.jsonl", [twice])
+    _write(laptop / "claude" / "-p" / "s3.jsonl", [twice])  # a fork repeats it
+    _write(
+        laptop / "codex" / "rollout-x.jsonl",
+        _rollout("/w", (NOW, (0, 0, 100_000), (0, 0, 100_000))),  # $1.5 on gpt-5.4
+    )
+    reads = []
+    real = costs._claude_rows
+    monkeypatch.setattr(costs, "_claude_rows", lambda f: reads.append(f) or real(f))
+    machines = [("Ноутбук", [laptop / "claude"], [laptop / "codex"])]
+
+    def run():
+        return costs.spend(
+            period, Path("/nowhere/private"), here="Сервер", machines=machines
+        )
+
+    got = run()
+    assert got["cost"] == pytest.approx(5.5)
+    where = [(m["name"], m["cost"], [(t["name"], t["cost"]) for t in m["tools"]]) for m in got["machines"]]  # fmt: skip
+    assert where == [
+        ("Сервер", 3.0, [("OpenClaw", 2.0), ("Claude Code", 1.0)]),
+        ("Ноутбук", 2.5, [("Codex", 1.5), ("Claude Code", 1.0)]),  # b once
+    ]
+    assert [(p["provider"], p["cost"]) for p in got["providers"]] == [
+        ("anthropic", 4.0),
+        ("openai", 1.5),
+    ]
+    month = got["months"][-1]
+    assert month["providers"] == {"anthropic": 4.0, "openai": 1.5}
+    assert {m["model"]: m["provider"] for m in got["models"]}["gpt-5.4"] == "openai"
+    assert len(reads) == 2
+    assert run()["cost"] == pytest.approx(5.5) and len(reads) == 2  # unchanged files
+    costs.reset_for_testing()

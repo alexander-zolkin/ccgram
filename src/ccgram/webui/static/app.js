@@ -2886,6 +2886,80 @@ function allSecHtml(p) {
     <div class="u-cols st-cols"><div><div class="hub-label">Модели за 30 дней</div>${modelTable(p.models)}</div>
     <div><div class="hub-label">Дороже всего за неделю</div>${p.chats.length ? `<ul class="u-chats">${p.chats.map((x) => `<li><span>${esc(x.name)}</span><span class="u-num">${usd(x.cost)}</span><span class="u-share"><i style="width:${Math.max(3, (x.cost / (p.chats[0].cost || 1)) * 100)}%"></i></span></li>`).join("")}${p.chats_rest ? `<li><span class="muted">Остальное (SSH, фоновые задачи)</span><span class="u-num">${usd(p.chats_rest)}</span></li>` : ""}</ul>` : '<div class="muted">За неделю чаты не работали</div>'}</div></div>`;
 }
+// «Всё потребление»: every machine and model at its provider's list prices.
+// Providers keep their colour (app.css --pv-*); the small ones share the last.
+const PROVIDERS = [["anthropic", "Claude"], ["openai", "ChatGPT"], ["xai", "Grok"], ["google", "Gemini"]];
+const PROVIDER_RU = { alibaba: "Qwen", meta: "Llama", other: "другие" };
+function providerSlots(t) {
+  const named = new Set(PROVIDERS.map(([id]) => id));
+  const rest = t.providers.filter((p) => !named.has(p.provider));
+  const slots = PROVIDERS.map(([id, label]) => ({ id, label, ids: [id] }));
+  if (rest.length) slots.push({ id: "other", label: rest.length > 2 ? "Другие" : rest.map((p) => PROVIDER_RU[p.provider] || p.provider).join(", "), ids: rest.map((p) => p.provider) });
+  const sum = (ids, get) => ids.reduce((acc, id) => acc + (get(id) || 0), 0);
+  return slots.map((s) => ({ ...s, cost: sum(s.ids, (id) => t.providers.find((p) => p.provider === id)?.cost), tokens: sum(s.ids, (id) => t.providers.find((p) => p.provider === id)?.tokens) }))
+    .filter((s) => s.cost > 0 || s.tokens > 0);
+}
+const monthRu = (key, opt = { month: "long", year: "numeric" }) => new Date(`${key}-15T12:00:00`).toLocaleDateString("ru-RU", opt);
+// Dollars per month, one stacked column per month, a 2px gap between providers.
+function monthChart(months, slots) {
+  const W = 420, H = 170, left = 44, right = 6, top = 20, bottom = 24, gap = 2;
+  const plotW = W - left - right, plotH = H - top - bottom, base = top + plotH;
+  const cost = (m, s) => s.ids.reduce((acc, id) => acc + (m.providers[id] || 0), 0);
+  const max = niceMax(Math.max(...months.map((m) => m.cost)));
+  const band = plotW / months.length, bw = Math.min(28, band * 0.62);
+  const peak = months.reduce((best, m, i) => (m.cost > months[best].cost ? i : best), 0);
+  let svg = "";
+  for (const v of [0, max / 2, max]) {
+    const yy = base - (v / max) * plotH;
+    svg += `<line class="u-grid" x1="${left}" x2="${W - right}" y1="${yy}" y2="${yy}"/><text class="u-tick" x="${left - 6}" y="${yy + 4}" text-anchor="end">${v ? usd(v) : "0"}</text>`;
+  }
+  months.forEach((m, i) => {
+    const x = left + band * i + (band - bw) / 2;
+    const parts = slots.map((s) => [s, cost(m, s)]).filter(([, c]) => (c / max) * plotH >= 1);
+    let y = base;
+    parts.forEach(([s, c], k) => {
+      const h = (c / max) * plotH;
+      const shown = k ? Math.max(0.5, h - gap) : h; // the gap comes out of the upper one
+      svg += k === parts.length - 1 ? `<path class="pv pv-${s.id}" d="${colPath(x, y - (h - shown), bw, shown)}"/>` : `<rect class="pv pv-${s.id}" x="${x}" y="${y - h}" width="${bw}" height="${shown}"/>`;
+      y -= h;
+    });
+    if (i === peak && m.cost) svg += `<text class="u-val" x="${x + bw / 2}" y="${base - (m.cost / max) * plotH - 6}" text-anchor="middle">${usd(m.cost)}</text>`;
+    const label = MONTH_SHORT[Number(m.month.slice(5)) - 1];
+    if (months.length <= 12 || i % 2 === 0) svg += `<text class="u-tick" x="${x + bw / 2}" y="${H - 6}" text-anchor="middle">${label}</text>`;
+    const split = slots.map((s) => [s.label, cost(m, s)]).filter(([, c]) => c >= 0.01).map(([l, c]) => `${l} ${usd(c)}`).join(" · ");
+    const tip = `${monthRu(m.month)} · ${usd(m.cost)}${split ? `: ${split}` : ""}`;
+    svg += `<rect class="u-hit" x="${left + band * i}" y="${top - 14}" width="${band}" height="${plotH + 14}" data-tip="${esc(tip)}"/>`;
+  });
+  return `<svg class="u-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Стоимость по ценам API по месяцам, по провайдерам">${svg}</svg>`;
+}
+// Every month from the first one on, empty months included.
+function monthsSince(t) {
+  if (!t.months.length) return [];
+  const have = Object.fromEntries(t.months.map((m) => [m.month, m]));
+  const out = [];
+  for (let [y, mo] = t.months[0].month.split("-").map(Number); ; mo += 1) {
+    if (mo > 12) { y += 1; mo = 1; }
+    const key = `${y}-${String(mo).padStart(2, "0")}`;
+    out.push(have[key] || { month: key, cost: 0, providers: {} });
+    if (key >= t.months[t.months.length - 1].month) return out;
+  }
+}
+function totalSecHtml(t) {
+  const slots = providerSlots(t);
+  const since = t.since ? new Date(`${t.since}T12:00:00`).toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" }) : "";
+  const top = t.machines[0]?.cost || 1;
+  return `<div class="st-head"><h3>Всё потребление</h3><span class="muted st-since">все машины и модели${since ? ` · с ${since}` : ""}</span></div>
+    <div class="st-big">${usd(t.cost)}<span>столько стоило бы по ценам API</span></div>
+    <div class="st-tiles">${slots.map((s) => tile(usd(s.cost), `<i class="pv-sw pv-${s.id}"></i>${esc(s.label)} · ${tokRu(s.tokens)} ток.`)).join("")}</div>
+    ${monthChart(monthsSince(t), slots)}
+    <details class="u-table"><summary>По месяцам таблицей</summary><div class="st-scroll"><table class="st-table"><tr><th>Месяц</th>${slots.map((s) => `<th>${esc(s.label)}</th>`).join("")}<th>Всего</th></tr>${monthsSince(t).map((m) => `<tr><td>${esc(monthRu(m.month))}</td>${slots.map((s) => `<td>${usd(s.ids.reduce((acc, id) => acc + (m.providers[id] || 0), 0))}</td>`).join("")}<td>${usd(m.cost)}</td></tr>`).join("")}</table></div></details>
+    <div class="u-cols st-cols"><div><div class="hub-label">По машинам</div><ul class="u-chats st-where">${t.machines.map((m) => `<li><span>${esc(m.name)}<small>${m.tools.map((x) => `${esc(x.name)} ${usd(x.cost)}`).join(" · ")}</small></span><span class="u-num">${usd(m.cost)}</span><span class="u-share"><i style="width:${Math.max(3, (m.cost / top) * 100)}%"></i></span></li>`).join("")}</ul></div>
+    <div><div class="hub-label">Модели</div>${modelTable(t.models.slice(0, 8))}${t.models.length > 8 ? `<details class="u-table"><summary>Ещё ${t.models.length - 8}</summary>${modelTable(t.models.slice(8))}</details>` : ""}</div></div>
+    <p class="st-line muted">Цены — нынешние прайс-листы Anthropic, OpenAI, xAI, Google и Alibaba, без надбавки за длинный контекст. Не вошли приватные чаты (и приватный Grok) и ChatGPT в браузере: в его выгрузке нет счёта токенов.</p>`;
+}
+function skTotal() {
+  return `${sk("sk-title", "width:28%")}${sk("sk-big")}<div class="st-tiles">${sk("sk-tile").repeat(4)}</div>${sk("sk-chart")}`;
+}
 function actSecHtml(p, reveal = true) {
   const since = new Date(`${p.all.since}T12:00:00`);
   const age = Math.round((Date.now() - since.getTime()) / 86400000);
@@ -3027,8 +3101,9 @@ async function openStats() {
     <section class="st-sec" data-part="limits">${known.limits ? limitsSecHtml(known.limits) : skLimits()}</section>
     ${tid != null ? `<section class="st-sec" data-part="chat">${chatKnown ? chatSecHtml(chatKnown) : skChat()}</section>` : ""}
     <section class="st-sec" data-part="all">${known.period ? allSecHtml(known.period) : skAll()}</section>
+    <section class="st-sec" data-part="total">${known.total ? totalSecHtml(known.total) : skTotal()}</section>
     <section class="st-sec" data-part="act">${known.period ? actSecHtml(known.period, false) : skAct()}</section>
-    <p class="st-note">«По ценам API» — сколько стоила бы та же работа без подписки, по тарифам Anthropic. По подписке платишь фиксированно; расход подписки — в лимитах выше. Приватные чаты не считаются.</p></div>`;
+    <p class="st-note">«По ценам API» — сколько стоила бы та же работа без подписки, по тарифам провайдеров. По подписке платишь фиксированно; расход подписки — в лимитах выше. Приватные чаты не считаются.</p></div>`;
   openSheet("Статистика");
   const live = () => state.statsRun === run && !$("sheet").hidden;
   const sec = (name) => body.querySelector(`[data-part="${name}"]`);
@@ -3087,6 +3162,11 @@ async function openStats() {
     fill("act", actSecHtml(p, first));
     wireAct(p, keep);
   }).catch((e) => { clearInterval(ticker); if (live() && sec("act").querySelector(".sk")) fill("act", `<p class="muted">${esc(e.message)}</p>`); }));
+  jobs.push(get("total").then((t) => {
+    if (!live() || !t) return;
+    statsKeep("total", t);
+    fill("total", totalSecHtml(t));
+  }).catch((e) => live() && sec("total").querySelector(".sk") && fill("total", `<p class="muted">${esc(e.message)}</p>`)));
   await Promise.allSettled(jobs);
   const status = body.querySelector(".st-status");
   if (live() && status) { status.classList.add("done"); status.querySelector("span").textContent = "Обновлено"; }

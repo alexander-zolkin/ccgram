@@ -37,7 +37,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/uploads``                   file for a session not created yet
 - ``GET  /api/models``                    Claude models for the picker
 - ``GET  /api/usage?refresh=1``          plan limits, what /usage shows in Claude Code
-- ``GET  /api/stats/{limits|chat|period}?tid=``  the statistics sheet, block by block
+- ``GET  /api/stats/{limits|chat|period|total}?tid=``  the statistics sheet, block by block
 - ``GET  /api/events``                    SSE: messages + session-list changes
 - ``GET  /api/auth/methods``              which logins are open (no session needed)
 - ``POST /api/auth/passkey/login/options``, ``/api/auth/passkey/login``  passkey login
@@ -574,7 +574,7 @@ async def _stats(request: web.Request) -> web.Response:
     tid = request.query.get("tid")
     thread_id = int(tid) if tid and tid.lstrip("-").isdigit() else None
     name = request.match_info["part"]
-    if name not in ("limits", "limits-known", "chat", "period"):
+    if name not in ("limits", "limits-known", "chat", "period", "total"):
         raise service.WebUIError("unknown part", 404)
     return web.json_response({name: await costs.part(name, thread_id)})
 

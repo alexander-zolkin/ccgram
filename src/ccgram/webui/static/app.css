@@ -822,3 +822,16 @@ body.sheet-open { overflow: hidden; }
 .st-status i { width: 6px; height: 6px; border-radius: 50%; background: var(--chart-1); animation: pulse 1.2s infinite; }
 .st-status.done { opacity: 0; }
 .st-status.done i { animation: none; background: var(--ok); }
+/* «Всё потребление»: a colour per provider, validated as a set for light and dark */
+:root { --pv-anthropic: var(--chart-1); --pv-openai: #2a78d6; --pv-xai: #1baf7a; --pv-google: #6250d6; --pv-other: #eda100; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --pv-openai: #3987e5; --pv-xai: #199e70; --pv-google: #9085e9; --pv-other: #c98500; }
+}
+:root[data-theme="dark"] { --pv-openai: #3987e5; --pv-xai: #199e70; --pv-google: #9085e9; --pv-other: #c98500; }
+.pv-anthropic { fill: var(--pv-anthropic); background: var(--pv-anthropic); }
+.pv-openai { fill: var(--pv-openai); background: var(--pv-openai); }
+.pv-xai { fill: var(--pv-xai); background: var(--pv-xai); }
+.pv-google { fill: var(--pv-google); background: var(--pv-google); }
+.pv-other { fill: var(--pv-other); background: var(--pv-other); }
+.pv-sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
+.st-where small { display: block; margin-top: 1px; font-size: 12px; color: var(--muted); }
