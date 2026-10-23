@@ -1364,6 +1364,7 @@ function greeting() {
 function showHome() {
   state.current = null;
   state.draft = null;
+  reportPresence();
   $("gone-card").hidden = true;
   clearTimeout(state.paneTimer);
   $("app").classList.add("home-mode");
@@ -1431,6 +1432,7 @@ async function openSession(tid, { keep = false } = {}) {
   enterChat();
   state.current = tid;
   state.draft = null;
+  reportPresence();
   state.unread.delete(tid);
   if (state.agentsAt !== tid) { state.agents = new Map(); state.agentsAt = null; }
   loadDraft();
@@ -2746,6 +2748,8 @@ async function refreshPushState() {
     const reg = await navigator.serviceWorker.ready;
     const sub = await reg.pushManager.getSubscription();
     state.pushOn = Boolean(sub) && Notification.permission === "granted";
+    state.pushEndpoint = state.pushOn ? sub.endpoint : null;
+    reportPresence();
     // Re-register: keeps the server list right after a key/endpoint change.
     if (state.pushOn) await api("/api/push/subscribe", { body: { subscription: sub.toJSON() } });
   } catch (_) { state.pushOn = false; }
@@ -2762,6 +2766,8 @@ async function enablePush() {
     const sub = (await reg.pushManager.getSubscription()) || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
     await api("/api/push/subscribe", { body: { subscription: sub.toJSON() } });
     state.pushOn = true;
+    state.pushEndpoint = sub.endpoint;
+    reportPresence();
     toast("Уведомления включены");
   } catch (e) { toast(`Не получилось: ${e.message}`); }
 }
@@ -2776,17 +2782,18 @@ async function disablePush() {
     }
   } catch (_) { /* already gone */ }
   state.pushOn = false;
+  state.pushEndpoint = null;
   toast("Уведомления выключены на этом устройстве");
 }
 
-// While a Kara tab is on screen the server holds pushes back (the page shows
-// its own notification); it resumes 45 s after the last "visible" ping.
-// "Watching" is on screen AND focused: a PWA window left open behind other
-// windows must not hold back the pushes (the phone's included).
+// "Watching" is on screen AND focused. While this device watches, the server
+// skips its push subscription and the page notifies by itself — about every
+// chat but the open one; other devices get their pushes as usual.
 const clientId = Math.random().toString(36).slice(2);
 const watching = () => !document.hidden && document.hasFocus();
 function reportPresence() {
-  api("/api/presence", { body: { client: clientId, visible: watching() } }).catch(() => {});
+  const body = { client: clientId, visible: watching(), chat: state.current, endpoint: state.pushEndpoint || null };
+  api("/api/presence", { body }).catch(() => {});
 }
 document.addEventListener("visibilitychange", reportPresence);
 addEventListener("focus", reportPresence);
