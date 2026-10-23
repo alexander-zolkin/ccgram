@@ -452,7 +452,7 @@ function userNode(it) {
   if (!it.task) {
     const acts = el("span", "u-acts");
     acts.append(actBtn(ACT.copy, "Копировать", (b) => copyText(text, b)));
-    if (canRewind(it)) acts.append(actBtn(SVG.edit, "Изменить и отправить заново", () => rewindTo(it, { edit: true })));
+    if (canRewind(it)) acts.append(actBtn(SVG.edit, "Изменить и отправить заново", () => startInlineEdit(n)));
     acts.append(actBtn(ACT.more, "Ещё", (b) => openMenu(msgMenu(n), menuBelow(b), n)));
     meta.append(acts);
   }
@@ -611,12 +611,14 @@ function errorNode(it) {
   n.appendChild(body);
   const foot = el("div", "err-foot");
   const edit = el("button", "btn small", "Изменить сообщение");
-  edit.type = "button";
+  const again = el("button", "btn small", "Повторить");
+  edit.type = again.type = "button";
   edit.onclick = () => {
     const prev = promptNear(n, -1);
-    if (prev) rewindTo(prev._item, { edit: true }); else toast("Сообщение выше не найдено — пролистай вверх");
+    if (prev) { startInlineEdit(prev); prev.scrollIntoView({ block: "center", behavior: "smooth" }); } else toast("Сообщение выше не найдено — пролистай вверх");
   };
-  if (currentSession()?.provider === "claude") foot.append(edit);
+  again.onclick = () => { const prev = promptNear(n, -1); if (prev) rewindTo(prev._item, { send: prev._item.text }); else toast("Сообщение выше не найдено — пролистай вверх"); };
+  if (currentSession()?.provider === "claude") foot.append(edit, again);
   foot.insertAdjacentHTML("beforeend", `<span class="msg-time">${esc(hhmm(it.ts))}</span>`);
   n._item = it;
   n.appendChild(foot);
@@ -677,7 +679,7 @@ function msgMenu(node) {
     );
     if (canRewind(it)) {
       items.push("sep",
-        { label: "Изменить и отправить заново", sub: "Диалог вернётся к моменту до этого сообщения", icon: SVG.edit, action: () => rewindTo(it, { edit: true }) },
+        { label: "Изменить и отправить заново", sub: "Диалог вернётся к моменту до этого сообщения", icon: SVG.edit, action: () => startInlineEdit(node) },
         { label: "Откатить сюда…", sub: "Можно вернуть и файлы, которые менялись после", icon: ACT.rewind, action: () => rewindTo(it, { files: true }) });
     }
   } else if (node.classList.contains("a-msg")) {
@@ -705,11 +707,14 @@ function rewindDialog({ title, text, files }) {
   return confirmDialog(title, text, "Откатить", false).then((ok) => ok && { files: $("rw-files").checked });
 }
 
-async function rewindTo(it, { edit = false, files = false, back = false } = {}) {
+// send: text to send right after (an edit in place, «Повторить»); with it
+// there is no dialog — the person already said what they want.
+async function rewindTo(it, { edit = false, files = false, back = false, send = null } = {}) {
   const tid = state.current;
   const s = currentSession();
-  if (!canRewind(it) || tid == null) return;
+  if (!canRewind(it) || tid == null) return false;
   const running = turnRunning(s) ? " Текущий ход будет остановлен." : "";
+  if (send != null) return rewindAndSend(tid, it, send);
   const choice = await rewindDialog({
     title: back ? "Вернуться к этому ответу?" : edit ? "Изменить сообщение?" : "Откатить диалог сюда?",
     text: (back
@@ -731,6 +736,80 @@ async function rewindTo(it, { edit = false, files = false, back = false } = {}) 
     $("input").focus();
     toast(res.relaunched ? "Откатила. Сообщение — в поле ввода" : "Откатила — сессия проснётся уже с этого места");
   } catch (e) { toast(`Не откатилось: ${e.message}`); }
+  return true;
+}
+
+async function rewindAndSend(tid, it, text) {
+  toast("Откатываю и отправляю…");
+  try {
+    await api(`/api/sessions/${tid}/rewind`, { body: { uuid: it.uuid, files: false } });
+    if (state.current !== tid) return true;
+    state.pending.delete(tid);
+    await openSession(tid);
+    // Claude Code has just started again: give its input a moment.
+    await new Promise((r) => setTimeout(r, 1200));
+    if (state.current === tid) sendTo(tid, text);
+    return true;
+  } catch (e) { toast(`Не получилось: ${e.message}`); return false; }
+}
+
+// Edit in place (claude.ai style): the bubble turns into an editor; «Отправить»
+// rewinds to just before it and sends the new text.
+const UPLOADED_LINE = /^I've uploaded (?:an image to \S+ — please take a look\.|.+? to \S+)\s*$/gm;
+function startInlineEdit(node) {
+  const it = node?._item;
+  if (!canRewind(it) || node.classList.contains("editing")) return;
+  const raw = String(it.text || "");
+  const files = raw.match(UPLOADED_LINE) || [];
+  const box = el("div", "edit-box");
+  const ta = el("textarea", "edit-ta");
+  ta.value = raw.replace(UPLOADED_LINE, "").trim();
+  const bar = el("div", "edit-bar", '<span class="edit-note">Всё, что было после, Кара забудет</span>');
+  const cancel = el("button", "btn small", "Отмена");
+  const ok = el("button", "btn small primary", "Отправить");
+  cancel.type = ok.type = "button";
+  bar.append(cancel, ok);
+  box.append(ta, bar);
+  node.classList.add("editing");
+  node.append(box);
+  const fit = () => { ta.style.height = "auto"; ta.style.height = `${Math.min(ta.scrollHeight, innerHeight * 0.5)}px`; };
+  ta.oninput = fit;
+  fit();
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  const close = () => { box.remove(); node.classList.remove("editing"); };
+  cancel.onclick = close;
+  const submit = async () => {
+    const text = [...files, ta.value.trim()].filter(Boolean).join("\n\n");
+    if (!ta.value.trim() && !files.length) return;
+    ok.disabled = cancel.disabled = ta.disabled = true;
+    ok.textContent = "Отправляю…";
+    if (!(await rewindTo(it, { send: text }))) { ok.disabled = cancel.disabled = ta.disabled = false; ok.textContent = "Отправить"; }
+  };
+  ok.onclick = submit;
+  ta.onkeydown = (ev) => {
+    if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); close(); }
+    if (ev.key === "Enter" && !ev.shiftKey && !isMobile()) { ev.preventDefault(); submit(); }
+  };
+}
+
+// «[Request interrupted by user]» is Claude Code's marker of an Esc, not
+// something the person wrote: a notice with the two ways on.
+const INTERRUPTED_TEXT = /^\[Request interrupted by user/;
+function interruptedNode(it) {
+  const n = el("div", "int-card");
+  n._item = it;
+  n.innerHTML = `<span class="int-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 7.5v.5" stroke-linecap="round"/></svg></span><span class="int-text">${/tool use/.test(it.text) ? "Ход прерван во время действия." : "Ответ прерван."}</span>`;
+  if (currentSession()?.provider === "claude" && state.structured) {
+    const prev = () => promptNear(n, -1);
+    const edit = el("button", "btn small", "Изменить запрос");
+    const again = el("button", "btn small", "Повторить");
+    edit.type = again.type = "button";
+    edit.onclick = () => { const p = prev(); if (p) { startInlineEdit(p); p.scrollIntoView({ block: "center", behavior: "smooth" }); } else toast("Запрос выше не найден — пролистай вверх"); };
+    again.onclick = () => { const p = prev(); if (p) rewindTo(p._item, { send: p._item.text }); else toast("Запрос выше не найден — пролистай вверх"); };
+    n.append(edit, again);
+  }
+  return n;
 }
 
 // Right click on a message: its menu (a selection keeps the browser's own).
@@ -1150,9 +1229,10 @@ function buildBlocks(items, continueFrom, live = false) {
     // An update says what the thinking was: it replaces a bare «Размышляла».
     if (it.kind === "update" && steps && !steps.querySelector(".steps-inner").children.length) steps.remove();
     steps = null;
-    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode, peer: peerNode, update: updateNode, turn: turnNode, notice: noticeNode, error: errorNode, task: taskNode }[it.kind]?.(it) || assistantNode(it);
+    const kindFn = it.kind === "user" && INTERRUPTED_TEXT.test(it.text || "") ? interruptedNode : null;
+    const node = kindFn ? kindFn(it) : { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode, peer: peerNode, update: updateNode, turn: turnNode, notice: noticeNode, error: errorNode, task: taskNode }[it.kind]?.(it) || assistantNode(it);
     // The transcript copy replaces the pending bubble in place: no re-entry.
-    if ((it.kind === "user" || it.kind === "bash" || it.kind === "command") && clearPending()) node.classList.add("swap");
+    if (((it.kind === "user" && !kindFn) || it.kind === "bash" || it.kind === "command") && clearPending()) node.classList.add("swap");
     frag.appendChild(node);
   }
   return frag;
@@ -1202,6 +1282,7 @@ function appendItems(items) {
   markLast();
   refreshMsgStatus();
   autoOpenLive();
+  syncLiveRow();
   if (stick) toBottom(true);
   else if (items.length) {
     state.newBelow = (state.newBelow || 0) + items.filter((it) => it.kind === "assistant" || it.kind === "user").length;
@@ -1284,6 +1365,7 @@ function showHome() {
   $("pane").hidden = true;
   $("chat-state").innerHTML = "";
   $("working").hidden = true;
+  $("live-row").hidden = true;
   $("prompt-card").hidden = true;
   $("tg-toggle").hidden = false;
   $("model-btn").hidden = false;
@@ -1614,6 +1696,7 @@ function renderHeader() {
   $("gone-card").hidden = !s.topic_deleted;
   $("disclaimer").textContent = s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
   setTitle(`${working ? "⏳ " : ""}${s.name} — Кара`);
+  syncLiveRow();
   refreshMsgStatus();
   updateLed();
 }
@@ -3170,7 +3253,45 @@ function turnClock(live, status) {
   state.turnClock = { tid: state.current, start, out: Math.max(turn.out || 0, status.tokens || 0) };
   tickWork();
 }
+// ═══ the live row: «в работе» inside the thread, under the last message ═════
+// (claude.ai style): pulsing dots, what is going on right now — the running
+// step, else the latest thinking update — and the seconds; a tap opens steps.
+function liveTitle() {
+  const kids = $("thread").children;
+  const last = kids[kids.length - 1];
+  if (last?.classList.contains("steps")) {
+    const run = [...last.querySelectorAll(".step")].reverse().find((n) => !n._tool.result);
+    if (run) return toolMeta(run._tool).title.replace(/<[^>]+>/g, "");
+  }
+  if (last?.classList.contains("a-update")) return (last.innerText.split("\n").find((l) => l.trim()) || "").trim();
+  return $("working-text").textContent || "Думаю…";
+}
+function syncLiveRow() {
+  const row = $("live-row");
+  const s = currentSession();
+  const on = state.current != null && Boolean(s) && turnRunning(s);
+  $("working").classList.toggle("inline", on);
+  if (row.hidden === on) {
+    const stick = nearBottom();
+    row.hidden = !on;
+    if (on && stick) toBottom();
+  }
+  if (!on) return;
+  const t = row.querySelector(".lr-text");
+  const text = liveTitle();
+  if (t.textContent !== text) { t.textContent = text; replay(t, "lr-swap"); }
+  const c = state.turnClock;
+  const sec = c && c.tid === state.current ? Math.max(0, Math.round((Date.now() - c.start) / 1000)) : null;
+  row.querySelector(".lr-time").textContent = sec == null ? "" : sec < 60 ? `${sec} с` : clock(sec);
+  if ($("working-meta").dataset.tip) row.dataset.tip = $("working-meta").dataset.tip;
+}
+$("live-row").onclick = () => {
+  const st = [...$("thread").querySelectorAll(".steps:not(.thought-only)")].pop();
+  if (st) { st.classList.add("open"); st.scrollIntoView({ block: "nearest", behavior: "smooth" }); }
+};
+
 function tickWork() {
+  syncLiveRow();
   // Running subagents' clocks (live rows, steps, the agent sheet).
   document.querySelectorAll("[data-since]").forEach((n) => { n.textContent = clock(Math.max(0, Math.round(Date.now() / 1000 - Number(n.dataset.since)))); });
   const meta = $("working-meta");
