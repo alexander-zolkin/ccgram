@@ -1320,6 +1320,7 @@ async function sendTo(tid, message, node) {
     p.querySelector(".tick").innerHTML = TICK.sent;
     p.dataset.sent = "1";
     refreshMsgStatus();
+    if (message.startsWith("/")) setTimeout(() => revealDialog(tid), 1500);
   } catch (e) {
     state.pending.delete(tid);
     if (state.inflight?.tid === tid) { state.inflight = null; state.turnClock = null; renderHeader(); }
@@ -1339,6 +1340,9 @@ async function send() {
   if (state.attachments.some((a) => a.uploading)) { toast("Файлы ещё загружаются…"); return; }
   const message = composeMessage();
   if (!message) return;
+  // Claude Code's /usage opens a dialog in the terminal that the web never
+  // sees: answer it here, from the same source, without bothering the session.
+  if (/^\/usage\s*$/i.test(message)) { clearComposer(); autosize(); showUsage(); return; }
   $("send-btn").disabled = true;
   try {
     if (state.current == null) {
@@ -2776,6 +2780,68 @@ function usageChart(days) {
   return `<svg class="u-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Токены ответа по дням за неделю">${svg}</svg>`;
 }
 
+// ═══ plan limits — what /usage shows in Claude Code ═════════════════════════
+function resetRu(ts) {
+  if (!ts) return "";
+  const left = Math.max(0, Math.round(ts - Date.now() / 1000));
+  const d = new Date(ts * 1000);
+  const at = left < 86400 ? hhmm(ts * 1000) : `${d.toLocaleDateString("ru-RU", { weekday: "short" })} ${hhmm(ts * 1000)}`;
+  const inRu = left < 3600 ? `${Math.max(1, Math.round(left / 60))} мин` : left < 86400 ? `${Math.floor(left / 3600)} ч ${Math.floor((left % 3600) / 60)} мин` : `${Math.floor(left / 86400)} д ${Math.floor((left % 86400) / 3600)} ч`;
+  return `сброс через ${inRu} · ${at}`;
+}
+function limitsHtml(u) {
+  const rows = u.limits.map((l) => {
+    const pct = Math.round(l.percent);
+    const level = l.severity !== "normal" || pct >= 95 ? "crit" : pct >= 80 ? "warn" : "";
+    return `<div class="lim ${level}"><div class="lim-top"><span>${esc(l.label)}</span><b>${pct} %</b></div>
+      <div class="lim-bar"><i style="width:${Math.min(100, Math.max(pct ? 1.5 : 0, pct))}%"></i></div>
+      <div class="lim-reset">${esc(resetRu(l.resets_at))}</div></div>`;
+  }).join("");
+  const parts = u.surfaces.filter((x) => x.percent > 0).map((x) => `${esc(x.name)} ${Math.round(x.percent)} %`);
+  const when = u.live ? `обновлено ${agoRu(u.as_of) || "только что"}` : `данные Claude Code от ${hhmm(u.as_of * 1000)}`;
+  return `${rows}<div class="lim-foot">${parts.length ? `Неделя по продуктам: ${parts.join(" · ")} · ` : ""}${when}</div>`;
+}
+async function fetchLimits(refresh) {
+  try { state.limits = (await api(`/api/usage${refresh ? "?refresh=1" : ""}`)).usage; } catch (_) { /* keep the last */ }
+  return state.limits;
+}
+// "/usage" in a chat: a card in the thread, like Claude Code's own panel.
+async function showUsage() {
+  if (state.current == null) { // home: the "Расход" card has the same block
+    $("hub-usage").scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+    renderLimits(await fetchLimits(true));
+    return;
+  }
+  const card = el("div", "usage-card", '<div class="uc-head"><b>Лимиты Claude</b><span class="uc-plan"></span></div><div class="uc-body muted">Узнаю у Anthropic…</div>');
+  $("thread").appendChild(card);
+  toBottom(true);
+  const u = await fetchLimits(true);
+  card.querySelector(".uc-body").classList.remove("muted");
+  card.querySelector(".uc-plan").textContent = u?.plan || "";
+  card.querySelector(".uc-body").innerHTML = u ? limitsHtml(u) : "Лимиты сейчас недоступны — Claude Code ещё ни разу их не запрашивал.";
+  toBottom(true);
+}
+function renderLimits(u) {
+  const box = $("hub-usage")?.querySelector(".u-limits");
+  if (!box) return;
+  box.hidden = !u || !u.limits.length;
+  if (!box.hidden) box.innerHTML = `<div class="hub-label">Лимиты Claude${u.plan ? ` · ${esc(u.plan)}` : ""}</div><div class="lim-grid">${limitsHtml(u)}</div>`;
+}
+
+// After a slash command: Claude Code may have opened a dialog in the terminal
+// (/status, /config, /model…) that never reaches the transcript — show it.
+async function revealDialog(tid) {
+  if (state.current !== tid || !$("pane").hidden) return;
+  let data;
+  try { data = await api(`/api/sessions/${tid}/pane`); } catch (_) { return; }
+  if (!data.alive || state.current !== tid) return;
+  const tail = data.text.replace(/\s+$/, "").split("\n").slice(-14);
+  if (tail.some((line) => /^\s*❯/.test(line))) return; // the prompt is there: no dialog
+  $("pane").hidden = false;
+  pollPane();
+  toast("Claude Code открыл окно — оно в терминале. Закрыть — Esc");
+}
+
 function renderUsage(u) {
   const card = $("hub-usage");
   card.hidden = !u;
@@ -2783,6 +2849,7 @@ function renderUsage(u) {
   const top = u.chats[0]?.out || 1;
   card.innerHTML = `
     <header class="hub-head">${HUB_ICON.usage}<h2>Расход</h2><span class="hub-sub">за 7 дней ${tokRu(u.total)} токенов ответа</span></header>
+    <div class="u-limits" hidden></div>
     <div class="u-cols">
       <div>${usageChart(u.days)}
         <details class="u-table"><summary>Таблицей</summary><table>${u.days.map((d) => `<tr><td>${esc(d.date.split("-").reverse().slice(0, 2).join("."))}</td><td>${tokRu(d.out)}</td><td>${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}</td></tr>`).join("")}</table></details>
@@ -2791,6 +2858,11 @@ function renderUsage(u) {
         ${u.chats.length ? `<ul class="u-chats">${u.chats.map((c) => `<li><a href="#${c.thread_id}">${esc(c.name)}</a><span class="u-num">${tokRu(c.out)}</span><span class="u-share"><i style="width:${Math.max(3, (c.out / top) * 100)}%"></i></span></li>`).join("")}</ul>` : '<div class="muted ev-none">За неделю чаты не работали</div>'}
       </div>
     </div>`;
+  if (state.limits) renderLimits(state.limits);
+  if (!state.limitsAt || Date.now() - state.limitsAt > 60000) {
+    state.limitsAt = Date.now();
+    fetchLimits(false).then(renderLimits);
+  }
 }
 
 // ═══ «Дневник»: a short digest of a day, written on request ═════════════════
