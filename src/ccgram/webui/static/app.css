@@ -750,3 +750,8 @@ body.sheet-open { overflow: hidden; }
 .st-table th:first-child, .st-table td:first-child { text-align: left; padding-left: 0; }
 .st-cols { margin-top: 16px; }
 .st-note { font-size: 12px; color: var(--muted); margin: 0; }
+.stats .u-chart { max-width: 640px; }
+.st-head .btn { flex: none; white-space: nowrap; }
+.st-cols > div { min-width: 0; } /* a wide table scrolls in its own box */
+.stats ul.u-chats { padding-left: 0; margin: 0; }
+.stats ul.u-chats li { margin: 0; }

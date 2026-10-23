@@ -2781,7 +2781,7 @@ function usageChart(days, opt = {}) {
     const name = i === last ? "сегодня" : many ? ((last - i) % 7 === 0 ? dm : "") : WEEKDAY[dt.getDay()];
     const tip = `${i === last ? "Сегодня" : `${WEEKDAY[dt.getDay()]} ${dm}`} · ${fmt(v)}${unit} · ${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}`;
     svg += `<path class="u-col" d="${colPath(x, base, bw, h)}"/>`;
-    if (v && (i === last || i === peak)) svg += `<text class="u-val" x="${x + bw / 2}" y="${base - h - 6}" text-anchor="middle">${fmt(v)}</text>`;
+    if (v && (i === peak || (i === last && !many))) svg += `<text class="u-val" x="${x + bw / 2}" y="${base - h - 6}" text-anchor="middle">${fmt(v)}</text>`;
     if (name) svg += `<text class="u-tick${i === last ? " now" : ""}" x="${x + bw / 2}" y="${H - 6}" text-anchor="middle">${name}</text>`;
     svg += `<rect class="u-hit" x="${left + band * i}" y="${top - 14}" width="${band}" height="${plotH + 14}" data-tip="${esc(tip)}"/>`;
   });
