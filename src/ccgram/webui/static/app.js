@@ -4484,6 +4484,24 @@ const STATS_KEY = "kara-stats";
 function statsKnown() {
   try { return JSON.parse(store.get(STATS_KEY) || "{}") || {}; } catch (_) { return {}; }
 }
+// What an older version of the page remembered may lack what this one draws
+// (an old cache made the button do nothing at all): a block that cannot be
+// drawn from it starts as a skeleton, and is forgotten.
+const STATS_DRAW = {
+  limits: (u) => limitsSecHtml(u),
+  period: (p) => allSecHtml(p) + actSecHtml(p, false) + actStatsHtml(p[state.actWin]),
+  total: (t) => totalSecHtml(t),
+};
+function statsRecall() {
+  const known = statsKnown();
+  let dropped = false;
+  for (const [part, draw] of Object.entries(STATS_DRAW)) {
+    if (!known[part]) continue;
+    try { draw(known[part]); } catch (_) { delete known[part]; dropped = true; }
+  }
+  if (dropped) store.set(STATS_KEY, JSON.stringify(known));
+  return known;
+}
 function statsKeep(part, data) {
   const known = statsKnown();
   known[part] = data;
@@ -4498,7 +4516,7 @@ async function openStats() {
   const tid = state.current;
   const run = (state.statsRun || 0) + 1;
   state.statsRun = run;
-  const known = statsKnown();
+  const known = statsRecall();
   const chatKnown = tid != null ? state.chatStats?.[tid] : undefined;
   body.innerHTML = `<div class="stats">
     <p class="st-status"><i></i><span>Обновляю…</span></p>
