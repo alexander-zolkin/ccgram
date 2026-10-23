@@ -1381,6 +1381,7 @@ function showHome() {
   $("sess-effort-btn").hidden = true;
   $("live").hidden = true;
   renderCwd();
+  syncRemoteComposer(null);
   $("input").placeholder = "Как я могу помочь?";
   setTitle("Кара");
   updateLed();
@@ -1390,6 +1391,7 @@ function showHome() {
   document.querySelector(".main").scrollTop = 0;
   loadHub();
   loadModels();
+  loadDevices();
   if (!isMobile()) $("input").focus();
 }
 
@@ -1401,6 +1403,7 @@ function enterChat() {
   $("model-btn").hidden = true;
   $("effort-btn").hidden = true;
   $("cwd-btn").hidden = true;
+  $("dev-btn").hidden = true;
   $("home-actions").hidden = true;
   hideHub();
   $("live").hidden = true;
@@ -1522,7 +1525,7 @@ const SESSION_KINDS = [
   ["unread", "Непрочитанные", "Пришёл ответ, пока ты был в другом чате", (s) => state.unread.has(s.thread_id)],
   ["pinned", "Закреплённые", "", (s) => s.pinned],
   ["telegram", "С Telegram-топиком", "", (s) => !s.web_only],
-  ["web", "Только в вебе", "Без топика в Telegram", (s) => s.web_only],
+  ["web", "Только в вебе", "Без топика в Telegram", (s) => s.web_only && !s.remote],
   ["asleep", "Спят", "Сессия выгружена, проснётся по сообщению", (s) => s.state === "dead"],
 ];
 state.kind = store.get("kara-kind") || "all";
@@ -2256,7 +2259,10 @@ async function send() {
   } else if (state.current == null) {
     const c = currentChoice();
     const effort = c?.provider.id === "claude" && state.effort ? state.effort : undefined;
-    const body = { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort, cwd: state.cwd || undefined, worktree: state.worktree || undefined };
+    const dev = remoteDevice();
+    const body = dev
+      ? { text: message, device: dev.id, cwd: state.devCwd[dev.id] || recentCwds(dev.id)[0] || "~", provider: "claude", model: c?.provider.id === "claude" ? c?.model?.id || undefined : undefined, effort: state.effort || undefined, web_only: true }
+      : { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort, cwd: state.cwd || undefined, worktree: state.worktree || undefined };
     if (state.worktree) { state.worktree = false; renderCwd(); }
     clearComposer();
     startDraft(message, body);
@@ -3602,7 +3608,61 @@ async function browseTo(path) {
     $("folder-wt-box").checked = false;
   } catch (e) { toast(e.message); }
 }
-$("cwd-btn").onclick = () => { $("folder-dlg").showModal(); browseTo(state.cwd || ""); };
+$("cwd-btn").onclick = () => {
+  if (state.device && state.device !== "local") { deviceCwdMenu(); return; }
+  $("folder-dlg").showModal(); browseTo(state.cwd || "");
+};
+
+// ── where a new chat runs: this server, or another device (kara-node) ──
+state.device = store.get("kara-device") || "local";
+state.devCwd = (() => { try { return JSON.parse(store.get("kara-dev-cwd") || "{}"); } catch (_) { return {}; } })();
+async function loadDevices() {
+  try { state.devices = (await api("/api/devices")).devices || []; } catch (_) { state.devices = []; }
+  if (state.device !== "local" && !state.devices.some((d) => d.id === state.device)) state.device = "local";
+  renderDevice();
+}
+const remoteDevice = () => (state.device && state.device !== "local" ? (state.devices || []).find((d) => d.id === state.device) : null);
+function renderDevice() {
+  const b = $("dev-btn");
+  const dev = remoteDevice();
+  b.hidden = state.current != null || !(state.devices || []).length;
+  $("dev-name").textContent = dev ? dev.name : "N100";
+  b.classList.toggle("on", Boolean(dev));
+  // Telegram topics are for this server's sessions only.
+  $("tg-toggle").classList.toggle("gone", Boolean(dev));
+  if (dev) {
+    const cwd = state.devCwd[dev.id] || recentCwds(dev.id)[0] || "~";
+    $("cwd-name").textContent = cwd.replace(/\/+$/, "").split("/").pop() || cwd;
+    $("cwd-btn").dataset.tip = `Новый чат запустится на «${dev.name}» в ${cwd}`;
+    $("cwd-btn").classList.add("on");
+  } else renderCwd();
+}
+function recentCwds(device) {
+  const seen = new Map();
+  for (const s of state.sessions) if (s.device === device && s.cwd && !seen.has(s.cwd)) seen.set(s.cwd, s.last_activity || 0);
+  return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([c]) => c);
+}
+$("dev-btn").onclick = () => {
+  const b = $("dev-btn");
+  openMenu([{ heading: "Где запустить новый чат" },
+    { label: "N100", sub: "Этот сервер · Telegram, ccgram", check: !remoteDevice(), action: () => { state.device = "local"; store.set("kara-device", "local"); renderDevice(); } },
+    ...(state.devices || []).map((d) => ({
+      label: d.name, sub: d.online ? "в сети · сессия в tmux на устройстве" : "не в сети", check: state.device === d.id, disabled: !d.online,
+      action: () => { state.device = d.id; store.set("kara-device", d.id); renderDevice(); },
+    }))], menuBelow(b), b);
+};
+function deviceCwdMenu() {
+  const dev = remoteDevice();
+  const b = $("cwd-btn");
+  const pick = (c) => { state.devCwd[dev.id] = c; store.set("kara-dev-cwd", JSON.stringify(state.devCwd)); renderDevice(); };
+  const cwds = recentCwds(dev.id).slice(0, 8);
+  openMenu([{ heading: `Папка на «${dev.name}»` },
+    ...cwds.map((c) => ({ label: c.replace(/^\/home\/[^/]+/, "~"), check: (state.devCwd[dev.id] || cwds[0]) === c, action: () => pick(c) })),
+    { label: "Домашняя папка", sub: "~", check: state.devCwd[dev.id] === "~", action: () => pick("~") },
+    "sep",
+    { label: "Другая папка…", sub: "Ввести путь", icon: SVG.folder, action: () => { const v = prompt(`Папка на «${dev.name}»`, state.devCwd[dev.id] || cwds[0] || "~"); if (v && v.trim()) pick(v.trim()); } },
+  ], menuBelow(b), b);
+}
 $("folder-pick").onclick = () => {
   state.cwd = $("folder-dlg").dataset.path || "";
   state.worktree = !$("folder-wt").hidden && $("folder-wt-box").checked;
