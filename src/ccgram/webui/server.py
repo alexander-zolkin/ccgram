@@ -69,6 +69,7 @@ import re
 from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 from aiohttp import web
 
@@ -525,6 +526,40 @@ async def _entries(request: web.Request) -> web.Response:
     )
 
 
+async def _rewind(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    return web.json_response(
+        await service.rewind_session(
+            _thread_id(request), str(body.get("uuid", "")), bool(body.get("files"))
+        )
+    )
+
+
+async def _agents(request: web.Request) -> web.Response:
+    return web.json_response(
+        await asyncio.to_thread(service.session_agents, _thread_id(request))
+    )
+
+
+async def _agent_entries(request: web.Request) -> web.Response:
+    def _int(name: str) -> int | None:
+        raw = request.query.get(name)
+        try:
+            return int(raw) if raw is not None else None
+        except ValueError:
+            raise service.WebUIError(f"bad {name}") from None
+
+    result = await asyncio.to_thread(
+        service.agent_entries,
+        _thread_id(request),
+        request.match_info["aid"],
+        limit=_int("limit") or service.DEFAULT_HISTORY,
+        before=_int("before"),
+        after=_int("after"),
+    )
+    return web.json_response(result)
+
+
 async def _rename(request: web.Request) -> web.Response:
     body = await _json_body(request)
     return web.json_response(
@@ -832,9 +867,35 @@ async def _search(request: web.Request) -> web.Response:
     return web.json_response(await service.search(request.query.get("q", "")))
 
 
+# Shown in the page; anything else downloads, so a file the agent sent (an
+# .html, say) never runs as a page of this origin.
+_INLINE_FILES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf")
+
+
 async def _file(request: web.Request) -> web.StreamResponse:
-    path = service.upload_file(_thread_id(request), request.query.get("path", ""))
-    return web.FileResponse(path, headers={"Cache-Control": "private, max-age=86400"})
+    path = await asyncio.to_thread(
+        service.upload_file, _thread_id(request), request.query.get("path", "")
+    )
+    headers = {"Cache-Control": "private, max-age=86400"}
+    if path.suffix.lower() not in _INLINE_FILES:
+        name = quote(path.name)
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{name}"
+    return web.FileResponse(path, headers=headers)
+
+
+async def _image(request: web.Request) -> web.Response:
+    media, data = await asyncio.to_thread(
+        service.transcript_image,
+        _thread_id(request),
+        request.query.get("ref", ""),
+        request.query.get("agent", ""),
+    )
+    # A line of the transcript never changes once written.
+    return web.Response(
+        body=data,
+        content_type=media,
+        headers={"Cache-Control": "private, max-age=604800, immutable"},
+    )
 
 
 async def _pane(request: web.Request) -> web.Response:
@@ -951,6 +1012,10 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/pin", _pin)
     r.add_post("/api/sessions/{tid}/sound", _sound)
     r.add_get("/api/sessions/{tid}/file", _file)
+    r.add_get("/api/sessions/{tid}/image", _image)
+    r.add_get("/api/sessions/{tid}/agents", _agents)
+    r.add_post("/api/sessions/{tid}/rewind", _rewind)
+    r.add_get("/api/sessions/{tid}/agents/{aid}/entries", _agent_entries)
     r.add_get("/api/search", _search)
     r.add_post("/api/sessions/{tid}/probe", _probe)
     r.add_get("/api/sessions/{tid}/live", _live)

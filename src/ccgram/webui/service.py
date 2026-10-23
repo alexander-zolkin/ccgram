@@ -30,7 +30,7 @@ from ..multiplexer import multiplexer as tmux_manager
 from ..multiplexer.window_ops import send_to_window
 from ..providers import get_provider_for_window
 from ..thread_router import thread_router
-from . import transcript
+from . import agents, rewind, transcript
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -374,10 +374,15 @@ async def entries(
         return {"items": [], "start": 0, "end": 0, "structured": False}
     limit = max(1, min(limit, MAX_HISTORY))
     if (provider or "claude") == "claude":
+        hidden = rewind.hidden_ranges(path)  # what rewinds abandoned
         if after is not None:
-            result = await asyncio.to_thread(transcript.read_after, path, after)
+            result = await asyncio.to_thread(
+                transcript.read_after, path, after, hidden=hidden
+            )
         else:
-            result = await asyncio.to_thread(transcript.read_tail, path, limit, before)
+            result = await asyncio.to_thread(
+                transcript.read_tail, path, limit, before, hidden=hidden
+            )
         return {**result, "structured": True}
     if after is not None or before is not None:
         return {"items": [], "start": 0, "end": 0, "structured": False}
@@ -415,7 +420,7 @@ async def _launch_effort(window_id: str) -> str | None:
             return arg.split("=", 1)[1]
     try:
         saved = json.loads((Path.home() / ".claude" / "settings.json").read_text())
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     return saved.get("effortLevel") if isinstance(saved, dict) else None
 
@@ -469,16 +474,116 @@ async def search(query: str) -> dict[str, Any]:
 
 
 def upload_file(thread_id: int, rel: str) -> Path:
-    """An uploaded file of a session, only from its ``.ccgram-uploads`` folder."""
+    """A file of a session the page may show: an upload in its
+    ``.ccgram-uploads`` folder, or one the agent sent with SendUserFile."""
     binding = find_binding(thread_id)
     cwd = _cwd_for(binding)
     if not cwd:
         raise WebUIError("no folder for this session", 404)
     folder = (Path(cwd) / _UPLOAD_DIR).resolve()
     path = (Path(cwd) / rel).resolve()
-    if folder not in path.parents or not path.is_file():
+    if not path.is_file():
         raise WebUIError("file not found", 404)
+    if folder in path.parents:
+        return path
+    transcript_path, provider = _transcript_for(binding)
+    if (
+        transcript_path is not None
+        and (provider or "claude") == "claude"
+        and _sent_by_agent(transcript_path, path)
+    ):
+        return path
+    raise WebUIError("file not found", 404)
+
+
+def _sent_by_agent(transcript_path: Path, path: Path) -> bool:
+    """Whether a SendUserFile call in the transcript names ``path``."""
+    needle = json.dumps(str(path))[1:-1].encode()
+    try:
+        with transcript_path.open("rb") as fh:
+            for raw in fh:
+                if b'"SendUserFile"' not in raw or needle not in raw:
+                    continue
+                with contextlib.suppress(ValueError):
+                    entry = json.loads(raw)
+                    if _names_file(entry, path):
+                        return True
+    except OSError:
+        return False
+    return False
+
+
+def _names_file(entry: Any, path: Path) -> bool:
+    if not isinstance(entry, dict) or entry.get("type") != "assistant":
+        return False
+    for block in (entry.get("message") or {}).get("content") or []:
+        if not isinstance(block, dict) or block.get("name") != "SendUserFile":
+            continue
+        files = (block.get("input") or {}).get("files") or []
+        if any(Path(str(f)).resolve() == path for f in files):
+            return True
+    return False
+
+
+def _claude_transcript(thread_id: int) -> Path:
+    path, provider = _transcript_for(find_binding(thread_id))
+    if path is None or (provider or "claude") != "claude":
+        raise WebUIError("no transcript", 404)
     return path
+
+
+def transcript_image(thread_id: int, ref: str, agent: str = "") -> tuple[str, bytes]:
+    """An image stored in a Claude session's transcript (see transcript.image_at),
+    or in one of its subagents' when ``agent`` names it."""
+    path: Path | None = _claude_transcript(thread_id)
+    if agent:
+        path = agents.agent_path(path, agent)
+    found = transcript.image_at(path, ref) if path else None
+    if found is None:
+        raise WebUIError("image not found", 404)
+    return found
+
+
+async def rewind_session(thread_id: int, uuid: str, files: bool) -> dict[str, Any]:
+    """Rewind a Claude session to just before prompt ``uuid`` (see rewind.py)."""
+    binding = find_binding(thread_id)
+    path = _claude_transcript(thread_id)
+    alive = await _window_alive(binding.window_id)
+    try:
+        return await rewind.rewind(
+            window_id=binding.window_id if alive else None,
+            transcript_path=path,
+            cwd=_cwd_for(binding),
+            uuid=uuid,
+            files=files,
+        )
+    except rewind.RewindError as exc:
+        raise WebUIError(str(exc), exc.status) from exc
+
+
+def session_agents(thread_id: int) -> dict[str, Any]:
+    """The session's subagents with their stats (see agents.list_agents)."""
+    path, provider = _transcript_for(find_binding(thread_id))
+    if path is None or (provider or "claude") != "claude":
+        return {"agents": [], "now": time.time()}
+    return {"agents": agents.list_agents(path), "now": time.time()}
+
+
+def agent_entries(
+    thread_id: int,
+    agent_id: str,
+    *,
+    limit: int = DEFAULT_HISTORY,
+    before: int | None = None,
+    after: int | None = None,
+) -> dict[str, Any]:
+    limit = max(1, min(limit, MAX_HISTORY))
+    found = agents.entries(
+        _claude_transcript(thread_id), agent_id, limit=limit, before=before, after=after
+    )
+    if found is None:
+        raise WebUIError("no such subagent", 404)
+    return found
 
 
 async def rename(bot: Bot, thread_id: int, name: str) -> dict[str, Any]:

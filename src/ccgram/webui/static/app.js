@@ -78,12 +78,19 @@ const hhmm = (ts) => {
 async function copyText(text, btn) {
   try {
     await navigator.clipboard.writeText(text);
-    if (btn) { const o = btn.textContent; btn.textContent = "Скопировано"; setTimeout(() => { btn.textContent = o; }, 1200); }
+    if (btn?.classList.contains("act-btn")) {
+      btn.innerHTML = ACT.done;
+      btn.classList.add("ok");
+      setTimeout(() => { btn.innerHTML = ACT.copy; btn.classList.remove("ok"); }, 1200);
+    } else if (btn) { const o = btn.textContent; btn.textContent = "Скопировано"; setTimeout(() => { btn.textContent = o; }, 1200); }
+    else toast("Скопировано");
   } catch (_) { toast("Не удалось скопировать"); }
 }
 
+
+const SVG_MORE = '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>';
 const SVG = {
-  more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>',
+  more: SVG_MORE,
   pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 17v5M8 3h8l-1 6 3 3v2H6v-2l3-3z"/></svg>',
   edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
   tg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M21.9 4.6l-3.1 14.7c-.2 1-.8 1.3-1.7.8l-4.7-3.5-2.3 2.2c-.3.3-.5.5-1 .5l.3-4.8 8.7-7.9c.4-.3-.1-.5-.6-.2L6.8 13.2 2.2 11.7c-1-.3-1-1 .2-1.5l18-6.9c.8-.3 1.6.2 1.5 1.3z"/></svg>',
@@ -104,6 +111,18 @@ const SVG = {
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
   branch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-12 3-12 8"/></svg>',
   chev: '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>',
+};
+
+// Message action icons (hover row under a reply, inside a user bubble).
+const ACT = {
+  copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="8.5" y="8.5" width="12" height="12" rx="2.5"/><path d="M15.5 8.5V6a2.5 2.5 0 0 0-2.5-2.5H6A2.5 2.5 0 0 0 3.5 6v7A2.5 2.5 0 0 0 6 15.5h2.5"/></svg>',
+  done: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+  listen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>',
+  stop: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>',
+  rewind: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3.5 4.5v4.6h4.6"/><path d="M12 8v4.2l2.8 1.8"/></svg>',
+  quote: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M8 11h12M8 16h9M4 11v5"/></svg>',
+  text: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 6h14M12 6v13M9 19h6"/></svg>',
+  more: SVG_MORE,
 };
 
 // ═══ popover menu ═══════════════════════════════════════════════════════════
@@ -165,6 +184,7 @@ document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeMen
 window.addEventListener("resize", closeMenu);
 
 function confirmDialog(title, text, okLabel, danger = true) {
+  // Callers may fill #confirm-extra just before; it is cleared on close.
   return new Promise((resolve) => {
     $("confirm-title").textContent = title;
     $("confirm-text").textContent = text;
@@ -172,7 +192,7 @@ function confirmDialog(title, text, okLabel, danger = true) {
     $("confirm-ok").className = `btn ${danger ? "danger-fill" : "primary"}`;
     const dlg = $("confirm");
     dlg.returnValue = "";
-    dlg.onclose = () => resolve(dlg.returnValue === "ok");
+    dlg.onclose = () => { resolve(dlg.returnValue === "ok"); setTimeout(() => { $("confirm-extra").innerHTML = ""; $("confirm-extra").hidden = true; }, 0); };
     dlg.showModal();
   });
 }
@@ -292,6 +312,10 @@ function toolDetail(t) {
     }
   } else if (t.name === "Agent" || t.name === "Task") {
     if (i.prompt) parts.push(`<div class="lbl">Задание</div><pre>${esc(i.prompt)}</pre>`);
+    if (r && !r.is_error && String(r.text || "").trim()) {
+      parts.push(`<div class="lbl">Отчёт</div><div class="md-out">${renderMarkdown(r.text).innerHTML}</div>`);
+      return parts.join("");
+    }
   } else {
     const shown = Object.fromEntries(Object.entries(i).filter(([k]) => k !== "description"));
     if (Object.keys(shown).length) parts.push(`<pre>${esc(JSON.stringify(shown, null, 2))}</pre>`);
@@ -304,6 +328,7 @@ function toolDetail(t) {
 }
 
 function stepStat(t) {
+  if (AGENT_TOOLS.has(t.name) && agentOf(t)) return agentStat(agentOf(t));
   if (!t.result) return '<span class="spin"></span>';
   if (t.result.is_error) return '<span class="bad">✕</span>';
   if (t.result.patch) {
@@ -317,11 +342,15 @@ function stepNode(t) {
   const m = toolMeta(t);
   const node = el("div", "step");
   node.innerHTML = `<div class="step-row"><span class="step-ico">${ICONS[m.icon] || ICONS.gear}</span><span class="step-title">${m.title}</span><span class="step-stat">${stepStat(t)}</span></div><div class="step-detail"></div>`;
+  if (AGENT_TOOLS.has(t.name)) node.classList.add("agent-step");
   node.querySelector(".step-row").onclick = () => {
+    // A subagent's step opens its own conversation (when its file is known).
+    if (AGENT_TOOLS.has(t.name) && !state.agentView?.building && agentOf(t)) { openAgent(t.id); return; }
     node.classList.toggle("open");
     if (node.classList.contains("open")) node.querySelector(".step-detail").innerHTML = toolDetail(t);
   };
   node._tool = t;
+  stepImages(node);
   return node;
 }
 
@@ -368,6 +397,7 @@ const state = {
   paneTimer: null,
   attachments: [],
   pending: new Map(),     // session id → {text, at} shown until the transcript has it
+  agents: new Map(),      // Agent tool_use id → its subagent's stats (open chat)
   drafts: new Map(),      // key → a chat still being created (see «a chat being created»)
   draft: null,            // key of the draft on screen
   actWin: "all",          // «Активность» window in the statistics sheet
@@ -389,7 +419,7 @@ const EFFORTS = [
 
 // ═══ thread rendering ═══════════════════════════════════════════════════════
 function userNode(it) {
-  const n = el("div", "u-msg");
+  const n = el("div", `u-msg${it.task ? " task-msg" : ""}`);
   const files = [];
   const text = String(it.text || "").replace(/^I've uploaded (?:an image to (\S+) — please take a look\.|(.+?) to (\S+))\s*$/gm, (_, img, name, path) => {
     files.push(img ? { name: img.split("/").pop().replace(/^\d{8}-\d{6}-/, ""), path: img } : { name, path });
@@ -399,20 +429,25 @@ function userNode(it) {
     const att = el("div", "att");
     for (const f of files) {
       if (f.path && state.current != null && /\.(png|jpe?g|gif|webp)$/i.test(f.path)) {
-        const img = el("img", "att-img");
-        img.loading = "lazy";
-        img.alt = f.name;
-        img.src = `/api/sessions/${state.current}/file?path=${encodeURIComponent(f.path)}`;
-        img.onerror = () => img.replaceWith(el("span", "", `🖼 ${esc(f.name)}`));
-        img.onclick = () => window.open(img.src, "_blank");
-        att.appendChild(img);
+        att.appendChild(thumb(fileUrl(f.path), f.name));
       } else att.appendChild(el("span", "", `📄 ${esc(f.name)}`));
     }
-    if (it.images) att.appendChild(el("span", "", `🖼 ${it.images}`));
+    if (it.imgs?.length) it.imgs.forEach((ref, i) => att.appendChild(thumb(imageUrl(ref), `картинка ${i + 1}`)));
+    else if (it.images) att.appendChild(el("span", "", `🖼 ${it.images}`));
     n.appendChild(att);
   }
   if (text) { const md = renderMarkdown(text); md.className = "u-md"; n.appendChild(md); }
-  n.appendChild(el("div", "u-meta", `<span class="msg-time">${esc(hhmm(it.ts))}</span><span class="tick">${TICK.read}</span>`));
+  n._item = it;
+  const meta = el("div", "u-meta");
+  if (!it.task) {
+    const acts = el("span", "u-acts");
+    acts.append(actBtn(ACT.copy, "Копировать", (b) => copyText(text, b)));
+    if (canRewind(it)) acts.append(actBtn(SVG.edit, "Изменить и отправить заново", () => rewindTo(it, { edit: true })));
+    acts.append(actBtn(ACT.more, "Ещё", (b) => openMenu(msgMenu(n), menuBelow(b), n)));
+    meta.append(acts);
+  }
+  meta.insertAdjacentHTML("beforeend", `<span class="msg-time">${esc(hhmm(it.ts))}</span><span class="tick">${TICK.read}</span>`);
+  n.appendChild(meta);
   return n;
 }
 
@@ -448,20 +483,23 @@ function flyIn(node) {
   );
 }
 
+function actBtn(icon, tip, run, cls = "") {
+  const b = el("button", `act-btn ${cls}`.trim(), icon);
+  b.type = "button";
+  b.dataset.tip = tip;
+  b.setAttribute("aria-label", tip);
+  b.onclick = (ev) => { ev.stopPropagation(); run(b, ev); };
+  return b;
+}
+
 function assistantNode(it) {
   const n = el("div", "a-msg");
+  n._item = it;
   n.appendChild(renderMarkdown(it.text));
   const actions = el("div", "msg-actions");
-  const copy = el("button", "copy-btn", "Копировать");
-  copy.type = "button";
-  copy.onclick = () => copyText(it.text, copy);
-  actions.append(copy);
-  if (state.tts) {
-    const listen = el("button", "copy-btn listen-btn", "Прослушать");
-    listen.type = "button";
-    listen.onclick = () => speak(n, listen);
-    actions.append(listen);
-  }
+  actions.append(actBtn(ACT.copy, "Копировать", (b) => copyText(it.text, b)));
+  if (state.tts) actions.append(actBtn(ACT.listen, "Прослушать", (b) => speak(n, b), "listen-btn"));
+  actions.append(actBtn(ACT.more, "Ещё", (b) => openMenu(msgMenu(n), menuBelow(b), n)));
   actions.append(el("span", "msg-time", esc(hhmm(it.ts))));
   n.appendChild(actions);
   return n;
@@ -541,6 +579,379 @@ function updateNode(it) {
   return n;
 }
 
+// Claude Code's own notes in the conversation — a recap after a break, idle
+// compaction, safeguards stepping in: quiet lines, as its console prints them.
+function noticeNode(it) {
+  const n = el("div", `notice ${it.level || "info"}`);
+  const text = String(it.text || "").replace(/^uds:\S+\s+is idle/, "Другая сессия освободилась");
+  const level = /safeguards/i.test(text) ? "warn" : it.level;
+  n.className = `notice ${level || "info"}`;
+  const ico = { warn: "⚠", recap: "※" }[level] || "ℹ";
+  n.innerHTML = `<span class="notice-ico">${ico}</span><span class="notice-text">${it.level === "recap" ? "<b>Сводка.</b> " : ""}${esc(text)}</span><span class="msg-time">${esc(hhmm(it.ts))}</span>`;
+  return n;
+}
+
+// "API Error: …" — Claude Code writes it in place of the reply.
+function errorNode(it) {
+  const n = el("div", "err-card");
+  const text = String(it.text || "").replace(/\n+Double press esc to edit your last message[^\n]*/i, "");
+  n.innerHTML = '<div class="err-head">⚠ Ответа нет — ошибка API</div>';
+  const body = renderMarkdown(text.replace(/^API Error:\s*/, ""));
+  body.className = "err-body";
+  n.appendChild(body);
+  const foot = el("div", "err-foot");
+  const edit = el("button", "btn small", "Изменить сообщение");
+  edit.type = "button";
+  edit.onclick = () => {
+    const prev = promptNear(n, -1);
+    if (prev) rewindTo(prev._item, { edit: true }); else toast("Сообщение выше не найдено — пролистай вверх");
+  };
+  if (currentSession()?.provider === "claude") foot.append(edit);
+  foot.insertAdjacentHTML("beforeend", `<span class="msg-time">${esc(hhmm(it.ts))}</span>`);
+  n._item = it;
+  n.appendChild(foot);
+  return n;
+}
+
+// A background task (a subagent, a command run in the background) reporting back.
+const TASK_RU = [
+  [/^Background command "(.+)" completed(?: \(exit code 0\))?$/s, "Фоновая команда «$1» выполнена"],
+  [/^Background command "(.+)" completed \((exit code [^)]*)\)$/s, "Фоновая команда «$1» завершилась ($2)"],
+  [/^Background command "(.+)" failed with exit code (\d+)$/s, "Фоновая команда «$1» упала (код $2)"],
+  [/^Background command "(.+)" was stopped$/s, "Фоновая команда «$1» остановлена"],
+  [/^Agent "(.+)" (?:finished|completed)$/s, "Субагент «$1» закончил"],
+  [/^Agent "(.+)" failed(.*)$/s, "Субагент «$1» упал$2"],
+];
+function taskNode(it) {
+  let text = String(it.text || "");
+  for (const [re, ru] of TASK_RU) if (re.test(text)) { text = text.replace(re, ru); break; }
+  const bad = /fail|error|kill/i.test(it.status || "");
+  const n = el(it.result ? "details" : "div", `task-line${bad ? " bad" : it.status === "completed" ? " ok" : ""}`);
+  const head = `<span class="task-ico">${bad ? "✕" : it.status === "completed" ? "✓" : "•"}</span><span class="task-text">${esc(text)}</span><span class="msg-time">${esc(hhmm(it.ts))}</span>`;
+  if (!it.result) { n.innerHTML = head; return n; }
+  n.innerHTML = `<summary>${head}</summary>`;
+  const body = renderMarkdown(it.result);
+  body.className = "summary-body";
+  n.appendChild(body);
+  return n;
+}
+
+// ── message actions: the «…» menu, right click, rewind ──
+const canRewind = (it) => Boolean(it && it.uuid && !it.queued && !it.task && state.structured && currentSession()?.provider === "claude");
+const plainText = (node) => (node.querySelector(".u-md, .a-msg > div:first-child, .err-body")?.innerText || node.innerText || "").trim();
+
+// The person's prompt next to a node: dir +1 = the next one below, -1 = above.
+function promptNear(node, dir) {
+  for (let n = dir > 0 ? node.nextElementSibling : node.previousElementSibling; n; n = dir > 0 ? n.nextElementSibling : n.previousElementSibling) {
+    if (n.classList.contains("u-msg") && canRewind(n._item)) return n;
+  }
+  return null;
+}
+
+function quoteInto(text) {
+  const q = String(text || "").trim().split("\n").map((l) => `> ${l}`).join("\n");
+  const box = $("input");
+  box.value = `${box.value.trim() ? box.value.replace(/\s*$/, "\n\n") : ""}${q}\n\n`;
+  autosize();
+  box.focus();
+  box.setSelectionRange(box.value.length, box.value.length);
+}
+
+function msgMenu(node) {
+  const it = node._item || {};
+  const items = [];
+  if (node.classList.contains("u-msg")) {
+    items.push(
+      { label: "Копировать", icon: ACT.copy, action: () => copyText(plainText(node)) },
+      { label: "Цитировать", icon: ACT.quote, action: () => quoteInto(plainText(node)) },
+    );
+    if (canRewind(it)) {
+      items.push("sep",
+        { label: "Изменить и отправить заново", sub: "Диалог вернётся к моменту до этого сообщения", icon: SVG.edit, action: () => rewindTo(it, { edit: true }) },
+        { label: "Откатить сюда…", sub: "Можно вернуть и файлы, которые менялись после", icon: ACT.rewind, action: () => rewindTo(it, { files: true }) });
+    }
+  } else if (node.classList.contains("a-msg")) {
+    items.push(
+      { label: "Копировать", sub: "С разметкой Markdown", icon: ACT.copy, action: () => copyText(it.text || plainText(node)) },
+      { label: "Копировать как текст", icon: ACT.text, action: () => copyText(plainText(node)) },
+      { label: "Цитировать", icon: ACT.quote, action: () => quoteInto(it.text || plainText(node)) },
+    );
+    if (state.tts && node.classList.contains("a-msg") && !node.classList.contains("a-update")) {
+      const b = node.querySelector(".listen-btn");
+      if (b) items.push({ label: state.speech?.btn === b ? "Остановить чтение" : "Прослушать", icon: ACT.listen, action: () => speak(node, b) });
+    }
+    const next = promptNear(node, 1);
+    if (next) items.push("sep", { label: "Вернуться к этому ответу", sub: "Всё, что было после, Кара забудет", icon: ACT.rewind, action: () => rewindTo(next._item, { back: true }) });
+  } else if (node.classList.contains("err-card")) {
+    items.push({ label: "Копировать", icon: ACT.copy, action: () => copyText(plainText(node)) });
+  }
+  return items;
+}
+
+function rewindDialog({ title, text, files }) {
+  const box = $("confirm-extra");
+  box.innerHTML = `<label class="check-row"><input type="checkbox" id="rw-files"${files ? " checked" : ""}><span>Вернуть и файлы<span class="sub">Правки, которые Кара сделала после этого сообщения, откатятся</span></span></label>`;
+  box.hidden = false;
+  return confirmDialog(title, text, "Откатить", false).then((ok) => ok && { files: $("rw-files").checked });
+}
+
+async function rewindTo(it, { edit = false, files = false, back = false } = {}) {
+  const tid = state.current;
+  const s = currentSession();
+  if (!canRewind(it) || tid == null) return;
+  const running = turnRunning(s) ? " Текущий ход будет остановлен." : "";
+  const choice = await rewindDialog({
+    title: back ? "Вернуться к этому ответу?" : edit ? "Изменить сообщение?" : "Откатить диалог сюда?",
+    text: (back
+      ? "Всё, что было после этого ответа, Кара забудет. Твоё следующее сообщение вернётся в поле ввода."
+      : "Диалог вернётся к моменту перед этим сообщением — всё, что было после, Кара забудет. Текст сообщения окажется в поле ввода: поправь и отправь.")
+      + (s && !s.web_only ? " В Telegram старые сообщения останутся." : "") + running,
+    files,
+  });
+  if (!choice) return;
+  toast("Откатываю…");
+  try {
+    const res = await api(`/api/sessions/${tid}/rewind`, { body: { uuid: it.uuid, files: choice.files } });
+    if (state.current !== tid) return;
+    state.pending.delete(tid);
+    await openSession(tid);
+    $("input").value = res.text || "";
+    store.set(draftKey(), $("input").value);
+    autosize();
+    $("input").focus();
+    toast(res.relaunched ? "Откатила. Сообщение — в поле ввода" : "Откатила — сессия проснётся уже с этого места");
+  } catch (e) { toast(`Не откатилось: ${e.message}`); }
+}
+
+// Right click on a message: its menu (a selection keeps the browser's own).
+$("thread").addEventListener("contextmenu", (ev) => {
+  const node = ev.target.closest(".u-msg, .a-msg, .err-card");
+  if (!node || node.classList.contains("pending") || ev.target.closest("a, img, pre, code")) return;
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed && node.contains(sel.anchorNode)) return;
+  const items = msgMenu(node);
+  if (!items.length) return;
+  ev.preventDefault();
+  openMenu(items, { x: ev.clientX, y: ev.clientY }, node);
+});
+// Touch: a tap on a message shows its actions (they stay hidden otherwise).
+$("thread").addEventListener("click", (ev) => {
+  if (!matchMedia("(hover: none)").matches) return;
+  const node = ev.target.closest(".u-msg, .a-msg");
+  if (!node || ev.target.closest("a, button, img, summary, .codebox, input")) return;
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return;
+  const was = node.classList.contains("show-act");
+  $("thread").querySelectorAll(".show-act").forEach((x) => x.classList.remove("show-act"));
+  if (!was) node.classList.add("show-act");
+});
+
+// ── images and files ──
+const imageUrl = (ref) => `/api/sessions/${state.current}/image?ref=${encodeURIComponent(ref)}${state.agentView?.building ? `&agent=${state.agentView.id}` : ""}`;
+const fileUrl = (path) => `/api/sessions/${state.current}/file?path=${encodeURIComponent(path)}`;
+const IMG_EXT = /\.(png|jpe?g|gif|webp)$/i;
+
+function thumb(src, alt = "") {
+  const img = el("img", "att-img");
+  img.loading = "lazy";
+  img.alt = alt;
+  img.src = src;
+  img.onerror = () => img.replaceWith(el("span", "img-gone", `🖼 ${esc(alt || "картинка недоступна")}`));
+  img.onclick = (ev) => { ev.stopPropagation(); openImage(src, alt); };
+  return img;
+}
+
+function openImage(src, alt = "") {
+  const box = $("lightbox");
+  box.querySelector("img").src = src;
+  box.querySelector("img").alt = alt;
+  box.querySelector(".lb-open").href = src;
+  box.hidden = false;
+  replay(box, "fade");
+}
+function closeImage() { $("lightbox").hidden = true; $("lightbox").querySelector("img").removeAttribute("src"); }
+$("lightbox").addEventListener("click", (ev) => { if (!ev.target.closest(".lb-open")) closeImage(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("lightbox").hidden) { ev.stopImmediatePropagation(); closeImage(); } }, true);
+
+function stepImages(node) {
+  const refs = node._tool.result?.imgs || [];
+  if (!refs.length || node.querySelector(".step-imgs")) return;
+  const box = el("div", "step-imgs");
+  refs.forEach((ref, i) => box.appendChild(thumb(imageUrl(ref), `${toolMeta(node._tool).label} · ${i + 1}`)));
+  node.querySelector(".step-row").after(box);
+}
+
+// SendUserFile: what the agent hands over — a message of its own, not a step.
+function sentFilesNode(t) {
+  const i = t.input || {};
+  const n = el("div", "a-msg sent-files");
+  if (i.caption) n.appendChild(renderMarkdown(i.caption));
+  const list = el("div", "file-list");
+  for (const f of Array.isArray(i.files) ? i.files : []) {
+    const name = String(f).split("/").pop();
+    if (IMG_EXT.test(name)) { list.appendChild(thumb(fileUrl(f), name)); continue; }
+    const a = el("a", "file-chip", `<span class="ext">${esc((name.split(".").pop() || "file").slice(0, 4))}</span><span class="nm">${esc(name)}</span><span class="dl">Скачать</span>`);
+    a.href = fileUrl(f);
+    a.download = name;
+    list.appendChild(a);
+  }
+  n.appendChild(list);
+  n.appendChild(el("div", "msg-actions", `<span class="msg-time">${esc(hhmm(t.ts))}</span>`));
+  return n;
+}
+
+// ── subagents ──
+// Each Agent call runs a conversation of its own (webui/agents.py). Its step
+// shows the agent's progress and opens that conversation; running agents are
+// listed above the composer with what they are doing right now.
+const AGENT_TOOLS = new Set(["Agent", "Task"]);
+const agentOf = (t) => state.agents.get(t.id);
+const agentSecs = (a) => Math.max(0, Math.round(((a.status === "running" ? Date.now() / 1000 + (state.agentSkew || 0) : a.last || a.started) - (a.started || 0))));
+const sinceAttr = (a) => (a.status === "running" && a.started ? ` data-since="${a.started - (state.agentSkew || 0)}"` : "");
+
+function agentStat(a) {
+  const n = `${a.tools} ${plural(a.tools, "действие", "действия", "действий")}`;
+  if (a.status === "running") return `<span class="spin"></span><span>${n} · <span${sinceAttr(a)}>${clock(agentSecs(a))}</span></span>`;
+  const mark = a.status === "done" ? '<span class="ok">✓</span>' : '<span class="bad" data-tip="Остановлен, не закончив">■</span>';
+  return `${mark}<span>${n} · ${esc(secsRu(Math.max(1, agentSecs(a))))}${a.out ? ` · ${tokRu(a.out)} ток.` : ""}</span>`;
+}
+
+function paintAgentStep(node) {
+  const a = agentOf(node._tool);
+  if (!a) return;
+  node.querySelector(".step-stat").innerHTML = agentStat(a);
+  node.classList.toggle("running", a.status === "running");
+}
+
+async function refreshAgents(tid) {
+  try {
+    const data = await api(`/api/sessions/${tid}/agents`);
+    if (tid !== state.current) return;
+    state.agentSkew = data.now - Date.now() / 1000;
+    state.agents = new Map(data.agents.map((a) => [a.tool_id || a.id, a]));
+    document.querySelectorAll("#thread .agent-step").forEach(paintAgentStep);
+    if (state.lastLive?.tid === tid) renderLive(state.lastLive.live, currentSession());
+    if (state.agentView?.tid === tid) paintAgentHead();
+  } catch (_) { /* next poll */ }
+}
+const runningAgents = () => [...state.agents.values()].filter((a) => a.status === "running");
+
+// Rows above the composer: one per running agent, a tap opens it.
+function renderAgentsLive(names) {
+  const box = $("live-agents");
+  const running = runningAgents();
+  box.innerHTML = "";
+  if (!running.length) {
+    if (names.length) box.innerHTML = `<span class="la-ico">${ICONS.bot}</span><span>${names.length === 1 ? "Субагент" : `Субагентов: ${names.length}`} — ${names.map((a) => `<b>${esc(a)}</b>`).join(", ")}</span>`;
+    return Boolean(names.length);
+  }
+  box.appendChild(el("div", "la-title", `${ICONS.bot}<span>${running.length === 1 ? "Работает субагент" : `Работают субагенты · ${running.length}`}</span>`));
+  for (const a of running) {
+    const row = el("button", "la-row", `<span class="spin"></span><b>${esc(a.description || a.type || "Субагент")}</b><span class="la-act">${esc(a.action || "")}</span><span class="la-n">${a.tools} · <span${sinceAttr(a)}>${clock(agentSecs(a))}</span></span>`);
+    row.type = "button";
+    row.onclick = () => openAgent(a.tool_id || a.id);
+    box.appendChild(row);
+  }
+  return true;
+}
+
+// The agent's own conversation in the sheet, live while it runs.
+function agentScope(fn) {
+  const v = state.agentView;
+  const keep = [state.seen, state.steps];
+  [state.seen, state.steps] = [v.seen, v.steps];
+  v.building = true;
+  try { return fn(); } finally { [state.seen, state.steps] = keep; v.building = false; }
+}
+
+function paintAgentHead() {
+  const v = state.agentView;
+  const a = v && state.agents.get(v.key);
+  const head = $("sheet-body").querySelector(".av-head");
+  if (!a || !head) return;
+  const status = { running: "работает", done: "закончил", stopped: "остановлен" }[a.status] || a.status;
+  head.innerHTML = `<div class="av-tiles">
+    <div class="st-tile"><b class="av-status ${esc(a.status)}">${a.status === "running" ? '<span class="spin"></span>' : ""}${esc(status)}</b><span>${esc(a.type || "субагент")}${a.background ? " · в фоне" : ""}</span></div>
+    <div class="st-tile"><b${sinceAttr(a)}>${a.status === "running" ? clock(agentSecs(a)) : esc(secsRu(Math.max(1, agentSecs(a))))}</b><span>${a.status === "running" ? "идёт" : "заняло"}</span></div>
+    <div class="st-tile"><b>${a.tools}</b><span>${plural(a.tools, "действие", "действия", "действий")}${a.errors ? ` · ${a.errors} с ошибкой` : ""}</span></div>
+    <div class="st-tile"><b>${tokRu(a.out || 0)}</b><span>токенов написал</span></div>
+    ${a.model ? `<div class="st-tile"><b>${esc(prettyModel(a.model))}</b><span>модель</span></div>` : ""}
+  </div>`;
+  $("sheet-title").textContent = `Субагент · ${a.description || a.type || a.id}`;
+}
+
+async function openAgent(key) {
+  const tid = state.current;
+  const a = state.agents.get(key);
+  if (!a) return false;
+  openSheet(`Субагент · ${a.description || a.type || a.id}`);
+  state.sheetPath = null;
+  $("sheet-frame").hidden = true;
+  const body = $("sheet-body");
+  body.hidden = false;
+  body.classList.add("agent-view");
+  body.innerHTML = '<div class="av-head"></div><div class="av-thread"><div class="loader-row">Загружаю…</div></div>';
+  state.agentView = { tid, key, id: a.id, start: 0, end: 0, seen: new Set(), steps: new Map(), timer: null };
+  paintAgentHead();
+  try {
+    const data = await api(`/api/sessions/${tid}/agents/${a.id}/entries?limit=300`);
+    const v = state.agentView;
+    if (!v || v.key !== key) return true;
+    v.start = data.start;
+    v.end = data.end;
+    const box = body.querySelector(".av-thread");
+    box.innerHTML = data.start > 0 ? '<div class="loader-row">Показаны последние шаги</div>' : "";
+    box.appendChild(agentScope(() => buildBlocks(markTask(data.items), null)));
+    box.querySelectorAll(".steps").forEach((b) => b.classList.add("open"));
+    body.scrollTop = a.status === "running" ? body.scrollHeight : 0;
+  } catch (e) {
+    body.querySelector(".av-thread").innerHTML = `<div class="loader-row">Не загрузилось: ${esc(e.message)}</div>`;
+  }
+  pollAgent();
+  return true;
+}
+
+// The agent's first message is its task, written by the parent session.
+function markTask(items) {
+  const first = items.find((it) => it.kind === "user");
+  if (first && !state.agentView.start) first.task = true;
+  return items;
+}
+
+async function pollAgent() {
+  const v = state.agentView;
+  if (!v) return;
+  clearTimeout(v.timer);
+  const a = state.agents.get(v.key);
+  if (a && a.status === "running" && !document.hidden) {
+    try {
+      const data = await api(`/api/sessions/${v.tid}/agents/${v.id}/entries?after=${v.end}`);
+      if (state.agentView === v && data.items.length) {
+        v.end = data.end;
+        const body = $("sheet-body");
+        const stick = body.scrollHeight - body.scrollTop - body.clientHeight < 120;
+        const box = body.querySelector(".av-thread");
+        const frag = agentScope(() => buildBlocks(data.items, box.lastElementChild));
+        frag.querySelectorAll?.(".steps").forEach((b) => b.classList.add("open"));
+        box.appendChild(frag);
+        if (stick) body.scrollTop = body.scrollHeight;
+      } else if (state.agentView === v) v.end = data.end;
+    } catch (_) { /* next tick */ }
+  }
+  if (state.agentView === v) v.timer = setTimeout(pollAgent, 2000);
+}
+
+// ExitPlanMode carries the plan the agent asks to approve: shown as a card.
+function planNode(t) {
+  const n = el("details", "plan-card");
+  n.open = true;
+  n.innerHTML = '<summary><span class="plan-ico">☰</span>План</summary>';
+  const body = renderMarkdown(String(t.input?.plan || ""));
+  body.className = "plan-body";
+  n.appendChild(body);
+  return n;
+}
+
 // "Baked for 19s" in Claude Code: how long a finished turn took, what it wrote.
 const secsRu = (sec) => (sec < 60 ? `${sec} с` : sec < 3600 ? `${Math.floor(sec / 60)} мин${sec % 60 ? ` ${sec % 60} с` : ""}` : `${Math.floor(sec / 3600)} ч ${Math.floor((sec % 3600) / 60)} мин`);
 const clock = (sec) => { const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = String(sec % 60).padStart(2, "0"); return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
@@ -561,6 +972,9 @@ function itemKey(it) {
   return it.uuid ? `${it.kind}:${it.uuid}` : null;
 }
 
+// Tool calls that speak to the person: cards in the thread, not steps.
+const STANDALONE = { SendUserFile: sentFilesNode, ExitPlanMode: planNode };
+
 function buildBlocks(items, continueFrom, live = false) {
   const frag = document.createDocumentFragment();
   let steps = continueFrom && continueFrom.classList.contains("steps") ? continueFrom : null;
@@ -570,6 +984,7 @@ function buildBlocks(items, continueFrom, live = false) {
       if (node) {
         node._tool.result = it;
         node.querySelector(".step-stat").innerHTML = stepStat(node._tool);
+        stepImages(node);
         if (node.classList.contains("open")) node.querySelector(".step-detail").innerHTML = toolDetail(node._tool);
         refreshStepsHead(node.closest(".steps"));
       }
@@ -579,6 +994,11 @@ function buildBlocks(items, continueFrom, live = false) {
     if (key) {
       if (state.seen.has(key)) continue;
       state.seen.add(key);
+    }
+    if (it.kind === "tool" && STANDALONE[it.name]) {
+      steps = null;
+      frag.appendChild(STANDALONE[it.name](it));
+      continue;
     }
     if (it.kind === "tool" || it.kind === "thinking") {
       if (!steps) { steps = stepsBlock(); frag.appendChild(steps); }
@@ -601,7 +1021,7 @@ function buildBlocks(items, continueFrom, live = false) {
     // An update says what the thinking was: it replaces a bare «Размышляла».
     if (it.kind === "update" && steps && !steps.querySelector(".steps-inner").children.length) steps.remove();
     steps = null;
-    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode, peer: peerNode, update: updateNode, turn: turnNode }[it.kind]?.(it) || assistantNode(it);
+    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode, peer: peerNode, update: updateNode, turn: turnNode, notice: noticeNode, error: errorNode, task: taskNode }[it.kind]?.(it) || assistantNode(it);
     // The transcript copy replaces the pending bubble in place: no re-entry.
     if ((it.kind === "user" || it.kind === "bash" || it.kind === "command") && clearPending()) node.classList.add("swap");
     frag.appendChild(node);
@@ -621,6 +1041,8 @@ function markLast() {
   thread.querySelectorAll(".a-msg.last").forEach((n) => n.classList.remove("last"));
   const msgs = thread.querySelectorAll(".a-msg");
   msgs[msgs.length - 1]?.classList.add("last");
+  // A turn's closing reply keeps its actions in view on touch screens.
+  thread.querySelectorAll(".turn-stat").forEach((t) => { const a = t.previousElementSibling; if (a?.classList.contains("a-msg")) a.classList.add("final"); });
 }
 
 function nearBottom() {
@@ -734,6 +1156,7 @@ function showHome() {
   $("cwd-btn").hidden = false;
   $("home-actions").hidden = false;
   $("mode-btn").hidden = true;
+  $("sess-effort-btn").hidden = true;
   $("live").hidden = true;
   renderCwd();
   $("input").placeholder = "Как я могу помочь?";
@@ -761,6 +1184,8 @@ function enterChat() {
   $("live").hidden = true;
   $("mode-btn").hidden = true;
   $("mode-btn").dataset.mode = "";
+  $("sess-effort-btn").hidden = true;
+  state.meta = null;
   $("input").placeholder = "Ответить Каре…";
   $("prompt-card").hidden = true;
   $("chat-meta").hidden = true;
@@ -773,6 +1198,7 @@ async function openSession(tid, { keep = false } = {}) {
   state.current = tid;
   state.draft = null;
   state.unread.delete(tid);
+  if (state.agentsAt !== tid) { state.agents = new Map(); state.agentsAt = null; }
   loadDraft();
   if (location.hash !== `#${tid}`) history.replaceState(null, "", `#${tid}`);
   $("pane-btn").hidden = false;
@@ -806,6 +1232,8 @@ async function openSession(tid, { keep = false } = {}) {
   }
   pollPane();
   probeTopic(tid);
+  state.agentsAt = tid;
+  refreshAgents(tid);
   if (!isMobile()) $("input").focus();
 }
 
@@ -903,7 +1331,7 @@ const TIP = {
   document.addEventListener("scroll", () => { tip.hidden = true; }, true);
   document.addEventListener("click", (ev) => {
     // Only for passive markers (flags, ticks): buttons keep doing their job.
-    const t = ev.target.closest?.(".s-flag[data-tip], .tick[data-tip], .u-hit[data-tip]");
+    const t = ev.target.closest?.(".s-flag[data-tip], .tick[data-tip], .u-status[data-tip], .u-hit[data-tip]");
     if (t && matchMedia("(hover: none)").matches) { ev.preventDefault(); ev.stopPropagation(); toast(t.dataset.tip); }
   }, true);
 })();
@@ -1157,8 +1585,8 @@ function soundMenu(s) {
 }
 
 function effortMenu(s) {
-  const info = $("chat-meta").hidden ? "" : $("chat-meta").dataset.info;
-  const now = $("chat-meta").hidden ? "" : $("chat-meta").dataset.effort;
+  const info = state.meta?.tid === s.thread_id ? state.meta.info : "";
+  const now = state.meta?.tid === s.thread_id ? state.meta.effort : "";
   return [
     ...(info ? [{ heading: info }, "sep"] : []),
     { heading: "Усилие этой сессии" },
@@ -1166,6 +1594,7 @@ function effortMenu(s) {
       label, sub, check: id === now, action: async () => {
         try {
           await api(`/api/sessions/${s.thread_id}/send`, { body: { text: `/effort ${id}` } });
+          if (state.meta?.tid === s.thread_id) { state.meta.effort = id; renderSessEffort(); }
           toast(`Усилие: ${label.toLowerCase()}`);
         } catch (e) { toast(e.message); }
       },
@@ -1196,16 +1625,66 @@ function promptOptions(text) {
   for (const line of String(text).split("\n")) {
     const m = line.match(/^\s*(?:[❯›>]\s*)?(\d)\.\s+(.+?)\s*$/);
     if (m) opts.push({ key: m[1], label: m[2].replace(/\s*\((?:esc|tab)\)\s*$/i, ""), current: /^\s*[❯›>]/.test(line) });
+    // A long option wraps onto an indented line of its own.
+    else if (opts.length && /^\s{5,}\S/.test(line)) opts[opts.length - 1].label += ` ${line.trim()}`;
+    else if (!line.trim() && opts.length) break;
   }
   return opts;
 }
 
-function renderPrompt(inter) {
+// Claude Code draws what it asks about (the command, the file, the diff) in a
+// box above the question; the parsed prompt starts at the question, so the
+// box is read off the pane: from the rule above it down to the question.
+function promptContext(pane, content) {
+  const lines = String(pane || "").split("\n");
+  const first = String(content || "").split("\n").find((l) => l.trim())?.trim();
+  if (!first) return "";
+  let end = -1;
+  for (let i = lines.length - 1; i >= 0; i--) if (lines[i].trim() === first) { end = i; break; }
+  if (end < 0) return "";
+  let start = end;
+  while (start > 0 && !/^\s*─{8,}\s*$/.test(lines[start - 1]) && end - start < 80) start--;
+  const box = lines.slice(start, end)
+    .filter((l) => !/^\s*Tip:/.test(l))
+    .map((l) => (/^\s*[╌─]{8,}\s*$/.test(l) ? "" : l.replace(/\s+$/, "")));
+  const indent = Math.min(...box.filter((l) => l.trim()).map((l) => l.match(/^ */)[0].length));
+  return box.map((l) => l.slice(Number.isFinite(indent) ? indent : 0)).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+const PROMPT_RU = [
+  [/^Do you want to proceed\?$/, "Выполнить?"],
+  [/^Do you want to make this edit to (.+)\?$/, "Внести эту правку в $1?"],
+  [/^Do you want to create (.+)\?$/, "Создать $1?"],
+  [/^Do you want to allow (.+)\?$/, "Разрешить $1?"],
+  [/^Would you like to proceed\?$/, "Продолжить?"],
+];
+const OPTION_RU = [
+  [/^Yes$/, "Да"],
+  [/^No$/, "Нет"],
+  [/^No, and tell Claude what to do differently$/, "Нет — и сказать, как надо"],
+  [/^Yes, and don't ask again for (.+?)(?: commands)? in (.+)$/, "Да, и больше не спрашивать про $1 в $2"],
+  [/^Yes, and don't ask again(.*)$/, "Да, и больше не спрашивать$1"],
+  [/^Yes, and always allow access to (.+?) from this project$/, "Да, и всегда пускать в $1 в этом проекте"],
+  [/^Yes, allow all edits during this session.*$/, "Да, разрешить все правки в этой сессии"],
+  [/^Yes, and switch to auto mode.*$/, "Да, и включить авто-режим"],
+  [/^Yes, and auto-accept edits$/, "Да, и дальше принимать правки сами"],
+  [/^Yes, and manually approve edits$/, "Да, но правки подтверждать"],
+];
+const ruLine = (text, table) => { for (const [re, ru] of table) if (re.test(text)) return text.replace(re, ru); return text; };
+
+function renderPrompt(inter, pane) {
   $("prompt-title").textContent = inter.name === "AskUserQuestion" ? "Кара задаёт вопрос" : /Permission/i.test(inter.name) ? "Кара просит разрешения" : "Кара ждёт выбора";
-  const opts = promptOptions(inter.content);
+  const opts = promptOptions(inter.content).map((o) => ({ ...o, label: ruLine(o.label, OPTION_RU) }));
+  const what = inter.name === "AskUserQuestion" ? "" : promptContext(pane, inter.content);
+  const whatBox = $("prompt-what");
+  whatBox.hidden = !what;
+  if (what && whatBox.dataset.sig !== what) {
+    whatBox.dataset.sig = what;
+    const [head, ...rest] = what.split("\n");
+    whatBox.innerHTML = `<div class="pw-head">${esc(head)}</div>${rest.join("\n").trim() ? `<pre>${esc(rest.join("\n").trim())}</pre>` : ""}`;
+  }
   // Without the option lines the question reads cleaner; the buttons carry them.
   $("prompt-text").textContent = opts.length
-    ? inter.content.split("\n").filter((l) => !/^\s*(?:[❯›>]\s*)?\d\.\s/.test(l) && !/^\s*Esc to cancel/i.test(l)).join("\n").trim()
+    ? inter.content.split("\n").filter((l) => !/^\s*(?:[❯›>]\s*)?\d\.\s/.test(l) && !/^\s*Esc to cancel/i.test(l) && !/^\s{4,}\S/.test(l)).map((l) => ruLine(l.trim(), PROMPT_RU)).join("\n").trim()
     : inter.content;
   const sig = opts.map((o) => o.key + o.label).join("|");
   const box = $("prompt-options");
@@ -1232,9 +1711,22 @@ function prettyModel(id) {
 }
 const kTokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1000)}k`);
 
+// The session's effort, in the composer next to the mode chip.
+const EFFORT_SHORT = { low: "низкое", medium: "среднее", high: "высокое", xhigh: "очень высокое", max: "макс." };
+function renderSessEffort() {
+  const b = $("sess-effort-btn");
+  const s = currentSession();
+  const e = state.meta?.tid === state.current ? state.meta.effort : "";
+  b.hidden = !s || s.provider !== "claude" || !e;
+  if (b.hidden) return;
+  $("sess-effort-name").textContent = EFFORT_SHORT[e] || e;
+  b.dataset.level = e;
+}
+
 function renderMeta(meta) {
   const box = $("chat-meta");
-  if (!meta || !meta.context) { box.hidden = true; return; }
+  state.meta = meta && meta.context ? { tid: state.current, effort: meta.effort || "" } : null;
+  if (!meta || !meta.context) { box.hidden = true; renderSessEffort(); return; }
   // The transcript names the model without «[1m]»; ccgram launches every
   // Claude but Haiku on the 1M window (model_catalog.with_1m_context).
   const oneM = meta.context > 200000 || /1m/i.test(meta.model) || (/^claude-/.test(meta.model) && !/haiku/i.test(meta.model));
@@ -1247,6 +1739,8 @@ function renderMeta(meta) {
   box.title = `${meta.model} · контекст ${meta.context.toLocaleString("ru-RU")} из ${kTokens(cap)} токенов${effort ? ` · усилие: ${effort[1].toLowerCase()}` : ""}`;
   // Phones show only the ring; the tap menu heads with this line.
   box.dataset.info = `${prettyModel(meta.model)} · контекст ${kTokens(meta.context)} из ${kTokens(cap)} (${pct}%)`;
+  state.meta.info = box.dataset.info;
+  renderSessEffort();
   box.innerHTML = `<span class="m-name">${esc(prettyModel(meta.model))}</span><span class="ctx${pct >= 80 ? " hot" : ""}"><span class="ctx-bar"><i style="width:${pct}%"></i></span><span class="ctx-ring" style="--p:${pct}"></span><span class="ctx-n">${kTokens(meta.context)}</span></span>`;
 }
 
@@ -1273,10 +1767,11 @@ async function pollPane() {
         }
         state.lastLive = { tid, live };
         renderLive(live, s);
+        if (turnRunning(s) || runningAgents().length) refreshAgents(tid);
         if (s.provider === "claude" && (!state.modeAt || Date.now() - state.modeAt > 15000)) refreshMode(tid);
         const inter = data.interactive;
         $("prompt-card").hidden = !inter;
-        if (inter) renderPrompt(inter);
+        if (inter) renderPrompt(inter, data.text);
         renderMeta(data.meta);
         updateLed();
       }
@@ -1287,7 +1782,7 @@ async function pollPane() {
       const data = await api(`/api/sessions/${tid}/pane`);
       if (tid === state.current) {
         $("prompt-card").hidden = !data.interactive;
-        if (data.interactive) renderPrompt(data.interactive);
+        if (data.interactive) renderPrompt(data.interactive, data.text);
         updateLed();
       }
     } catch (_) { /* transient */ }
@@ -1697,13 +2192,28 @@ function notify(s, e) {
     });
 }
 
+// The live feed. A browser's EventSource retries a dropped connection by
+// itself, but gives up for good on a non-200 answer (a 502 while the daemon
+// restarts): then this reconnects, backing off up to 30 s, and at once when
+// the tab comes back or the network returns.
 function connect() {
+  clearTimeout(state.esRetry);
   state.es?.close();
   const es = new EventSource("/api/events");
   state.es = es;
-  const online = (on) => { $("conn").classList.toggle("on", on); $("conn-text").textContent = on ? "на связи" : "нет связи"; };
-  es.onopen = () => online(true);
-  es.onerror = () => { online(false); api("/api/me").catch(() => {}); };
+  const online = (on) => { $("conn").classList.toggle("on", on); $("conn-text").textContent = on ? "на связи" : "переподключаюсь…"; };
+  es.onopen = () => {
+    online(true);
+    if (state.esWait) { state.esWait = 0; if (state.current != null) fetchNew(); refreshSessions().catch(() => {}); }
+  };
+  es.onerror = () => {
+    online(false);
+    api("/api/me").catch(() => {});
+    if (es.readyState === EventSource.CLOSED && state.es === es) {
+      state.esWait = Math.min(30000, (state.esWait || 1000) * 2);
+      state.esRetry = setTimeout(connect, state.esWait);
+    } else state.esWait = state.esWait || 1000;
+  };
   es.onmessage = (ev) => {
     const e = JSON.parse(ev.data);
     if (e.type === "sessions") {
@@ -1721,6 +2231,10 @@ function connect() {
     }
   };
 }
+
+const reconnectIfDown = () => { if (state.es && state.es.readyState === EventSource.CLOSED) connect(); };
+document.addEventListener("visibilitychange", () => { if (!document.hidden) reconnectIfDown(); });
+window.addEventListener("online", reconnectIfDown);
 
 // ═══ theme / profile ════════════════════════════════════════════════════════
 function applyTheme(mode) {
@@ -2485,6 +2999,8 @@ function turnClock(live, status) {
   tickWork();
 }
 function tickWork() {
+  // Running subagents' clocks (live rows, steps, the agent sheet).
+  document.querySelectorAll("[data-since]").forEach((n) => { n.textContent = clock(Math.max(0, Math.round(Date.now() / 1000 - Number(n.dataset.since)))); });
   const meta = $("working-meta");
   const c = state.turnClock;
   if (!c || c.tid !== (state.current ?? state.draft) || $("working").hidden) { meta.hidden = true; return; }
@@ -2506,16 +3022,19 @@ function renderLive(live, s) {
   if ($("working").hidden === working) renderHeader();
   if (!working) state.turnClock = null;
   const idleText = s && s.state === "dead" ? "Бужу сессию…" : workVerb(live?.turn?.start);
-  if (!live || !working) { box.hidden = true; if (working) $("working-text").textContent = idleText; tickWork(); refreshMsgStatus(); return; }
+  if (!live || !working) {
+    // Agents sent to the background keep working after the turn ends.
+    $("live-list").innerHTML = "";
+    box.hidden = !renderAgentsLive([]);
+    if (working) $("working-text").textContent = idleText;
+    tickWork(); refreshMsgStatus(); return;
+  }
   const status = parseStatus(live.status);
   // Claude Code's own whimsical word ("Combobulating…") reads as ours, in Russian.
   const text = status.text.replace(/^[A-Za-z'’-]+…/, idleText);
   $("working-text").textContent = text || live.wait || idleText;
   turnClock(live, status);
-  const agents = live.subagents || [];
-  $("live-agents").innerHTML = agents.length
-    ? `<span class="la-ico">${ICONS.bot}</span><span>${agents.length === 1 ? "Субагент" : `Субагентов: ${agents.length}`} — ${agents.map((a) => `<b>${esc(a)}</b>`).join(", ")}</span>`
-    : "";
+  const agentsShown = renderAgentsLive(live.subagents || []);
   const items = (live.todos && live.todos.length)
     ? live.todos.map((t) => ({ text: t.text, mark: t.status === "completed" ? "done" : t.status === "in_progress" ? "doing" : "todo" }))
     : (live.progress || []).map((line) => {
@@ -2524,7 +3043,7 @@ function renderLive(live, s) {
     });
   const list = $("live-list");
   list.innerHTML = items.slice(0, 12).map((it) => `<li class="${it.mark}"><span class="lm"></span><span>${esc(it.text)}</span></li>`).join("");
-  box.hidden = !agents.length && !items.length;
+  box.hidden = !agentsShown && !items.length;
   refreshMsgStatus();
 }
 
@@ -2599,6 +3118,14 @@ $("mode-btn").onclick = () => {
   if (b.classList.contains("menu-open")) { closeMenu(); return; }
   const r = b.getBoundingClientRect();
   openMenu(modeMenu(), { x: r.right - 300, y: r.bottom + 6, top: r.top }, b, "mode-menu");
+};
+$("sess-effort-btn").onclick = () => {
+  const s = currentSession();
+  const b = $("sess-effort-btn");
+  if (!s || s.provider !== "claude") return;
+  if (b.classList.contains("menu-open")) { closeMenu(); return; }
+  const r = b.getBoundingClientRect();
+  openMenu(effortMenu(s), { x: r.left, y: r.bottom + 6, top: r.top }, b);
 };
 
 // ═══ coloured terminal (ANSI SGR → HTML) ═════════════════════════════════════
@@ -2822,12 +3349,15 @@ async function setNotifyMode(mode) {
 }
 
 // ═══ message status: sending → delivered → read → being worked on ═══════════
+// One clear word per stage, the tooltip says what it means:
+// 🕓 not on the server yet → ✓ typed into Claude Code's terminal → ✓✓ in the
+// transcript, i.e. the model has it (then: working on it, or answered).
 const MSG_STATUS = {
-  sending: "Отправляется…",
-  sent: "Доставлено в сессию — модель ещё не прочитала",
-  queued: "Claude Code отдаст его модели на следующем шаге, работу не прерывает",
-  read: "Прочитано моделью",
-  working: "Прочитано — Кара работает над этим",
+  sending: ["отправляю…", "Ещё не дошло до сервера"],
+  sent: ["в терминале", "Сервер вписал сообщение в Claude Code, но модель его ещё не взяла (обычно секунда-две)"],
+  queued: ["в очереди", "Кара сейчас работает: Claude Code отдаст ей сообщение на следующем шаге, работу не прерывает"],
+  read: ["получено", "Сообщение у модели — оно в транскрипте сессии"],
+  working: ["Кара работает", "Сообщение у модели, она работает над ним"],
 };
 function refreshMsgStatus() {
   const thread = $("thread");
@@ -2847,8 +3377,9 @@ function refreshMsgStatus() {
   last.classList.add("latest");
   last.dataset.status = st;
   const label = last.querySelector(".u-status") || last.querySelector(".u-meta").insertBefore(el("span", "u-status"), last.querySelector(".u-meta").firstChild);
-  label.textContent = { sending: "отправляется", sent: "доставлено", queued: "в очереди", read: "прочитано", working: "прочитано · в работе" }[st];
-  last.querySelector(".tick").dataset.tip = MSG_STATUS[st];
+  label.textContent = MSG_STATUS[st][0];
+  label.dataset.tip = MSG_STATUS[st][1];
+  last.querySelector(".tick").dataset.tip = MSG_STATUS[st][1];
 }
 
 // ═══ home: Kara's own page — now / reach / pending / memory ═════════════════
@@ -3691,7 +4222,7 @@ function stopSpeaking() {
   run.stopped = true;
   run.audio.pause();
   run.resolve?.();
-  run.btn.textContent = "Прослушать";
+  if (run.btn.classList.contains("act-btn")) run.btn.innerHTML = ACT.listen; else run.btn.textContent = "Прослушать";
   run.btn.classList.remove("on");
 }
 async function speak(node, btn) {
@@ -3703,7 +4234,7 @@ async function speak(node, btn) {
   audio.play().catch(() => {});
   const run = { audio, btn, stopped: false };
   state.speech = run;
-  btn.textContent = "Стоп";
+  if (btn.classList.contains("act-btn")) btn.innerHTML = ACT.stop; else btn.textContent = "Стоп";
   btn.classList.add("on");
   let next = ttsClip(chunks[0]);
   for (let i = 0; i < chunks.length && !run.stopped; i++) {
@@ -3720,6 +4251,8 @@ async function speak(node, btn) {
 
 // ═══ sheet: the memory map (or one memory) over the page ═══════════════════
 function openSheet(title) {
+  if (state.agentView) { clearTimeout(state.agentView.timer); state.agentView = null; }
+  $("sheet-body").classList.remove("agent-view");
   $("sheet-title").textContent = title;
   syncSheetActions();
   $("sheet").hidden = false;
@@ -3728,6 +4261,8 @@ function openSheet(title) {
 function closeSheet() {
   $("sheet").hidden = true;
   state.sheetPath = null;
+  if (state.agentView) { clearTimeout(state.agentView.timer); state.agentView = null; }
+  $("sheet-body").classList.remove("agent-view");
   document.body.classList.remove("sheet-open");
 }
 $("sheet-close").onclick = closeSheet;

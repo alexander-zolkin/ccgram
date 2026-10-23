@@ -128,7 +128,9 @@ def test_message_typed_mid_turn_shows_where_the_model_got_it():
     assert item["kind"] == "user" and item["text"] == "а если один вопрос?"
     assert item["queued"] and item["ts"] == "2026-10-22T23:41:48.241Z"
     note = "<task-notification>\n<task-id>x</task-id>\n</task-notification>"
-    assert transcript.parse_entry(queued(note, "task-notification", "task")) == []
+    # A background task reporting back: its own quiet line, not a bubble.
+    (task,) = transcript.parse_entry(queued(note, "task-notification", "task"))
+    assert task["kind"] == "task" and task["text"] == "Фоновая задача"
     other = {"type": "attachment", "attachment": {"type": "hook_success"}}
     assert transcript.parse_entry(other) == []
 
@@ -447,3 +449,134 @@ def test_thinking_updates_are_shown_empty_thinking_is_not():
     items = transcript.parse_entry(entry)
     assert [i["kind"] for i in items] == ["thinking", "update", "tool"]
     assert items[1]["text"] == "Нашла причину, правлю."
+
+
+def test_task_notification_both_forms_share_a_key():
+    note = (
+        "<task-notification>\n<task-id>b1</task-id>\n<status>failed</status>\n"
+        '<summary>Background command "x" failed with exit code 1</summary>\n'
+        "<result>This agent's report was delivered to you as a message from "
+        '"b1" (its SubagentHandback call).</result>\n</task-notification>'
+    )
+    (idle,) = transcript.parse_entry(_user(note, "u9"))
+    queued = {
+        "type": "attachment",
+        "uuid": "a9",
+        "attachment": {
+            "type": "queued_command",
+            "prompt": note,
+            "commandMode": "task-notification",
+            "origin": {"kind": "task-notification"},
+        },
+    }
+    (busy,) = transcript.parse_entry(queued)
+    assert idle["kind"] == "task" and idle["status"] == "failed"
+    assert idle["text"].startswith("Background command")
+    assert idle["result"] == ""  # the report arrives as a message of its own
+    assert idle["uuid"] == busy["uuid"]
+
+
+def test_system_notes_api_errors_and_commands():
+    def system(sub, content, **extra):
+        return {
+            "type": "system",
+            "subtype": sub,
+            "content": content,
+            "uuid": sub,
+            **extra,
+        }
+
+    (recap,) = transcript.parse_entry(
+        system("away_summary", "Чиню веб. (disable recaps in /config)")
+    )
+    assert recap == {
+        "kind": "notice",
+        "level": "recap",
+        "text": "Чиню веб.",
+        "ts": None,
+        "uuid": "away_summary",
+    }
+    (info,) = transcript.parse_entry(system("informational", "Compacted while idle"))
+    assert info["level"] == "info"
+    assert transcript.parse_entry(system("turn_duration", "")) == []
+    assert (
+        transcript.parse_entry(system("compact_boundary", "Conversation compacted"))
+        == []
+    )
+    out = system(
+        "local_command",
+        "<local-command-stdout>Set effort to max</local-command-stdout>",
+    )
+    assert transcript.parse_entry(out)[0]["kind"] == "command_result"
+    name = system("local_command", "<command-name>/resume</command-name>")
+    assert transcript.parse_entry(name)[0] == {
+        "kind": "command",
+        "text": "/resume",
+        "ts": None,
+        "uuid": "local_command",
+    }
+    err = _assistant([{"type": "text", "text": "API Error: flagged"}], "e1")
+    err["isApiErrorMessage"] = True
+    assert transcript.parse_entry(err) == [
+        {"kind": "error", "text": "API Error: flagged", "ts": None, "uuid": "e1"}
+    ]
+
+
+def test_images_are_referenced_by_line_and_served(tmp_path):
+    import base64
+
+    png = base64.b64encode(b"\x89PNG fake").decode()
+    image = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": png},
+    }
+    svg = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/svg+xml", "data": png},
+    }
+    p = tmp_path / "t.jsonl"
+    _write(
+        p,
+        [
+            _user("до", "u1"),
+            _assistant(
+                [{"type": "tool_use", "id": "T1", "name": "Read", "input": {}}], "a1"
+            ),
+            {
+                "type": "user",
+                "uuid": "r1",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "T1",
+                            "content": [image, svg],
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "uuid": "u2",
+                "message": {"content": [{"type": "text", "text": "смотри"}, image]},
+            },
+        ],
+    )
+    items = transcript.read_tail(p, 50)["items"]
+    tool = next(it for it in items if it["kind"] == "tool")
+    refs = tool["result"]["imgs"]
+    assert len(refs) == 2 and tool["result"]["text"] == ""
+    assert transcript.image_at(p, refs[0]) == ("image/png", b"\x89PNG fake")
+    assert transcript.image_at(p, refs[1]) is None  # SVG is never served
+    user = items[-1]
+    assert (
+        user["images"] == 1
+        and transcript.image_at(p, user["imgs"][0])[1] == b"\x89PNG fake"
+    )
+    at = int(refs[0].split(":")[0])
+    assert transcript.image_at(p, f"{at + 1}:0") is None  # not a line start
+    assert transcript.image_at(p, f"{at}:9") is None
+    assert transcript.image_at(p, "x") is None
+    # Offsets hold for a forward read from the middle too.
+    after = transcript.read_after(p, at)["items"]
+    assert after[0]["imgs"] == refs

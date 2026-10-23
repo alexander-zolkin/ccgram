@@ -23,6 +23,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from collections.abc import Sequence
 
 CHUNK = 1024 * 1024
 MAX_SCAN = 24 * 1024 * 1024
@@ -45,6 +46,12 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # Claude Code wraps pasted text in these (a multi-line message from the web
 # arrives as a paste); the person wrote only what is inside.
 _PASTED = re.compile(r'\n?</?pasted_content(?: id="[^"]*")?>\n?')
+# A background task (subagent, ``run_in_background`` command) reporting back.
+_TASK_NOTE = re.compile(r"^\s*<task-notification>")
+_TASK_FIELD = re.compile(r"<(task-id|status|summary|result)>(.*?)</\1>", re.S)
+# Boilerplate a subagent's notification carries when its report came as a
+# message of its own: nothing to show twice.
+_TASK_ELSEWHERE = "report was delivered to you as a message"
 
 
 def _tags(text: str) -> dict[str, str]:
@@ -103,16 +110,89 @@ def _result_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "text":
-                parts.append(block.get("text", ""))
-            elif block.get("type") == "image":
-                parts.append("[image]")
-        return "\n".join(parts)
+        return "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
     return ""
+
+
+# ── images ───────────────────────────────────────────────────────────────────
+# Images live base64-encoded inside the transcript line (a screenshot the
+# agent read, a picture pasted into Claude Code). Items carry references
+# ``"<line offset>:<n>"`` instead, n counting the line's images in order
+# (top-level blocks, and inside each tool_result); :func:`image_at` reads one.
+
+
+def _line_images(content: Any) -> list[dict[str, Any]]:
+    """Every image block of a message's content, in reference order."""
+    found: list[dict[str, Any]] = []
+    if not isinstance(content, list):
+        return found
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            found.append(block)
+        elif block.get("type") == "tool_result" and isinstance(
+            block.get("content"), list
+        ):
+            found.extend(
+                b
+                for b in block["content"]
+                if isinstance(b, dict) and b.get("type") == "image"
+            )
+    return found
+
+
+def _refs(at: int | None, first: int, count: int) -> list[str]:
+    return [] if at is None else [f"{at}:{first + i}" for i in range(count)]
+
+
+MAX_IMAGE_LINE = 64 * 1024 * 1024
+_IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+
+
+def _line_at(path: Path, at: int) -> dict[str, Any] | None:
+    """The entry on the line that starts exactly at byte ``at``."""
+    try:
+        with path.open("rb") as fh:
+            if at > 0:
+                fh.seek(at - 1)
+                if fh.read(1) != b"\n":
+                    return None  # not the start of a line
+            fh.seek(at)
+            entry = json.loads(fh.readline(MAX_IMAGE_LINE))
+    except OSError, ValueError:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
+def _decode_image(block: dict[str, Any]) -> tuple[str, bytes] | None:
+    import base64
+
+    source = block.get("source") or {}
+    media = str(source.get("media_type") or "")
+    if source.get("type") != "base64" or media not in _IMAGE_TYPES:
+        return None  # never serve an SVG (script) from this origin
+    try:
+        return media, base64.b64decode(source.get("data") or "")
+    except ValueError:
+        return None
+
+
+def image_at(path: Path, ref: str) -> tuple[str, bytes] | None:
+    """(media type, bytes) of image ``n`` on the line starting at byte ``at``."""
+    try:
+        at, n = (int(x) for x in ref.split(":", 1))
+    except ValueError:
+        return None
+    entry = _line_at(path, at) if at >= 0 and n >= 0 else None
+    if entry is None:
+        return None
+    images = _line_images((entry.get("message") or {}).get("content"))
+    return _decode_image(images[n]) if n < len(images) else None
 
 
 def _tool_input(name: str, raw: dict[str, Any]) -> dict[str, Any]:
@@ -157,7 +237,9 @@ def _patch(tur: Any) -> list[dict[str, Any]] | None:
     return out
 
 
-def _result_item(block: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+def _result_item(
+    block: dict[str, Any], entry: dict[str, Any], imgs: list[str]
+) -> dict[str, Any]:
     tur = entry.get("toolUseResult")
     item: dict[str, Any] = {
         "kind": "tool_result",
@@ -165,6 +247,8 @@ def _result_item(block: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]
         "is_error": bool(block.get("is_error")),
         "text": _clip(_result_text(block.get("content"))),
     }
+    if imgs:
+        item["imgs"] = imgs
     if isinstance(tur, dict):
         if "stdout" in tur or "stderr" in tur:
             item["stdout"] = _clip(tur.get("stdout") or "")
@@ -191,32 +275,64 @@ def _parse_user_text(
     return [{"kind": "user", "text": text, "ts": ts, "uuid": uuid}]
 
 
-def _parse_user(entry: dict[str, Any], content: Any, ts: Any, uuid: str) -> list:
+def _task_item(text: str, ts: Any, uuid: str) -> dict[str, Any]:
+    """A background task's ``<task-notification>``: what finished, and how."""
+    fields = {m.group(1): m.group(2).strip() for m in _TASK_FIELD.finditer(text)}
+    result = fields.get("result", "")
+    if _TASK_ELSEWHERE in result:
+        result = ""
+    return {
+        "kind": "task",
+        "status": fields.get("status", ""),
+        "text": fields.get("summary", "") or "Фоновая задача",
+        "result": _clip(result, MAX_FIELD),
+        "ts": ts,
+        # The same notice can be recorded twice (queued, then as a prompt).
+        "uuid": f"{fields.get('task-id', uuid)}:{fields.get('status', '')}:"
+        f"{len(fields.get('summary', ''))}",
+    }
+
+
+def _parse_user_blocks(
+    entry: dict[str, Any], content: list, ts: Any, uuid: str, at: int | None
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    texts, images, seen = [], [], 0
+    for block in content:
+        btype = block.get("type") if isinstance(block, dict) else None
+        if btype == "tool_result":
+            inner = len(_line_images([block]))
+            items.append(_result_item(block, entry, _refs(at, seen, inner)))
+            seen += inner
+        elif btype == "text" and not _PLUMBING.match(block.get("text", "")):
+            texts.append(block.get("text", ""))
+        elif btype == "image":
+            images.append(seen)
+            seen += 1
+    if texts or images:
+        text = _PASTED.sub("\n", "\n".join(t for t in texts if t)).strip("\n")
+        item = {"kind": "user", "text": text, "images": len(images), "ts": ts}
+        if at is not None and images:
+            item["imgs"] = [f"{at}:{n}" for n in images]
+        items.append({**item, "uuid": uuid})
+    return items
+
+
+def _parse_user(
+    entry: dict[str, Any], content: Any, ts: Any, uuid: str, at: int | None = None
+) -> list:
     origin = entry.get("origin")
     if isinstance(origin, dict) and origin.get("kind") == "peer":
         return [_peer_item(origin, ts, uuid)]  # delivered to an idle session
     if entry.get("isMeta"):
         return []
     if isinstance(content, str):
+        if _TASK_NOTE.match(content):
+            return [_task_item(content, ts, uuid)]
         return _parse_user_text(entry, content, ts, uuid)
     if not isinstance(content, list):
         return []
-    items: list[dict[str, Any]] = []
-    texts, images = [], 0
-    for block in content:
-        btype = block.get("type") if isinstance(block, dict) else None
-        if btype == "tool_result":
-            items.append(_result_item(block, entry))
-        elif btype == "text" and not _PLUMBING.match(block.get("text", "")):
-            texts.append(block.get("text", ""))
-        elif btype == "image":
-            images += 1
-    if texts or images:
-        text = _PASTED.sub("\n", "\n".join(t for t in texts if t)).strip("\n")
-        items.append(
-            {"kind": "user", "text": text, "images": images, "ts": ts, "uuid": uuid}
-        )
-    return items
+    return _parse_user_blocks(entry, content, ts, uuid, at)
 
 
 def _parse_assistant(content: Any, ts: Any, uuid: str) -> list[dict[str, Any]]:
@@ -285,6 +401,9 @@ def _parse_queued(entry: dict[str, Any]) -> list[dict[str, Any]]:
     ts, uuid = entry.get("timestamp"), entry.get("uuid", "")
     if origin.get("kind") == "peer":
         return [_peer_item(origin, ts, uuid)]
+    prompt = att.get("prompt")
+    if isinstance(prompt, str) and _TASK_NOTE.match(prompt):
+        return [_task_item(prompt, ts, uuid)]
     if origin.get("kind") not in (None, "human"):
         return []  # coordinator, task notifications: not typed by anyone
     human = origin.get("kind") == "human"
@@ -303,13 +422,58 @@ def _parse_queued(entry: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"kind": "user", "text": text, "ts": ts, "uuid": uuid, "queued": True}]
 
 
-def parse_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    """Turn one JSONL entry into zero or more UI items."""
+# Claude Code's own notes in the conversation (``system`` entries) that its
+# console prints: shown as quiet lines. Others (turn ends, hook summaries,
+# compaction markers) are bookkeeping.
+_RECAP_TAIL = re.compile(r"\s*\(disable recaps in /config\)\s*$")
+
+
+def _parse_system(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    sub = entry.get("subtype")
+    ts, uuid = entry.get("timestamp"), entry.get("uuid", "")
+    text = str(entry.get("content") or "").strip()
+    if sub == "local_command":
+        # A slash command's echo and output, as newer Claude Code writes them.
+        return _special_user(text, ts, uuid) or []
+    if sub == "away_summary" and text:
+        text = _RECAP_TAIL.sub("", text)
+        return [
+            {"kind": "notice", "level": "recap", "text": text, "ts": ts, "uuid": uuid}
+        ]
+    if sub == "informational" and text:
+        level = "warn" if entry.get("level") == "warning" else "info"
+        return [
+            {"kind": "notice", "level": level, "text": text, "ts": ts, "uuid": uuid}
+        ]
+    if sub == "model_refusal_fallback" and text:
+        return [
+            {"kind": "notice", "level": "warn", "text": text, "ts": ts, "uuid": uuid}
+        ]
+    if sub == "scheduled_task_fire":
+        return [
+            {
+                "kind": "notice",
+                "level": "info",
+                "text": text or "Запуск по расписанию",
+                "ts": ts,
+                "uuid": uuid,
+            }
+        ]
+    return []
+
+
+def parse_entry(entry: dict[str, Any], at: int | None = None) -> list[dict[str, Any]]:
+    """Turn one JSONL entry into zero or more UI items.
+
+    ``at`` is the byte offset of the entry's line: images get references to it.
+    """
     kind = entry.get("type")
     if entry.get("isSidechain"):
         return []
     if kind == "attachment":
         return _parse_queued(entry)
+    if kind == "system":
+        return _parse_system(entry)
     if kind not in ("user", "assistant"):
         return []
     message = entry.get("message") or {}
@@ -319,7 +483,15 @@ def parse_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
         entry.get("uuid", ""),
     )
     if kind == "user":
-        return _parse_user(entry, content, ts, uuid)
+        return _parse_user(entry, content, ts, uuid, at)
+    if entry.get("isApiErrorMessage"):
+        # Claude Code's own "API Error: …" stands in for the reply.
+        text = "\n".join(
+            b.get("text", "")
+            for b in content or []
+            if isinstance(b, dict) and b.get("type") == "text"
+        ).strip()
+        return [{"kind": "error", "text": text, "ts": ts, "uuid": uuid}] if text else []
     return _parse_assistant(content, ts, uuid)
 
 
@@ -329,7 +501,7 @@ def parse_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
 # one message is its own entry and repeats that message's usage.
 
 TURN_BACK = 4 * 1024 * 1024
-_PROMPT_KINDS = ("user", "bash", "command", "peer")
+_PROMPT_KINDS = ("user", "bash", "command", "peer", "task")
 
 
 class _Turn:
@@ -601,22 +773,34 @@ def _merge_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _parse_lines(
-    lines: list[bytes], path: Path | None = None, offset: int = 0
+    lines: list[bytes],
+    path: Path | None = None,
+    offset: int = 0,
+    sidechain: bool = False,
+    hidden: Sequence[tuple[int, int]] = (),
 ) -> list[dict[str, Any]]:
     """UI items of ``lines``, which start at byte ``offset`` of ``path``.
 
     A turn that began before ``offset`` gets its earlier tokens from a
     backwards read, so a poll that only sees ``turn_duration`` still has them.
+    ``sidechain``: the file is a subagent's own, every line of it counts.
+    ``hidden``: byte ranges a rewind abandoned (webui/rewind.py), skipped.
     """
     items: list[dict[str, Any]] = []
     turn = _Turn()
+    pos = offset
     for raw in lines:
+        at, pos = pos, pos + len(raw) + 1
+        if hidden and any(a <= at < b for a, b in hidden):
+            continue
         try:
             entry = json.loads(raw)
         except ValueError:
             continue
         if not isinstance(entry, dict):
             continue
+        if sidechain:
+            entry["isSidechain"] = False
         if _turn_end(entry):
             if not turn.complete and path is not None:
                 turn.merge(_turn_back(path, offset))
@@ -631,7 +815,7 @@ def _parse_lines(
             )
             turn = _Turn(complete=True)
             continue
-        parsed = parse_entry(entry)
+        parsed = parse_entry(entry, at)
         if _interrupted(entry):
             turn = _Turn(complete=True)
         elif _is_prompt(entry, parsed):
@@ -641,7 +825,12 @@ def _parse_lines(
     return items
 
 
-def read_after(path: Path, after: int) -> dict[str, Any]:
+def read_after(
+    path: Path,
+    after: int,
+    sidechain: bool = False,
+    hidden: Sequence[tuple[int, int]] = (),
+) -> dict[str, Any]:
     """Items from complete lines past byte ``after``; ``end`` is the new cursor."""
     size = path.stat().st_size
     if after >= size:
@@ -653,11 +842,18 @@ def read_after(path: Path, after: int) -> dict[str, Any]:
     if cut < 0:
         return {"items": [], "end": after}
     complete = data[: cut + 1]
-    items = _merge_results(_parse_lines(complete.splitlines(), path, after))
+    lines = complete.splitlines()
+    items = _merge_results(_parse_lines(lines, path, after, sidechain, hidden))
     return {"items": items, "end": after + len(complete)}
 
 
-def read_tail(path: Path, limit: int, before: int | None = None) -> dict[str, Any]:
+def read_tail(
+    path: Path,
+    limit: int,
+    before: int | None = None,
+    sidechain: bool = False,
+    hidden: Sequence[tuple[int, int]] = (),
+) -> dict[str, Any]:
     """The last ``limit`` items ending at byte ``before`` (default: EOF).
 
     ``start`` is the byte where the returned window begins — pass it back as
@@ -691,7 +887,8 @@ def read_tail(path: Path, limit: int, before: int | None = None) -> dict[str, An
                 carry, body, start = data[: nl + 1], data[nl + 1 :], new + nl + 1
             else:
                 carry, body, start = b"", data, 0
-            items = _parse_lines(body.splitlines(), path, start) + items
+            lines = body.splitlines()
+            items = _parse_lines(lines, path, start, sidechain, hidden) + items
     merged = _merge_results(items)
     return {"items": merged[-limit:] if limit else merged, "start": start, "end": end}
 

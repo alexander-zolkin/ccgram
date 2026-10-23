@@ -77,7 +77,6 @@
       <span class="spacer"></span>
       <span id="chat-meta" class="chat-meta" hidden></span>
       <span id="chat-state" class="chat-state"></span>
-      <button id="mode-btn" class="mode-chip" hidden data-tip="Режим Claude Code — нажми, чтобы переключить (Shift+Tab)"></button>
       <button id="stats-btn" class="icon-btn" title="Статистика: лимиты, стоимость, токены" aria-label="Статистика">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
       </button>
@@ -112,6 +111,7 @@
       </div>
       <div id="prompt-card" class="prompt-card" hidden>
         <div class="prompt-head"><span class="pulse"></span><b id="prompt-title">Кара ждёт ответа</b></div>
+        <div id="prompt-what" class="prompt-what" hidden></div>
         <pre id="prompt-text"></pre>
         <div id="prompt-options" class="prompt-options"></div>
         <details id="prompt-keys" class="prompt-keys"><summary>Клавиши</summary><div class="keys" data-keys></div></details>
@@ -153,6 +153,11 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
             <span id="mic-time"></span>
           </button>
+          <button id="sess-effort-btn" type="button" class="model-btn sess-effort" hidden data-tip="Усилие этой сессии: сколько модель думает">
+            <svg class="effort-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 18a8 8 0 1 1 16 0"/><path d="M12 18l4-6"/></svg>
+            <span id="sess-effort-name"></span>
+          </button>
+          <button id="mode-btn" type="button" class="mode-chip" hidden data-tip="Режим Claude Code — нажми, чтобы переключить (Shift+Tab)"></button>
           <button id="send-btn" type="submit" class="send-btn" disabled aria-label="Отправить">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
           </button>
@@ -184,6 +189,7 @@
   <form method="dialog">
     <h3 id="confirm-title"></h3>
     <p id="confirm-text" class="muted"></p>
+    <div id="confirm-extra" hidden></div>
     <div class="dialog-actions">
       <button value="cancel" class="btn">Отмена</button>
       <button value="ok" id="confirm-ok" class="btn danger-fill">Удалить</button>
@@ -227,6 +233,10 @@
   </form>
 </dialog>
 <div id="toast" class="toast" hidden></div>
+<div id="lightbox" class="lightbox" hidden>
+  <img alt="">
+  <div class="lb-bar"><a class="lb-open" target="_blank" rel="noopener">Открыть отдельно</a><button type="button" class="lb-close" aria-label="Закрыть"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+</div>
 <dialog id="folder-dlg" class="dialog picker">
   <div class="picker-head"><b>Папка для нового чата</b><button type="button" class="icon-btn" data-close>✕</button></div>
   <div id="folder-path" class="picker-path"></div>
