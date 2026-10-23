@@ -2861,14 +2861,14 @@ function allSecHtml(p) {
     <div class="u-cols st-cols"><div><div class="hub-label">Модели за 30 дней</div>${modelTable(p.models)}</div>
     <div><div class="hub-label">Дороже всего за неделю</div>${p.chats.length ? `<ul class="u-chats">${p.chats.map((x) => `<li><span>${esc(x.name)}</span><span class="u-num">${usd(x.cost)}</span><span class="u-share"><i style="width:${Math.max(3, (x.cost / (p.chats[0].cost || 1)) * 100)}%"></i></span></li>`).join("")}${p.chats_rest ? `<li><span class="muted">Остальное (SSH, фоновые задачи)</span><span class="u-num">${usd(p.chats_rest)}</span></li>` : ""}</ul>` : '<div class="muted">За неделю чаты не работали</div>'}</div></div>`;
 }
-function actSecHtml(p) {
+function actSecHtml(p, reveal = true) {
   const since = new Date(`${p.all.since}T12:00:00`);
   const age = Math.round((Date.now() - since.getTime()) / 86400000);
   const dm = since.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
   const sub = p.born ? `родилась ${dm} — ${daysRu(age)} назад` : `журналы с ${dm}`;
   const wins = ACT_WINDOWS.map(([k, label]) => [k, k === "all" && p.born ? "С рождения" : label]);
   return `<div class="st-head"><h3>Активность</h3><span class="muted st-since">${sub}</span><div class="seg" role="tablist">${wins.map(([k, label]) => `<button type="button" data-win="${k}"${k === state.actWin ? ' class="on"' : ""}>${label}</button>`).join("")}</div></div>
-    ${heatmapSvg(p.heatmap, true)}
+    ${heatmapSvg(p.heatmap, reveal)}
     <div class="hm-legend">Меньше <i class="hm-key l0"></i><i class="hm-key l1"></i><i class="hm-key l2"></i><i class="hm-key l3"></i><i class="hm-key l4"></i> Больше</div>
     <div class="act-stats"></div>`;
 }
@@ -2975,6 +2975,18 @@ function renderActStats(p) {
   $("sheet-body").querySelectorAll(".seg [data-win]").forEach((b) => b.classList.toggle("on", b.dataset.win === state.actWin));
 }
 
+// What was shown last time is shown at once (finished days never change);
+// only what can have moved — today, the limits — is asked for, quietly.
+const STATS_KEY = "kara-stats";
+function statsKnown() {
+  try { return JSON.parse(store.get(STATS_KEY) || "{}") || {}; } catch (_) { return {}; }
+}
+function statsKeep(part, data) {
+  const known = statsKnown();
+  known[part] = data;
+  store.set(STATS_KEY, JSON.stringify(known));
+}
+
 async function openStats() {
   state.sheetPath = null;
   $("sheet-frame").hidden = true;
@@ -2983,49 +2995,76 @@ async function openStats() {
   const tid = state.current;
   const run = (state.statsRun || 0) + 1;
   state.statsRun = run;
+  const known = statsKnown();
+  const chatKnown = tid != null ? state.chatStats?.[tid] : undefined;
   body.innerHTML = `<div class="stats">
-    <section class="st-sec" data-part="limits">${skLimits()}</section>
-    ${tid != null ? `<section class="st-sec" data-part="chat">${skChat()}</section>` : ""}
-    <section class="st-sec" data-part="all">${skAll()}</section>
-    <section class="st-sec" data-part="act">${skAct()}</section>
+    <p class="st-status"><i></i><span>Обновляю…</span></p>
+    <section class="st-sec" data-part="limits">${known.limits ? limitsSecHtml(known.limits) : skLimits()}</section>
+    ${tid != null ? `<section class="st-sec" data-part="chat">${chatKnown ? chatSecHtml(chatKnown) : skChat()}</section>` : ""}
+    <section class="st-sec" data-part="all">${known.period ? allSecHtml(known.period) : skAll()}</section>
+    <section class="st-sec" data-part="act">${known.period ? actSecHtml(known.period, false) : skAct()}</section>
     <p class="st-note">«По ценам API» — сколько стоила бы та же работа без подписки, по тарифам Anthropic. По подписке платишь фиксированно; расход подписки — в лимитах выше. Приватные чаты не считаются.</p></div>`;
   openSheet("Статистика");
   const live = () => state.statsRun === run && !$("sheet").hidden;
   const sec = (name) => body.querySelector(`[data-part="${name}"]`);
-  const fill = (name, html) => { const el = sec(name); if (el) { el.innerHTML = html; el.classList.add("st-in"); } };
-  let say = 0;
-  const ticker = setInterval(() => {
-    const line = body.querySelector(".sk-say");
-    if (!line || !live()) { clearInterval(ticker); return; }
-    line.textContent = SK_SAY[say % SK_SAY.length];
-    say += 1;
-  }, 1300);
-  body.querySelector(".sk-say").textContent = SK_SAY[say++];
-  const get = async (part) => (await api(`/api/stats/${part}${tid != null ? `?tid=${tid}` : ""}`))[part];
-  get("limits").then((u) => {
-    if (!live()) return;
-    fill("limits", limitsSecHtml(u));
-    sec("limits").querySelector('[data-act="refresh"]').onclick = async (ev) => {
-      ev.currentTarget.disabled = true;
-      const fresh = await fetchLimits(true);
-      if (live()) fill("limits", limitsSecHtml(fresh));
-      sec("limits").querySelector('[data-act="refresh"]').onclick = null;
-    };
-  }).catch((e) => live() && fill("limits", `<p class="muted">${esc(e.message)}</p>`));
-  if (tid != null) {
-    get("chat").then((c) => { if (live()) { if (c) fill("chat", chatSecHtml(c)); else sec("chat")?.remove(); } })
-      .catch(() => live() && sec("chat")?.remove());
-  }
-  get("period").then((p) => {
-    clearInterval(ticker);
-    if (!live() || !p) return;
-    fill("all", allSecHtml(p));
-    fill("act", actSecHtml(p));
+  // A block that was a skeleton rises in; one that was already shown just updates.
+  const fill = (name, html) => {
+    const el = sec(name);
+    if (!el) return;
+    const first = Boolean(el.querySelector(".sk"));
+    el.innerHTML = html;
+    if (first) el.classList.add("st-in");
+  };
+  const wireLimits = () => {
+    const btn = sec("limits")?.querySelector('[data-act="refresh"]');
+    if (btn) btn.onclick = async () => { btn.disabled = true; const fresh = await fetchLimits(true); if (live() && fresh) { fill("limits", limitsSecHtml(fresh)); statsKeep("limits", fresh); wireLimits(); } };
+  };
+  const wireAct = (p, keepScroll) => {
     renderActStats(p);
     sec("act").querySelectorAll(".seg [data-win]").forEach((btn) => { btn.onclick = () => { state.actWin = btn.dataset.win; renderActStats(p); }; });
     const box = sec("act").querySelector(".hm-scroll");
-    if (box) { box.scrollLeft = box.scrollWidth; dragScroll(box); } // today is on the right
-  }).catch((e) => { clearInterval(ticker); if (live()) fill("act", `<p class="muted">${esc(e.message)}</p>`); });
+    if (!box) return;
+    box.scrollLeft = keepScroll ?? box.scrollWidth; // today is on the right
+    dragScroll(box);
+  };
+  if (known.limits) wireLimits();
+  if (known.period) wireAct(known.period);
+  let say = 0;
+  const sayLine = () => { const line = body.querySelector(".sk-say"); if (line) line.textContent = SK_SAY[say++ % SK_SAY.length]; };
+  sayLine();
+  const ticker = setInterval(() => { if (!live()) clearInterval(ticker); else sayLine(); }, 1300);
+  const get = async (part) => (await api(`/api/stats/${part}${tid != null ? `?tid=${tid}` : ""}`))[part];
+  const jobs = [];
+  if (!known.limits) jobs.push(get("limits-known").then((u) => { if (live() && u && sec("limits").querySelector(".sk")) { fill("limits", limitsSecHtml(u)); wireLimits(); } }).catch(() => {}));
+  jobs.push(get("limits").then((u) => {
+    if (!live()) return;
+    if (u) statsKeep("limits", u);
+    fill("limits", limitsSecHtml(u));
+    wireLimits();
+  }).catch((e) => live() && sec("limits").querySelector(".sk") && fill("limits", `<p class="muted">${esc(e.message)}</p>`)));
+  if (tid != null) {
+    jobs.push(get("chat").then((c) => {
+      if (!live()) return;
+      if (!c) { sec("chat")?.remove(); return; }
+      state.chatStats = { ...(state.chatStats || {}), [tid]: c };
+      fill("chat", chatSecHtml(c));
+    }).catch(() => live() && !chatKnown && sec("chat")?.remove()));
+  }
+  jobs.push(get("period").then((p) => {
+    clearInterval(ticker);
+    if (!live() || !p) return;
+    statsKeep("period", p);
+    const box = sec("act").querySelector(".hm-scroll");
+    const atEnd = !box || box.scrollLeft + box.clientWidth >= box.scrollWidth - 4;
+    const keep = box && !atEnd ? box.scrollLeft : undefined;
+    const first = Boolean(sec("act").querySelector(".sk"));
+    fill("all", allSecHtml(p));
+    fill("act", actSecHtml(p, first));
+    wireAct(p, keep);
+  }).catch((e) => { clearInterval(ticker); if (live() && sec("act").querySelector(".sk")) fill("act", `<p class="muted">${esc(e.message)}</p>`); }));
+  await Promise.allSettled(jobs);
+  const status = body.querySelector(".st-status");
+  if (live() && status) { status.classList.add("done"); status.querySelector("span").textContent = "Обновлено"; }
 }
 async function showUsage() { openStats(); }
 function renderLimits(u) {

@@ -806,3 +806,8 @@ body.sheet-open { overflow: hidden; }
 .hm-scroll { flex: 1; min-width: 0; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; cursor: grab; padding-bottom: 4px; }
 .hm-scroll.dragging { cursor: grabbing; user-select: none; }
 .hm-scroll .heatmap { width: auto; max-width: none; }
+/* «Обновляю…»: what is shown is already known, the rest is on its way */
+.st-status { align-self: flex-end; margin: -14px 0 -18px; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); transition: opacity .6s .8s; }
+.st-status i { width: 6px; height: 6px; border-radius: 50%; background: var(--chart-1); animation: pulse 1.2s infinite; }
+.st-status.done { opacity: 0; }
+.st-status.done i { animation: none; background: var(--ok); }

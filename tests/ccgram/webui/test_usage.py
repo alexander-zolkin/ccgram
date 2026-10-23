@@ -49,6 +49,8 @@ def _claude_home(tmp_path, monkeypatch, expires_in, cached=None):
             json.dumps({"cachedUsageUtilization": cached})
         )
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CCGRAM_DIR", str(tmp_path / "ccgram"))
+    (tmp_path / "ccgram").mkdir(exist_ok=True)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     usage.reset_for_testing()
 
@@ -92,3 +94,21 @@ async def test_expired_token_is_never_used_falls_back_to_claude_copy(
     assert [(lim["label"], lim["percent"]) for lim in got["limits"]] == [
         ("Неделя · все модели", 40.0)
     ]
+
+
+async def test_the_last_answer_is_kept_and_shown_without_asking(tmp_path, monkeypatch):
+    _claude_home(tmp_path, monkeypatch, 3600)
+
+    async def fake_fetch(token):
+        return RAW
+
+    monkeypatch.setattr(usage, "_fetch", fake_fetch)
+    await usage.plan_usage()
+    usage.reset_for_testing()  # a restart: nothing in memory
+
+    async def no_fetch(token):
+        raise AssertionError("known_usage must not ask Anthropic")
+
+    monkeypatch.setattr(usage, "_fetch", no_fetch)
+    got = await usage.known_usage()
+    assert got["live"] and [lim["percent"] for lim in got["limits"]] == [2.0, 25.0, 0.0]

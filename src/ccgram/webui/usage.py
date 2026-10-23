@@ -11,6 +11,7 @@ is undocumented, so every field is read defensively.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -216,6 +217,33 @@ async def _fetch(token: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _saved_path() -> Path:
+    base = Path(os.getenv("CCGRAM_DIR") or os.path.expanduser("~/.ccgram"))
+    return base / "plan_usage.json"
+
+
+def _save(raw: dict[str, Any], as_of: float) -> None:
+    path = _saved_path()
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        tmp.write_text(json.dumps({"as_of": as_of, "raw": raw}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.info("plan usage: not saved: %s", exc)
+
+
+def _known() -> dict[str, Any] | None:
+    """The newest answer on disk: ours (asked of Anthropic) or Claude Code's."""
+    ours = None
+    with contextlib.suppress(OSError, ValueError, TypeError, KeyError):
+        saved = json.loads(_saved_path().read_text(encoding="utf-8"))
+        ours = (float(saved["as_of"]), saved["raw"])
+    theirs = _cached_by_claude()
+    if ours and (not theirs or ours[0] >= theirs[0]):
+        return _shape(ours[1], ours[0], live=True)
+    return _shape(theirs[1], theirs[0], live=False) if theirs else None
+
+
 async def plan_usage(*, refresh: bool = False) -> dict[str, Any] | None:
     """Limits with their reset times; None when there is nothing to show."""
     global _cache
@@ -226,13 +254,19 @@ async def plan_usage(*, refresh: bool = False) -> dict[str, Any] | None:
         token = await asyncio.to_thread(_token)
         raw = await _fetch(token) if token else None
         if raw is not None:
-            data = _shape(raw, time.time(), live=True)
-        elif (cached := await asyncio.to_thread(_cached_by_claude)) is not None:
-            data = _shape(cached[1], cached[0], live=False)
+            now = time.time()
+            data = _shape(raw, now, live=True)
+            await asyncio.to_thread(_save, raw, now)
         else:
-            data = None
+            data = await asyncio.to_thread(_known)
         _cache = (time.time(), data)
         return data
+
+
+async def known_usage() -> dict[str, Any] | None:
+    """What is already known, without asking Anthropic: shown at once while a
+    fresh answer is on its way."""
+    return _cache[1] if _cache[1] is not None else await asyncio.to_thread(_known)
 
 
 def last() -> dict[str, Any] | None:

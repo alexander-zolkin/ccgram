@@ -186,3 +186,44 @@ def test_archived_transcripts_fill_the_past_once_and_stay_cached(tmp_path, monke
     cached = costs._archived
     assert run()["all"]["cost"] == pytest.approx(2.0) and costs._archived is cached
     costs.reset_for_testing()
+
+
+def test_store_keeps_finished_days_and_rereads_only_today(tmp_path, monkeypatch):
+    from datetime import date, timedelta
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    costs.reset_for_testing()
+    past = datetime.combine(date.today() - timedelta(days=3), datetime.min.time())
+    past = past.replace(hour=12).astimezone(UTC).isoformat()
+    usage = {"output_tokens": 50_000}  # $1 on opus-5-5
+    old = tmp_path / "projects" / "-w" / "old.jsonl"
+    now = tmp_path / "projects" / "-w" / "now.jsonl"
+    _write(old, [{**_say("p", "claude-opus-5-5", usage), "timestamp": past}])
+    _write(now, [_say("n1", "claude-opus-5-5", usage)])
+    store = tmp_path / "stats_days.json"
+    run = lambda: costs.period_stats(Path("/nowhere/private"), {}, store=store)  # noqa: E731
+    assert run()["all"]["cost"] == pytest.approx(2.0)
+    saved = json.loads(store.read_text())
+    assert saved["closed_until"] == date.today().isoformat()
+    assert list(saved["days"]) == [(date.today() - timedelta(days=3)).isoformat()]
+
+    old.unlink()  # cleaned up — the finished day stays in the store
+    with now.open("a") as fh:
+        fh.write(json.dumps(_say("n2", "claude-opus-5-5", usage)) + "\n")
+    got = run()
+    assert got["all"]["cost"] == pytest.approx(3.0) and got["today"][
+        "cost"
+    ] == pytest.approx(2.0)
+
+
+def test_chat_stats_read_only_what_was_appended(tmp_path, monkeypatch):
+    costs.reset_for_testing()
+    path = tmp_path / "s.jsonl"
+    usage = {"output_tokens": 50_000}
+    _write(path, [_say("a", "claude-opus-5-5", usage)])
+    assert costs.chat_stats(path)["cost"] == pytest.approx(1.0)
+    with path.open("a") as fh:
+        fh.write(json.dumps(_say("b", "claude-opus-5-5", usage)) + "\n")
+        fh.write('{"half a line')
+    assert costs.chat_stats(path)["cost"] == pytest.approx(2.0)
+    assert costs._chat_files[str(path)].offset < path.stat().st_size  # the tail waits

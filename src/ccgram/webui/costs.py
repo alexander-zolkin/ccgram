@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import time
@@ -39,7 +40,9 @@ PRICES: dict[str, tuple[float, float, float, float, float]] = {
 }
 FAST_FACTOR = 2.0  # fast mode bills double
 PERIOD_DAYS = 30
-PERIOD_TTL_S = 180.0
+PERIOD_TTL_S = 30.0  # past days come from the store; only today is re-read
+CHUNK = 256 * 1024
+STORE_VERSION = 1
 TOP_CHATS = 6
 HEATMAP_MIN_WEEKS = 26
 
@@ -145,24 +148,52 @@ def _patch_lines(result: Any) -> tuple[int, int]:
     return added, removed
 
 
-def _entries(path: Path):
+_WANTED = (b'"usage"', b"turn_duration", b"structuredPatch")
+
+
+def _parse(raw: bytes) -> dict[str, Any] | None:
+    """A transcript line worth parsing (usage, turn end, code change)."""
+    if not any(key in raw for key in _WANTED):
+        return None
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
+def _entries(path: Path) -> Iterator[dict[str, Any]]:
     try:
         fh = path.open("rb")
     except OSError:
         return
     with fh:
         for raw in fh:
-            if not (
-                b'"usage"' in raw
-                or b"turn_duration" in raw
-                or b"structuredPatch" in raw
-            ):
-                continue
-            try:
-                entry = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(entry, dict):
+            if (entry := _parse(raw)) is not None:
+                yield entry
+
+
+def _tail_entries(path: Path, since: float) -> Iterator[dict[str, Any]]:
+    """Entries stamped at or after ``since``, newest first. Transcripts only
+    grow, so reading backwards stops at the first older entry."""
+    try:
+        fh = path.open("rb")
+    except OSError:
+        return
+    with fh:
+        pos, carry = fh.seek(0, os.SEEK_END), b""
+        while pos > 0:
+            start = max(0, pos - CHUNK)
+            fh.seek(start)
+            lines = (fh.read(pos - start) + carry).split(b"\n")
+            pos = start
+            carry = lines.pop(0) if start > 0 else b""
+            for raw in reversed(lines):
+                if (entry := _parse(raw)) is None:
+                    continue
+                when = _epoch(entry.get("timestamp"))
+                if when is not None and when < since:
+                    return
                 yield entry
 
 
@@ -187,35 +218,70 @@ def _priced_message(entry: dict[str, Any]) -> tuple[str, str, dict[str, Any]] | 
     return str(msg.get("id") or entry.get("uuid") or ""), model, usage
 
 
+class _ChatFile:
+    """One transcript as far as it has been read; later calls read only what
+    was appended since."""
+
+    def __init__(self) -> None:
+        self.offset = 0
+        self.tally, self.seen = Tally(), set()
+        self.turns = self.busy_ms = self.added = self.removed = 0
+        self.first: float | None = None
+        self.last: float | None = None
+
+    def feed(self, path: Path, main: bool) -> None:
+        try:
+            size = path.stat().st_size
+            if size < self.offset:  # rewritten: start over
+                self.__init__()
+            with path.open("rb") as fh:
+                fh.seek(self.offset)
+                data = fh.read(size - self.offset)
+        except OSError:
+            return
+        complete = data[: data.rfind(b"\n") + 1]  # a line being written waits
+        self.offset += len(complete)
+        for raw in complete.splitlines():
+            if (entry := _parse(raw)) is not None:
+                self._take(entry, main)
+
+    def _take(self, entry: dict[str, Any], main: bool) -> None:
+        when = _epoch(entry.get("timestamp"))
+        if main and when is not None:  # subagents add cost, not turns or time
+            self.first = when if self.first is None else min(self.first, when)
+            self.last = when if self.last is None else max(self.last, when)
+        if _is_turn_end(entry):
+            if main:
+                self.turns += 1
+                self.busy_ms += int(entry.get("durationMs") or 0)
+            return
+        plus, minus = _patch_lines(entry.get("toolUseResult"))
+        self.added, self.removed = self.added + plus, self.removed + minus
+        priced = _priced_message(entry)
+        if priced is not None and priced[0] not in self.seen:
+            self.seen.add(priced[0])
+            self.tally.add(priced[1], priced[2])
+
+
+_chat_files: dict[str, _ChatFile] = {}
+
+
 def chat_stats(path: Path) -> dict[str, Any]:
     """One chat: cost and tokens by model, turns, time, code changed."""
-    tally, seen = Tally(), set()
-    turns, busy_ms, added, removed = 0, 0, 0, 0
-    stamps: list[float] = []
-    for i, file in enumerate(_files_of(path)):
-        main = i == 0  # subagents add cost, not turns or wall time
-        for entry in _entries(file):
-            when = _epoch(entry.get("timestamp"))
-            if main and when is not None:
-                stamps.append(when)
-            if _is_turn_end(entry):
-                turns += main
-                busy_ms += int(entry.get("durationMs") or 0) if main else 0
-                continue
-            plus, minus = _patch_lines(entry.get("toolUseResult"))
-            added, removed = added + plus, removed + minus
-            priced = _priced_message(entry)
-            if priced is not None and priced[0] not in seen:
-                seen.add(priced[0])
-                tally.add(priced[1], priced[2])
+    files = [_chat_files.setdefault(str(f), _ChatFile()) for f in _files_of(path)]
+    tally = Tally()
+    for i, (file, state) in enumerate(zip(_files_of(path), files, strict=True)):
+        state.feed(file, i == 0)
+        tally.merge(state.tally)
+    main = files[0]
     return {
         **tally.summary(),
-        "turns": turns,
-        "busy_s": round(busy_ms / 1000),
-        "wall_s": round(max(stamps) - min(stamps)) if stamps else 0,
-        "lines_added": added,
-        "lines_removed": removed,
-        "subagents": len(_files_of(path)) - 1,
+        "turns": main.turns,
+        "busy_s": round(main.busy_ms / 1000),
+        "wall_s": round(main.last - main.first) if main.first and main.last else 0,
+        "lines_added": sum(f.added for f in files),
+        "lines_removed": sum(f.removed for f in files),
+        "subagents": len(files) - 1,
     }
 
 
@@ -252,6 +318,35 @@ class _Period:
         self.days: dict[str, _Day] = {}
         self.spans: dict[str, list[float]] = {}  # session → [first, last]
         self.seen: set[str] = set()  # reply ids counted (archives repeat them)
+
+    def dump(self, until: date) -> dict[str, Any]:
+        """Days before ``until`` — finished, they never change again."""
+        cut = until.isoformat()
+        return {
+            "days": {
+                key: {"m": day.tally.models, "t": day.turns, "c": day.costs}
+                for key, day in self.days.items()
+                if key < cut
+            },
+            "spans": self.spans,
+        }
+
+    @classmethod
+    def load(cls, data: dict[str, Any]) -> _Period:
+        period = cls()
+        for key, raw in (data.get("days") or {}).items():
+            day = period.days[key] = _Day()
+            day.tally.models = {m: list(r) for m, r in (raw.get("m") or {}).items()}
+            day.turns, day.costs = int(raw.get("t") or 0), dict(raw.get("c") or {})
+        period.spans = {s: list(v) for s, v in (data.get("spans") or {}).items()}
+        return period
+
+    def absorb(self, newer: _Period) -> None:
+        """Days tallied since the store was closed, and their sessions' spans."""
+        self.days.update(newer.days)
+        for sid, (first, last) in newer.spans.items():
+            span = self.spans.setdefault(sid, [first, last])
+            span[0], span[1] = min(span[0], first), max(span[1], last)
 
     def copy(self) -> _Period:
         twin = _Period()
@@ -474,6 +569,33 @@ def _archive_period(
     return period
 
 
+def _signature(
+    private_root: Path, born: date | None, history: list[Path], archive: list[Path]
+) -> str:
+    """What the stored days were computed from: the sources, the prices and
+    every archived file's size and mtime — any change means a rebuild."""
+    hidden = _hidden(private_root)
+    files = [f for root in archive for f, _s, _m in _claude_files(root, hidden)]
+    files += [f for folder in history for f in folder.glob("**/*.jsonl*")]
+    stats = sorted((str(f), f.stat().st_size, f.stat().st_mtime) for f in files)
+    basis = [STORE_VERSION, sorted(PRICES.items()), str(born), hidden, stats]
+    return hashlib.sha1(json.dumps(basis, default=str).encode()).hexdigest()
+
+
+def _load_store(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _save_store(path: Path, data: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def period_stats(
     private_root: Path,
     names: dict[str, str],
@@ -481,6 +603,7 @@ def period_stats(
     born: date | None = None,
     history: Iterable[Path] = (),
     archive: Iterable[Path] = (),
+    store: Path | None = None,
 ) -> dict[str, Any]:
     """Everything the logs still hold: per day, windows, heatmap, chats.
 
@@ -491,11 +614,37 @@ def period_stats(
     logs — the agent's life before Claude Code, reset / deleted / checkpoint
     copies included, each reply counted once; ``born`` starts the "all"
     window and the heatmap.
+
+    With a ``store``, finished days are kept on disk: a later call re-reads
+    only the transcripts touched since the last stored day, from their tails
+    — and the history survives even if the transcripts are cleaned up.
     """
-    period = _archive_period(private_root, archive, history).copy()
-    for project in _project_dirs(private_root):
-        for file, sid, main in _claude_files(project, _hidden(private_root)):
-            period.add_file(_entries(file), sid, main, period.seen)
+    history, archive = list(history), list(archive)
+    today = date.today()
+    sig = _signature(private_root, born, history, archive) if store else ""
+    saved = _load_store(store) if store else None
+    if saved and saved.get("sig") == sig and saved.get("closed_until"):
+        period = _Period.load(saved)
+        opened = date.fromisoformat(saved["closed_until"])
+        since = datetime.combine(opened, datetime.min.time()).timestamp()
+        newer = _Period()
+        for project in _project_dirs(private_root):
+            for file, sid, main in _claude_files(project, _hidden(private_root)):
+                with contextlib.suppress(OSError):
+                    if file.stat().st_mtime >= since:
+                        newer.add_file(
+                            _tail_entries(file, since), sid, main, newer.seen
+                        )
+        period.absorb(newer)
+    else:
+        period = _archive_period(private_root, archive, history).copy()
+        for project in _project_dirs(private_root):
+            for file, sid, main in _claude_files(project, _hidden(private_root)):
+                period.add_file(_entries(file), sid, main, period.seen)
+    if store:
+        _save_store(
+            store, {**period.dump(today), "sig": sig, "closed_until": today.isoformat()}
+        )
     return period.result(names, born)
 
 
@@ -528,10 +677,16 @@ async def _period_cached() -> dict[str, Any] | None:
                 born=born,
                 history=history,
                 archive=archive,
+                store=_store_path(),
             )
         )
         _period = (time.time(), data)
         return data
+
+
+def _store_path() -> Path:
+    base = Path(os.getenv("CCGRAM_DIR") or os.path.expanduser("~/.ccgram"))
+    return base / "stats_days.json"
 
 
 def _life() -> tuple[date | None, list[Path], list[Path]]:
@@ -581,6 +736,8 @@ async def part(name: str, thread_id: int | None) -> Any:
 
     if name == "limits":
         return await usage.plan_usage()
+    if name == "limits-known":  # instant: the last answer, no request
+        return await usage.known_usage()
     if name == "chat":
         return await _chat(thread_id) if thread_id is not None else None
     if name == "period":
@@ -606,3 +763,4 @@ def reset_for_testing() -> None:
     global _period, _archived
     _period = (0.0, None)
     _archived = None
+    _chat_files.clear()

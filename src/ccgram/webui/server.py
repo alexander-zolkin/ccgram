@@ -574,7 +574,7 @@ async def _stats(request: web.Request) -> web.Response:
     tid = request.query.get("tid")
     thread_id = int(tid) if tid and tid.lstrip("-").isdigit() else None
     name = request.match_info["part"]
-    if name not in ("limits", "chat", "period"):
+    if name not in ("limits", "limits-known", "chat", "period"):
         raise service.WebUIError("unknown part", 404)
     return web.json_response({name: await costs.part(name, thread_id)})
 
