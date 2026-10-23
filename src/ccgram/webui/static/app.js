@@ -1635,7 +1635,7 @@ function sessionItem(s) {
   const flag = s.topic_deleted
     ? `<span class="s-flag gone" data-tip="${esc(TIP.gone)}">${SVG.tgGone}</span>`
     : s.web_only ? `<span class="s-flag" data-tip="${esc(TIP.web)}">${SVG.globe}</span>` : "";
-  const dev = showDevice(s) ? `<span class="s-dev${s.online ? "" : " off"}" data-tip="${esc(`${s.device_name}: ${s.online ? (s.writable ? "в сети" : "в сети, только чтение — сессия не в tmux") : "не в сети, только чтение"}`)}">${esc(s.device_name)}</span>` : "";
+  const dev = showDevice(s) ? `<span class="s-dev${s.online ? "" : " off"}" data-tip="${esc(`${devLabel(s)}: ${s.online ? (s.writable ? "в сети" : "в сети, только чтение — сессия не в tmux") : "не в сети, только чтение"}`)}">${esc(devLabel(s))}</span>` : "";
   item.classList.toggle("offline", Boolean(s.remote) && !s.online);
   item.innerHTML = `<span class="dot ${esc(s.state)}" title="${esc(STATE_LABEL[s.state] || "")}"></span><span class="s-name">${esc(s.name)}</span>${dev}${s.remote ? "" : flag}`;
   const more = el("button", "s-more", SVG.more);
@@ -1651,7 +1651,7 @@ function sessionMenu(s, item) {
   // The old web, a session of another machine: it can only read and type there.
   if (isRemote(s)) {
     return [
-      { heading: `${s.device_name} · ${s.online ? "в сети" : "не в сети"}` },
+      { heading: `${devLabel(s)} · ${s.online ? "в сети" : "не в сети"}` },
       { label: "Копировать путь", sub: s.cwd, icon: SVG.folder, action: () => copyText(s.cwd) },
       { label: "Копировать id сессии", sub: "для claude --resume", icon: ACT.copy, action: () => copyText(String(s.thread_id).split(":")[1]) },
     ];
@@ -1760,7 +1760,7 @@ function renderHeader() {
   $("chat-badge").hidden = !s.web_only || Boolean(s.remote);
   $("dev-badge").hidden = !showDevice(s);
   if (showDevice(s)) {
-    $("dev-badge").textContent = s.device_name;
+    $("dev-badge").textContent = devLabel(s);
     $("dev-badge").classList.toggle("off", !s.online);
   }
   syncRemoteComposer(s);
@@ -1797,7 +1797,7 @@ function syncRemoteComposer(s) {
   $("composer").classList.toggle("readonly", ro);
   $("input").disabled = ro;
   if (ro) $("input").placeholder = why;
-  else if (state.current != null) $("input").placeholder = showDevice(s) ? `Ответить (${s.device_name})…` : "Ответить Каре…";
+  else if (state.current != null) $("input").placeholder = showDevice(s) ? `Ответить (${devLabel(s)})…` : "Ответить Каре…";
   document.querySelector(".composer-bar label.tool-btn")?.classList.toggle("gone", isRemote(s));
 }
 
@@ -2304,7 +2304,7 @@ async function send() {
     const effort = c?.provider.id === "claude" && state.effort ? state.effort : undefined;
     const dev = remoteDevice();
     const body = dev
-      ? { text: message, device: dev.id, cwd: state.devCwd[dev.id] || recentCwds(dev.id)[0] || "~", provider: "claude", model: c?.provider.id === "claude" ? c?.model?.id || undefined : undefined, effort: state.effort || undefined, web_only: true }
+      ? { text: message, device: dev.id, env: devEnv(dev), cwd: devCwd(dev), provider: "claude", model: c?.provider.id === "claude" ? c?.model?.id || undefined : undefined, effort: state.effort || undefined, web_only: true }
       : { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort, cwd: state.cwd || undefined, worktree: state.worktree || undefined };
     if (state.worktree) { state.worktree = false; renderCwd(); }
     clearComposer();
@@ -2703,7 +2703,7 @@ const TG_RELAY = [
 // The line under the composer: where else this chat's messages go.
 function renderDisclaimer(s = currentSession()) {
   if (!s) return;
-  $("disclaimer").textContent = showDevice(s) ? `Сессия работает на устройстве «${s.device_name}» — ответы идут и туда.` : tgDisclaimer(s.web_only);
+  $("disclaimer").textContent = showDevice(s) ? `Сессия работает на устройстве «${devLabel(s)}» — ответы идут и туда.` : tgDisclaimer(s.web_only);
 }
 
 function tgDisclaimer(webOnly) {
@@ -3681,6 +3681,16 @@ $("cwd-btn").onclick = () => {
 // ── where a new chat runs: this server, or another device (kara-node) ──
 state.device = store.get("kara-device") || "local";
 state.devCwd = (() => { try { return JSON.parse(store.get("kara-dev-cwd") || "{}"); } catch (_) { return {}; } })();
+// A device may run sessions on more than one side (the PC: WSL and Windows).
+state.devEnvs = (() => { try { return JSON.parse(store.get("kara-dev-env") || "{}"); } catch (_) { return {}; } })();
+const envsOf = (d) => (d && d.envs) || [];
+const devEnv = (d) => (envsOf(d).some((e) => e.id === state.devEnvs[d.id]) ? state.devEnvs[d.id] : envsOf(d)[0]?.id || "linux");
+const envLabel = (d, env) => (envsOf(d).length > 1 ? envsOf(d).find((e) => e.id === env)?.label || env : "");
+const devTitle = (d) => [d.name, envLabel(d, devEnv(d))].filter(Boolean).join(" · ");
+const devLabel = (s) => (s.env_name ? `${s.device_name} · ${s.env_name}` : s.device_name);
+// Folders are remembered per side: "pc" for the first, "pc/windows" for another.
+const cwdKey = (d) => (devEnv(d) === (envsOf(d)[0]?.id || "linux") ? d.id : `${d.id}/${devEnv(d)}`);
+const devCwd = (d) => state.devCwd[cwdKey(d)] || recentCwds(d.id, devEnv(d))[0] || "~";
 async function loadDevices() {
   try { state.devices = (await api("/api/devices")).devices || []; } catch (_) { state.devices = []; }
   if (state.device === state.homeDevice || (state.device !== "local" && !state.devices.some((d) => d.id === state.device))) state.device = "local";
@@ -3691,20 +3701,20 @@ function renderDevice() {
   const b = $("dev-btn");
   const dev = remoteDevice();
   b.hidden = state.current != null || !(state.devices || []).length;
-  $("dev-name").textContent = dev ? dev.name : "N100";
+  $("dev-name").textContent = dev ? devTitle(dev) : "N100";
   b.classList.toggle("on", Boolean(dev));
   // Telegram topics are for this server's sessions only.
   $("tg-toggle").classList.toggle("gone", Boolean(dev));
   if (dev) {
-    const cwd = state.devCwd[dev.id] || recentCwds(dev.id)[0] || "~";
-    $("cwd-name").textContent = cwd.replace(/\/+$/, "").split("/").pop() || cwd;
-    $("cwd-btn").dataset.tip = `Новый чат запустится на «${dev.name}» в ${cwd}`;
+    const cwd = devCwd(dev);
+    $("cwd-name").textContent = cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd;
+    $("cwd-btn").dataset.tip = `Новый чат запустится на «${devTitle(dev)}» в ${cwd}`;
     $("cwd-btn").classList.add("on");
   } else renderCwd();
 }
-function recentCwds(device) {
+function recentCwds(device, env) {
   const seen = new Map();
-  for (const s of state.sessions) if (s.device === device && s.cwd && !seen.has(s.cwd)) seen.set(s.cwd, s.last_activity || 0);
+  for (const s of state.sessions) if (s.device === device && (!env || (s.env || "linux") === env) && s.cwd && !seen.has(s.cwd)) seen.set(s.cwd, s.last_activity || 0);
   return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([c]) => c);
 }
 $("dev-btn").onclick = () => {
@@ -3716,21 +3726,33 @@ $("dev-btn").onclick = () => {
   const offline = (d) => (d.seen ? `не в сети · был на связи ${agoRu(d.seen)}` : "не в сети");
   openMenu([{ heading: "Где запустить новый чат" },
     { label: home?.name || "N100", sub: "Этот сервер · можно с Telegram-топиком", check: !remoteDevice(), action: () => { state.device = "local"; store.set("kara-device", "local"); renderDevice(); } },
-    ...all.filter((d) => d !== home).map((d) => ({
-      label: d.name, sub: d.online ? "в сети · сессия в tmux на устройстве" : offline(d), check: state.device === d.id, disabled: !d.online,
-      action: () => { state.device = d.id; store.set("kara-device", d.id); renderDevice(); },
-    }))], menuBelow(b), b);
+    ...all.filter((d) => d !== home).flatMap((d) => {
+      const pick = (env) => {
+        state.device = d.id; store.set("kara-device", d.id);
+        if (env) { state.devEnvs[d.id] = env; store.set("kara-dev-env", JSON.stringify(state.devEnvs)); }
+        renderDevice();
+      };
+      const sides = envsOf(d).length > 1 ? envsOf(d) : [null];
+      return sides.map((e) => ({
+        label: e ? `${d.name} · ${e.label}` : d.name,
+        sub: !d.online ? offline(d) : e?.id === "windows" ? "в сети · claude.exe в Windows, через tmux в WSL" : "в сети · сессия в tmux на устройстве",
+        check: state.device === d.id && (!e || devEnv(d) === e.id), disabled: !d.online,
+        action: () => pick(e?.id),
+      }));
+    })], menuBelow(b), b);
 };
 function deviceCwdMenu() {
   const dev = remoteDevice();
   const b = $("cwd-btn");
-  const pick = (c) => { state.devCwd[dev.id] = c; store.set("kara-dev-cwd", JSON.stringify(state.devCwd)); renderDevice(); };
-  const cwds = recentCwds(dev.id).slice(0, 8);
-  openMenu([{ heading: `Папка на «${dev.name}»` },
-    ...cwds.map((c) => ({ label: c.replace(/^\/home\/[^/]+/, "~"), check: (state.devCwd[dev.id] || cwds[0]) === c, action: () => pick(c) })),
-    { label: "Домашняя папка", sub: "~", check: state.devCwd[dev.id] === "~", action: () => pick("~") },
+  const key = cwdKey(dev);
+  const pick = (c) => { state.devCwd[key] = c; store.set("kara-dev-cwd", JSON.stringify(state.devCwd)); renderDevice(); };
+  const cwds = recentCwds(dev.id, devEnv(dev)).slice(0, 8);
+  const short = (c) => c.replace(/^\/home\/[^/]+/, "~").replace(/^[A-Za-z]:\\Users\\[^\\]+/, "~");
+  openMenu([{ heading: `Папка на «${devTitle(dev)}»` },
+    ...cwds.map((c) => ({ label: short(c), check: (state.devCwd[key] || cwds[0]) === c, action: () => pick(c) })),
+    { label: "Домашняя папка", sub: "~", check: state.devCwd[key] === "~", action: () => pick("~") },
     "sep",
-    { label: "Другая папка…", sub: "Ввести путь", icon: SVG.folder, action: () => { const v = prompt(`Папка на «${dev.name}»`, state.devCwd[dev.id] || cwds[0] || "~"); if (v && v.trim()) pick(v.trim()); } },
+    { label: "Другая папка…", sub: devEnv(dev) === "windows" ? "Ввести путь, например C:\\Users\\…" : "Ввести путь", icon: SVG.folder, action: () => { const v = prompt(`Папка на «${devTitle(dev)}»`, state.devCwd[key] || cwds[0] || "~"); if (v && v.trim()) pick(v.trim()); } },
   ], menuBelow(b), b);
 }
 $("folder-pick").onclick = () => {
