@@ -667,30 +667,34 @@ def _find_status_line_index(lines: list[str], scan_start: int) -> int | None:
             if is_likely_spinner(candidate[0]):
                 return j + 1
             break
-        # CCGRAM-HOTFIX:spinner-above-hint — a tip ("⎿  Tip: …", wrapped on a
-        # narrow pane) or the todo list under the spinner pushed it out of the
-        # two-line window: the topic read idle mid-turn and flipped 🟢/🟡.
-        k = _above_hint_block(lines, i, scan_start)
-        if k is not None and _is_live_spinner(lines[k]):
+        # CCGRAM-HOTFIX:spinner-above-hint — Claude Code puts more between its
+        # spinner and the input box: a tip ("⎿  Tip: …", two rows on a narrow
+        # pane), the todo list, a "✦ Heads up" notice with its options. Out of
+        # the two-row window, a working session read idle and its topic
+        # flipped 🟢/🟡 all turn long.
+        k = _live_spinner_above(lines, i, scan_start)
+        if k is not None:
             return k
     return None
 
 
-_HINT_BLOCK_MAX = 12
+_SPINNER_REACH = 14
+# Claude Code 2.1.309 cycles "·✢*✶✻✽" on some terminals: the ASCII "*" frame
+# is not a likely-spinner symbol, so one frame in six read as idle.
+_SPINNER_FRAMES = STATUS_SPINNERS | {"*"}
 
 
-def _above_hint_block(lines: list[str], sep: int, scan_start: int) -> int | None:
-    """Index of the line just above a "⎿ …" block (and its indented
-    continuation lines) that sits right above separator ``sep``."""
-    j = sep - 1
-    while j >= max(scan_start, sep - _HINT_BLOCK_MAX):
-        line = lines[j]
-        stripped = line.strip()
-        if stripped.startswith("⎿"):
-            return j - 1 if j - 1 >= scan_start else None
-        if stripped and not line.startswith("    "):
+def _live_spinner_above(lines: list[str], sep: int, scan_start: int) -> int | None:
+    """The live spinner line within a few rows above separator ``sep``,
+    looking past whatever Claude Code draws under it; a reply (●) or a
+    prompt (❯) on the way means there is none."""
+    for j in range(sep - 1, max(scan_start, sep - _SPINNER_REACH) - 1, -1):
+        stripped = lines[j].strip()
+        if stripped[:1] in ("●", "❯"):
             return None
-        j -= 1
+        # The spinner sits at the left edge; reply and tool lines are indented.
+        if lines[j][:1] in _SPINNER_FRAMES and _is_live_spinner(lines[j]):
+            return j
     return None
 
 
@@ -699,7 +703,7 @@ def _is_live_spinner(line: str) -> bool:
     stripped = line.strip()
     return (
         bool(stripped)
-        and stripped[0] in STATUS_SPINNERS
+        and stripped[0] in _SPINNER_FRAMES
         and "\u2026" in stripped
         and not _DONE_LINE.search(stripped)
     )

@@ -143,6 +143,12 @@ class TestParseStatusLine:
             pytest.param(
                 "  ⎿  ☐ Fix the parser\n     ☐ Add tests\n     ☐ Deploy\n", id="todo_list"
             ),
+            pytest.param(
+                "  ⎿  Tip: Run /install-github-app to tag @claude right from your Github issues and PRs\n"
+                "\n✦ Heads up · both branches share one folder.\n"
+                "  1: Learn more   2: Knew this already   0: Dismiss\n\n",
+                id="heads_up_notice",
+            ),
         ],
     )
     def test_spinner_above_hint_block(self, below: str):
@@ -151,12 +157,20 @@ class TestParseStatusLine:
         pane = f"● Bash(pytest)\n✻ Perambulating… (11m 27s · ↓ 51.0k tokens)\n{below}{_SEPARATOR}\n❯ \n{_SEPARATOR}\n"
         assert parse_status_line(pane) == "Perambulating… (11m 27s · ↓ 51.0k tokens)"
 
+    def test_ascii_asterisk_frame_is_the_spinner(self):
+        # One of Claude Code's six spinner frames is a plain "*".
+        pane = f"* Perambulating… (30m 18s · ↓ 119.2k tokens)\n  ⎿  Tip: Use /clear\n{_SEPARATOR}\n❯ \n{_SEPARATOR}\n"
+        assert parse_status_line(pane) == "Perambulating… (30m 18s · ↓ 119.2k tokens)"
+
     @pytest.mark.parametrize(
         "above",
         [
             pytest.param("● Ran the tests\n", id="tool_bullet"),
             pytest.param("✻ Worked for 3m 30s · done 11:34 AM\n", id="done_line"),
             pytest.param("✻ Doing work\n", id="spinner_without_ellipsis"),
+            pytest.param(
+                "● Here is the list:\n  · an indented bullet of a reply…\n", id="indented_reply_line"
+            ),
         ],
     )
     def test_idle_hint_block_is_not_status(self, above: str):
