@@ -128,6 +128,10 @@ const ACT = {
 // ═══ popover menu ═══════════════════════════════════════════════════════════
 // items: {label, icon, sub, danger, check, href, action} | "sep" | {heading}
 function openMenu(items, at, owner, cls = "") {
+  // The press that just closed this owner's menu must not reopen it.
+  const pressed = closeMenu.pressed;
+  closeMenu.pressed = null;
+  if (pressed && owner && pressed.owner === owner && Date.now() - pressed.at < 600) return;
   const menu = $("menu");
   menu.className = `menu ${cls}`.trim();
   menu.innerHTML = "";
@@ -179,7 +183,13 @@ function menuBelow(button) {
   const r = button.getBoundingClientRect();
   return { x: r.left, y: r.bottom + 4, top: r.top };
 }
-document.addEventListener("mousedown", (ev) => { if (!$("menu").hidden && !$("menu").contains(ev.target)) closeMenu(); });
+document.addEventListener("mousedown", (ev) => {
+  if ($("menu").hidden || $("menu").contains(ev.target)) return;
+  const owner = closeMenu.owner;
+  closeMenu();
+  // A press on the button that opened the menu only closes it (see openMenu).
+  if (owner && owner.contains(ev.target)) closeMenu.pressed = { owner, at: Date.now() };
+});
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeMenu(); });
 window.addEventListener("resize", closeMenu);
 
