@@ -127,11 +127,27 @@ function openMenu(items, at, owner, cls = "") {
   closeMenu.owner?.classList.remove("menu-open");
   closeMenu.owner = owner || null;
   owner?.classList.add("menu-open");
+  document.addEventListener("touchstart", menuTouchStart, { passive: true });
+  document.addEventListener("touchmove", menuTouchMove, { passive: false });
 }
 function closeMenu() {
   $("menu").hidden = true;
   closeMenu.owner?.classList.remove("menu-open");
   closeMenu.owner = null;
+  document.removeEventListener("touchstart", menuTouchStart);
+  document.removeEventListener("touchmove", menuTouchMove);
+}
+// iOS hands a drag on the popover (which rarely overflows) to the page beneath it,
+// so while a menu is open nothing scrolls except the menu itself, within its bounds.
+let menuTouchY = 0;
+function menuTouchStart(ev) { menuTouchY = ev.touches[0].clientY; }
+function menuTouchMove(ev) {
+  const menu = $("menu");
+  const y = ev.touches[0].clientY;
+  const down = y > menuTouchY;
+  menuTouchY = y;
+  const room = down ? menu.scrollTop > 0 : menu.scrollTop + menu.clientHeight < menu.scrollHeight - 1;
+  if (!menu.contains(ev.target) || !room) ev.preventDefault();
 }
 function menuBelow(button) {
   const r = button.getBoundingClientRect();
@@ -1377,7 +1393,7 @@ function renderToggle() {
   $("tg-toggle").classList.toggle("on", state.telegram);
   $("tg-toggle-text").textContent = state.telegram ? "Telegram" : "Без Telegram";
   $("tg-toggle").title = state.telegram ? "Чат появится и в Telegram-топике" : "Чат будет только здесь";
-  $("disclaimer").textContent = state.telegram ? "Создам топик в группе «Кара» — переписка будет видна и там." : "Чат будет только в вебе, в Telegram ничего не появится.";
+  $("disclaimer").textContent = state.telegram ? "" : "Чат будет только в вебе, в Telegram ничего не появится.";
 }
 
 function currentChoice() {
