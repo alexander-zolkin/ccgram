@@ -2145,6 +2145,10 @@ function renderAttachments() {
     const ext = (a.name.split(".").pop() || "").slice(0, 4);
     const card = el("div", "att-card");
     const thumb = el("span", "ext", a.preview ? `<img src="${a.preview}" alt="">` : a.uploading ? '<span class="spin"></span>' : esc(ext || "file"));
+    if (a.preview) {
+      card.classList.add("has-img");
+      card.onclick = (ev) => { if (!ev.target.closest("button")) openImage(a.preview, a.name, thumb.querySelector("img")); };
+    }
     card.append(thumb, el("span", "nm", esc(a.name)));
     const x = el("button", "", "✕");
     x.type = "button";
@@ -2158,7 +2162,12 @@ function renderAttachments() {
 async function uploadFiles(files) {
   for (const file of files) {
     const a = { name: file.name || "image.png", uploading: true };
-    if (file.type.startsWith("image/") && file.size < 8e6) a.preview = URL.createObjectURL(file);
+    // A data: URL — the page's CSP allows data: images, not blob: ones.
+    if (file.type.startsWith("image/") && file.size < 8e6) {
+      const r = new FileReader();
+      r.onload = () => { a.preview = r.result; renderAttachments(); };
+      r.readAsDataURL(file);
+    }
     state.attachments.push(a);
     renderAttachments();
     const form = new FormData();
