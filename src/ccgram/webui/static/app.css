@@ -801,3 +801,8 @@ body.sheet-open { overflow: hidden; }
   .sk::after, .sk-hm rect, .st-in, .heatmap.reveal .hm { animation: none; }
 }
 .act-grid b { white-space: nowrap; }
+.hm-wrap { display: flex; align-items: flex-start; gap: 2px; }
+.hm-days { flex: none; }
+.hm-scroll { flex: 1; min-width: 0; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; cursor: grab; padding-bottom: 4px; }
+.hm-scroll.dragging { cursor: grabbing; user-select: none; }
+.hm-scroll .heatmap { width: auto; max-width: none; }

@@ -158,3 +158,31 @@ def test_life_since_birthday_counts_openclaw_replies_once(tmp_path, monkeypatch)
     assert every["cost"] == pytest.approx(25.0)  # Opus 4.6: $25 per 1M out, once
     assert every["sessions"] == 1 and every["favorite"] == "claude-opus-4-6"
     assert got["heatmap"][0]["date"] <= born.isoformat()
+
+
+def test_archived_transcripts_fill_the_past_once_and_stay_cached(tmp_path, monkeypatch):
+    from datetime import date, timedelta
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    costs.reset_for_testing()
+    old = datetime.combine(date.today() - timedelta(days=60), datetime.min.time())
+    old = old.replace(hour=12).astimezone(UTC).isoformat()
+    usage = {"output_tokens": 50_000}  # $1 on opus-5-5
+    now_reply = _say("a", "claude-opus-5-5", usage)
+    _write(tmp_path / "projects" / "-w" / "s1.jsonl", [now_reply])
+    arch = tmp_path / "backup" / "claude-projects"
+    _write(arch / "-w" / "s1.jsonl", [now_reply])  # the same reply, backed up
+    _write(
+        arch / "-w" / "s0.jsonl",
+        [{**_say("b", "claude-opus-5-5", usage), "timestamp": old}],
+    )
+    _write(arch / "-home-me-private" / "p.jsonl", [_say("c", "claude-opus-5-5", usage)])
+    run = lambda: costs.period_stats(Path("/home/me/private"), {}, archive=[arch])  # noqa: E731
+    got = run()
+    assert got["all"]["cost"] == pytest.approx(
+        2.0
+    )  # a + b; the copy and private skipped
+    assert got["all"]["sessions"] == 2 and got["all"]["days"] == 61
+    cached = costs._archived
+    assert run()["all"]["cost"] == pytest.approx(2.0) and costs._archived is cached
+    costs.reset_for_testing()

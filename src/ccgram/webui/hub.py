@@ -559,6 +559,11 @@ async def run() -> None:
             if conf.get("calendar"):
                 await asyncio.to_thread(_refresh_calendar)
             await _refresh_usage()
+            if conf.get("stats"):
+                # Lazy: costs reads this module's config back.
+                from . import costs
+
+                costs.warm()  # the statistics sheet's long pass, before any click
             if (conf.get("memory") or {}).get("dir"):
                 # Keeps the memory index warm: the first home-page load after
                 # a restart would otherwise walk ~1000 files (~2 s).

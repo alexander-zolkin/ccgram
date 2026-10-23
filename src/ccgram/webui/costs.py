@@ -251,6 +251,17 @@ class _Period:
     def __init__(self) -> None:
         self.days: dict[str, _Day] = {}
         self.spans: dict[str, list[float]] = {}  # session → [first, last]
+        self.seen: set[str] = set()  # reply ids counted (archives repeat them)
+
+    def copy(self) -> _Period:
+        twin = _Period()
+        for key, day in self.days.items():
+            mine = twin.days[key] = _Day()
+            mine.tally.merge(day.tally)
+            mine.turns, mine.costs = day.turns, dict(day.costs)
+        twin.spans = {sid: list(span) for sid, span in self.spans.items()}
+        twin.seen = set(self.seen)
+        return twin
 
     def add_file(
         self, entries: Iterable[dict[str, Any]], sid: str, main: bool, seen: set[str]
@@ -419,33 +430,72 @@ def _openclaw_entries(file: Path) -> Iterator[dict[str, Any]]:
             }
 
 
+def _claude_files(root: Path, hidden: str) -> Iterator[tuple[Path, str, bool]]:
+    """(transcript, session id, is the main transcript) under a projects dir."""
+    for file in root.glob("**/*.jsonl"):
+        if any(part.startswith(hidden) for part in file.parts):
+            continue  # the private root's project dirs
+        # subagents/agent-*.jsonl belong to the session dir above them
+        sub = file.parent.name == "subagents"
+        yield file, file.parent.parent.name if sub else file.stem, not sub
+
+
+def _hidden(private_root: Path) -> str:
+    return "-" + str(private_root).strip("/").replace("/", "-").replace(".", "-")
+
+
+_archived: tuple[tuple[Any, ...], _Period] | None = None
+
+
+def _archive_period(
+    private_root: Path, archive: Iterable[Path], history: Iterable[Path]
+) -> _Period:
+    """Old Claude Code transcripts and OpenClaw logs: they no longer change, so
+    they are tallied once and kept until a file's size or mtime moves."""
+    global _archived
+    hidden = _hidden(private_root)
+    claude = [f for root in archive for f in _claude_files(root, hidden)]
+    openclaw = sorted(f for folder in history for f in folder.glob("**/*.jsonl*"))
+    sig = tuple(
+        (str(f), st.st_size, st.st_mtime)
+        for f in [c[0] for c in claude] + openclaw
+        if (st := f.stat())
+    )
+    if _archived is not None and _archived[0] == sig:
+        return _archived[1]
+    period = _Period()
+    for file, sid, main in claude:
+        period.add_file(_entries(file), sid, main, period.seen)
+    replies: set[str] = set()  # OpenClaw ids live apart: checkpoints repeat them
+    for file in openclaw:
+        sid = "openclaw:" + file.name.split(".", 1)[0]
+        period.add_file(_openclaw_entries(file), sid, True, replies)
+    _archived = (sig, period)
+    return period
+
+
 def period_stats(
     private_root: Path,
     names: dict[str, str],
     *,
     born: date | None = None,
     history: Iterable[Path] = (),
+    archive: Iterable[Path] = (),
 ) -> dict[str, Any]:
     """Everything the logs still hold: per day, windows, heatmap, chats.
 
     ``names`` maps a session id to its chat name; other sessions (SSH, cron
-    jobs, headless helpers) are summed as one "other" row. ``history`` are
-    folders of OpenClaw session logs (the agent's life before Claude Code;
-    reset / deleted / checkpoint copies included, each reply counted once)
-    and ``born`` starts the "all" window and the heatmap.
+    jobs, headless helpers) are summed as one "other" row. ``archive`` are
+    older copies of Claude Code projects dirs (backups of transcripts Claude
+    Code has since cleaned up) and ``history`` folders of OpenClaw session
+    logs — the agent's life before Claude Code, reset / deleted / checkpoint
+    copies included, each reply counted once; ``born`` starts the "all"
+    window and the heatmap.
     """
-    period = _Period()
+    period = _archive_period(private_root, archive, history).copy()
     for project in _project_dirs(private_root):
-        for file in project.glob("**/*.jsonl"):
-            # subagents/agent-*.jsonl belong to the session dir above them
-            sub = file.parent.name == "subagents"
-            sid = file.parent.parent.name if sub else file.stem
-            period.add_file(_entries(file), sid, not sub, set())
-    seen: set[str] = set()  # checkpoints repeat their session's replies
-    for folder in history:
-        for file in sorted(folder.glob("*.jsonl*")):
-            sid = "openclaw:" + file.name.split(".", 1)[0]
-            period.add_file(_openclaw_entries(file), sid, True, seen)
+        for file, sid, main in _claude_files(project, _hidden(private_root)):
+            period.add_file(_entries(file), sid, main, period.seen)
     return period.result(names, born)
 
 
@@ -470,24 +520,29 @@ async def _period_cached() -> dict[str, Any] | None:
                 tx, _ = service._transcript_for(service.find_binding(s["thread_id"]))
                 if tx:
                     names[tx.stem] = s["name"]
-        born, history = _life()
+        born, history, archive = _life()
         data = await asyncio.to_thread(
             lambda: period_stats(
-                service._private_root(), names, born=born, history=history
+                service._private_root(),
+                names,
+                born=born,
+                history=history,
+                archive=archive,
             )
         )
         _period = (time.time(), data)
         return data
 
 
-def _life() -> tuple[date | None, list[Path]]:
+def _life() -> tuple[date | None, list[Path], list[Path]]:
     """``[stats]`` in hub.toml: the agent's birthday and older session logs.
 
     ::
 
         [stats]
         born = "2026-02-25"
-        history = ["~/.openclaw/agents/main/sessions"]
+        history = ["~/.openclaw/agents/main/sessions"]   # OpenClaw logs
+        archive = ["/backups/claude-projects"]           # old transcripts
     """
     # Lazy: hub reads its config file on demand.
     from . import hub
@@ -497,8 +552,12 @@ def _life() -> tuple[date | None, list[Path]]:
         born = date.fromisoformat(str(conf["born"])) if conf.get("born") else None
     except ValueError:
         born = None
-    history = [Path(os.path.expanduser(str(h))) for h in conf.get("history") or []]
-    return born, [h for h in history if h.is_dir()]
+
+    def dirs(key: str) -> list[Path]:
+        paths = [Path(os.path.expanduser(str(h))) for h in conf.get(key) or []]
+        return [h for h in paths if h.is_dir()]
+
+    return born, dirs("history"), dirs("archive")
 
 
 async def _chat(thread_id: int) -> dict[str, Any] | None:
@@ -544,5 +603,6 @@ def warm() -> None:
 
 
 def reset_for_testing() -> None:
-    global _period
+    global _period, _archived
     _period = (0.0, None)
+    _archived = None

@@ -2868,7 +2868,7 @@ function actSecHtml(p) {
   const sub = p.born ? `родилась ${dm} — ${daysRu(age)} назад` : `журналы с ${dm}`;
   const wins = ACT_WINDOWS.map(([k, label]) => [k, k === "all" && p.born ? "С рождения" : label]);
   return `<div class="st-head"><h3>Активность</h3><span class="muted st-since">${sub}</span><div class="seg" role="tablist">${wins.map(([k, label]) => `<button type="button" data-win="${k}"${k === state.actWin ? ' class="on"' : ""}>${label}</button>`).join("")}</div></div>
-    <div class="st-scroll">${heatmapSvg(p.heatmap, true)}</div>
+    ${heatmapSvg(p.heatmap, true)}
     <div class="hm-legend">Меньше <i class="hm-key l0"></i><i class="hm-key l1"></i><i class="hm-key l2"></i><i class="hm-key l3"></i><i class="hm-key l4"></i> Больше</div>
     <div class="act-stats"></div>`;
 }
@@ -2900,31 +2900,52 @@ const SK_SAY = ["Листаю журналы…", "Считаю токены…"
 // favourite model, streaks, the busiest day for the chosen window.
 const ACT_WINDOWS = [["all", "Всё время"], ["month", "30 дней"], ["week", "7 дней"]];
 const MONTH_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
+// Fixed-size cells in a strip that scrolls sideways (today at the right end);
+// the weekday labels stay put beside it.
 function heatmapSvg(days, reveal = false) {
-  const cell = 11, step = 13, left = 24, top = 16;
+  const cell = 11, step = 13, top = 16, zoom = 1.3;
   const weeks = Math.ceil(days.length / 7);
-  const W = left + weeks * step, H = top + 7 * step;
+  const W = weeks * step, H = top + 7 * step;
   const vals = days.map((d) => d.out).filter((v) => v > 0).sort((a, b) => a - b);
   const q = (f) => (vals.length ? vals[Math.min(vals.length - 1, Math.floor(f * vals.length))] : 0);
   const cuts = [q(0.25), q(0.5), q(0.75)];
   const level = (v) => (!v ? 0 : v <= cuts[0] ? 1 : v <= cuts[1] ? 2 : v <= cuts[2] ? 3 : 4);
-  let svg = [["пн", 0], ["ср", 2], ["пт", 4]].map(([t, r]) => `<text class="hm-t" x="0" y="${top + r * step + 9}">${t}</text>`).join("");
-  let month = -1, labelled = -9;
+  const labels = [["пн", 0], ["ср", 2], ["пт", 4]].map(([t, r]) => `<text class="hm-t" x="0" y="${top + r * step + 9}">${t}</text>`).join("");
+  let svg = "", month = -1, labelled = -9;
   days.forEach((d, i) => {
     const w = Math.floor(i / 7), wd = i % 7;
     const dt = new Date(`${d.date}T12:00:00`);
     if (wd === 0 && dt.getMonth() !== month) {
       month = dt.getMonth();
       if (w < weeks - 1 && w - labelled >= 3) { // a month that starts a week after the last label waits
-        svg += `<text class="hm-t" x="${left + w * step}" y="10">${MONTH_SHORT[month]}</text>`;
+        svg += `<text class="hm-t" x="${w * step}" y="10">${MONTH_SHORT[month]}</text>`;
         labelled = w;
       }
     }
     const when = `${WEEKDAY[dt.getDay()]} ${dt.toLocaleDateString("ru-RU", { day: "numeric", month: "short" })}`;
     const tip = d.out ? `${when} · ${tokRu(d.out)} токенов · ${usd(d.cost)} · ${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}` : `${when} · без работы`;
-    svg += `<rect class="hm l${level(d.out)}" x="${left + w * step}" y="${top + wd * step}" width="${cell}" height="${cell}" rx="2.5" style="--w:${w}" data-tip="${esc(tip)}"/>`;
+    svg += `<rect class="hm l${level(d.out)}" x="${w * step}" y="${top + wd * step}" width="${cell}" height="${cell}" rx="2.5" style="--w:${w}" data-tip="${esc(tip)}"/>`;
   });
-  return `<svg class="heatmap${reveal ? " reveal" : ""}" viewBox="0 0 ${W} ${H}" style="max-width:${W * 1.6}px" role="img" aria-label="Активность по дням">${svg}</svg>`;
+  return `<div class="hm-wrap"><svg class="hm-days" viewBox="0 0 22 ${H}" width="${22 * zoom}" height="${H * zoom}" aria-hidden="true">${labels}</svg>
+    <div class="hm-scroll"><svg class="heatmap${reveal ? " reveal" : ""}" viewBox="0 0 ${W} ${H}" width="${W * zoom}" height="${H * zoom}" role="img" aria-label="Активность по дням">${svg}</svg></div></div>`;
+}
+// Drag the strip with the mouse (touch and trackpads scroll it natively).
+function dragScroll(box) {
+  let from = null;
+  box.addEventListener("pointerdown", (ev) => {
+    if (ev.pointerType !== "mouse" || ev.button !== 0) return;
+    from = { x: ev.clientX, left: box.scrollLeft };
+    box.setPointerCapture(ev.pointerId);
+  });
+  box.addEventListener("pointermove", (ev) => {
+    if (!from) return;
+    const dx = ev.clientX - from.x;
+    if (Math.abs(dx) > 3) box.classList.add("dragging");
+    box.scrollLeft = from.left - dx;
+  });
+  const stop = () => { from = null; box.classList.remove("dragging"); };
+  box.addEventListener("pointerup", stop);
+  box.addEventListener("pointercancel", stop);
 }
 function daysRu(n) { return `${n} ${pluralRu(n, "день", "дня", "дней")}`; }
 // Long spans read in days, like Claude Code's "67d 18h 15m".
@@ -3002,8 +3023,8 @@ async function openStats() {
     fill("act", actSecHtml(p));
     renderActStats(p);
     sec("act").querySelectorAll(".seg [data-win]").forEach((btn) => { btn.onclick = () => { state.actWin = btn.dataset.win; renderActStats(p); }; });
-    const box = sec("act").querySelector(".heatmap")?.parentElement;
-    if (box) box.scrollLeft = box.scrollWidth; // today is on the right
+    const box = sec("act").querySelector(".hm-scroll");
+    if (box) { box.scrollLeft = box.scrollWidth; dragScroll(box); } // today is on the right
   }).catch((e) => { clearInterval(ticker); if (live()) fill("act", `<p class="muted">${esc(e.message)}</p>`); });
 }
 async function showUsage() { openStats(); }
