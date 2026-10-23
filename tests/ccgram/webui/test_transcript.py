@@ -297,7 +297,11 @@ def test_last_usage_and_search(tmp_path):
             },
         ],
     )
-    assert transcript.last_usage(p) == {"model": "claude-x", "context": 1015}
+    assert transcript.last_usage(p) == {
+        "model": "claude-x",
+        "context": 1015,
+        "effort": None,
+    }
     hits = transcript.search(p, "автоплатёж")
     assert [h["role"] for h in hits] == ["user", "assistant"]
     assert transcript.search(p, "нет такого") == []
@@ -413,18 +417,33 @@ def test_daily_stats_buckets_by_local_day(tmp_path):
     assert got == {day(2): {"out": 100, "turns": 0}, day(1): {"out": 40, "turns": 1}}
 
 
-def test_last_effort_reads_only_what_was_appended(tmp_path):
+def test_effort_is_the_newest_of_entry_stamp_and_effort_command(tmp_path):
     p = tmp_path / "t.jsonl"
     said = "<local-command-stdout>Set effort level to {} (saved)</local-command-stdout>"
+    reply = {
+        "type": "assistant",
+        "uuid": "a1",
+        "effort": "xhigh",
+        "message": {"model": "m", "usage": {"output_tokens": 1}, "content": []},
+    }
     quoted = _tool_result("t1", said.format("low"), "r1")  # inside tool output
-    _write(p, [_user("hi", "u1"), quoted])
-    assert transcript.last_effort(p) is None
+    _write(p, [_user(said.format("medium"), "u0"), reply, quoted])
+    assert transcript.last_usage(p)["effort"] == "xhigh"
+    blocks = [{"type": "text", "text": said.format("high")}]
     with p.open("a", encoding="utf-8") as fh:
-        fh.write(_line(_user(said.format("high"), "u2")))
-        fh.write(json.dumps(_user(said.format("max"), "u3"))[:40])  # half a line
-    assert transcript.last_effort(p) == "high"
-    blocks = [{"type": "text", "text": said.format("medium")}]
-    with p.open("a", encoding="utf-8") as fh:
-        fh.write("\n" + _line(_user(blocks, "u4")))
-    assert transcript.last_effort(p) == "medium"
-    assert transcript.last_effort(tmp_path / "missing.jsonl") is None
+        fh.write(_line(_user(blocks, "u1")))  # /effort after the last reply
+    assert transcript.last_usage(p)["effort"] == "high"
+
+
+def test_thinking_updates_are_shown_empty_thinking_is_not():
+    entry = _assistant(
+        [
+            {"type": "thinking", "thinking": ""},
+            {"type": "thinking", "thinking": "Нашла причину, правлю.\n\n"},
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+        ],
+        "a1",
+    )
+    items = transcript.parse_entry(entry)
+    assert [i["kind"] for i in items] == ["thinking", "update", "tool"]
+    assert items[1]["text"] == "Нашла причину, правлю."

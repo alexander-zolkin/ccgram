@@ -235,7 +235,12 @@ def _parse_assistant(content: Any, ts: Any, uuid: str) -> list[dict[str, Any]]:
                 }
             )
         elif btype == "thinking":
-            items.append({"kind": "thinking", "ts": ts, "uuid": f"{uuid}:{idx}"})
+            # With ``thinkingDisplay: updates`` Claude Code keeps the short
+            # "what I'm doing" lines it prints between tool calls here, not as
+            # text; the reasoning itself arrives empty (signed only).
+            said = (block.get("thinking") or "").strip()
+            kind = {"kind": "update", "text": said} if said else {"kind": "thinking"}
+            items.append({**kind, "ts": ts, "uuid": f"{uuid}:{idx}"})
         elif btype == "tool_use":
             name = block.get("name", "")
             items.append(
@@ -692,7 +697,9 @@ def read_tail(path: Path, limit: int, before: int | None = None) -> dict[str, An
 
 
 def last_usage(path: Path, window: int = 512 * 1024) -> dict[str, Any] | None:
-    """Model and context size from the newest assistant entry with usage."""
+    """Model, context size and effort from the newest assistant entry with
+    usage. Claude Code stamps each entry with its ``effort``; an ``/effort``
+    run after that entry is newer, so it wins."""
     try:
         with path.open("rb") as fh:
             size = fh.seek(0, 2)
@@ -700,7 +707,10 @@ def last_usage(path: Path, window: int = 512 * 1024) -> dict[str, Any] | None:
             lines = fh.read().splitlines()
     except OSError:
         return None
+    effort = None
     for raw in reversed(lines):
+        if effort is None and _EFFORT_HINT in raw:
+            effort = _effort_said(raw)
         if b'"usage"' not in raw or b'"assistant"' not in raw:
             continue
         try:
@@ -720,7 +730,11 @@ def last_usage(path: Path, window: int = 512 * 1024) -> dict[str, Any] | None:
                 "output_tokens",
             )
         )
-        return {"model": msg.get("model") or "", "context": context}
+        return {
+            "model": msg.get("model") or "",
+            "context": context,
+            "effort": effort or entry.get("effort"),
+        }
     return None
 
 
@@ -729,7 +743,6 @@ def last_usage(path: Path, window: int = 512 * 1024) -> dict[str, Any] | None:
 # lines that mention them are parsed, and then checked for that shape.
 _EFFORT_HINT = b"Set effort level to "
 _EFFORT_SET = re.compile(r"<local-command-stdout>Set effort level to ([a-z]+)")
-_effort_seen: dict[str, tuple[int, str | None]] = {}
 
 
 def _effort_said(raw: bytes) -> str | None:
@@ -754,36 +767,6 @@ def _effort_said(raw: bytes) -> str | None:
         return None
     found = [m.group(1) for t in texts if (m := _EFFORT_SET.match(t))]
     return found[-1] if found else None
-
-
-def last_effort(path: Path) -> str | None:
-    """The level the last ``/effort`` in this transcript set (None = never ran).
-
-    Remembers how far it has read, so a long transcript is scanned once and
-    every later call reads only what was appended."""
-    key = str(path)
-    offset, level = _effort_seen.get(key, (0, None))
-    try:
-        with path.open("rb") as fh:
-            if fh.seek(0, 2) < offset:
-                offset, level = 0, None  # the file was replaced
-            fh.seek(offset)
-            buf = b""
-            for chunk in iter(lambda: fh.read(CHUNK), b""):
-                buf += chunk
-                end = buf.rfind(b"\n") + 1  # only complete lines
-                pos = buf.find(_EFFORT_HINT, 0, end)
-                while pos != -1:
-                    start = buf.rfind(b"\n", 0, pos) + 1
-                    stop = buf.find(b"\n", pos)
-                    level = _effort_said(buf[start:stop]) or level
-                    pos = buf.find(_EFFORT_HINT, stop, end)
-                offset += end
-                buf = buf[end:]
-    except OSError:
-        return None
-    _effort_seen[key] = (offset, level)
-    return level
 
 
 def search(path: Path, needle: str, limit: int = 3) -> list[dict[str, Any]]:

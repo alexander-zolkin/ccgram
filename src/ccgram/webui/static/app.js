@@ -533,6 +533,14 @@ function peerNode(it) {
   return n;
 }
 
+// Claude Code's short "what I'm doing" lines between tool calls (thinking
+// updates): shown as the console shows them, quieter than an answer.
+function updateNode(it) {
+  const n = el("div", "a-msg a-update");
+  n.appendChild(renderMarkdown(it.text));
+  return n;
+}
+
 // "Baked for 19s" in Claude Code: how long a finished turn took, what it wrote.
 const secsRu = (sec) => (sec < 60 ? `${sec} с` : sec < 3600 ? `${Math.floor(sec / 60)} мин${sec % 60 ? ` ${sec % 60} с` : ""}` : `${Math.floor(sec / 3600)} ч ${Math.floor((sec % 3600) / 60)} мин`);
 const clock = (sec) => { const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = String(sec % 60).padStart(2, "0"); return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
@@ -590,8 +598,10 @@ function buildBlocks(items, continueFrom, live = false) {
       const host = pool.find((n) => n.classList.contains(it.kind === "bash_result" ? "bash-card" : "cmd-chip"));
       if (host && !host._filled) { host._fill(it); host._filled = true; continue; }
     }
+    // An update says what the thinking was: it replaces a bare «Размышляла».
+    if (it.kind === "update" && steps && !steps.querySelector(".steps-inner").children.length) steps.remove();
     steps = null;
-    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode, peer: peerNode, turn: turnNode }[it.kind]?.(it) || assistantNode(it);
+    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode, peer: peerNode, update: updateNode, turn: turnNode }[it.kind]?.(it) || assistantNode(it);
     // The transcript copy replaces the pending bubble in place: no re-entry.
     if ((it.kind === "user" || it.kind === "bash" || it.kind === "command") && clearPending()) node.classList.add("swap");
     frag.appendChild(node);

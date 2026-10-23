@@ -220,6 +220,8 @@ input:focus { border-color: var(--accent); }
 .a-msg { font: 16.5px/1.65 var(--serif); overflow-wrap: anywhere; padding: 0 2px; }
 .a-msg > :first-child { margin-top: 0; }
 .a-msg p { margin: 0 0 14px; }
+.a-update { font-size: 15px; color: var(--muted); }
+.a-update p { margin: 0 0 8px; }
 .a-msg h1, .a-msg h2, .a-msg h3, .a-msg h4 { font-family: var(--serif); font-weight: 600; line-height: 1.3; margin: 22px 0 10px; }
 .a-msg h1 { font-size: 1.4em; } .a-msg h2 { font-size: 1.22em; } .a-msg h3, .a-msg h4 { font-size: 1.06em; }
 .a-msg ul, .a-msg ol { margin: 0 0 14px; padding-left: 26px; }

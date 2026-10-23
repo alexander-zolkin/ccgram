@@ -399,13 +399,11 @@ async def entries(
     return {"items": items, "start": 0, "end": 0, "structured": False}
 
 
-async def _effort(window_id: str, tx: Path) -> str | None:
-    """The effort a Claude session runs at: its last ``/effort``, else the
-    ``--effort`` it was launched with, else Claude Code's saved default (what a
-    launch without the flag picks up). None when Claude is not in the pane."""
-    level = await asyncio.to_thread(transcript.last_effort, tx)
-    if level:
-        return level
+async def _launch_effort(window_id: str) -> str | None:
+    """For a transcript that names no effort (an older Claude Code): the
+    ``--effort`` the session was launched with, else Claude Code's saved
+    default, which a launch without the flag picks up. None when Claude is
+    not in the pane."""
     fg = await tmux_manager.foreground(window_id)
     argv = fg.argv if fg else []
     if not any(Path(a).name == "claude" for a in argv[:2]):
@@ -431,8 +429,8 @@ async def pane(thread_id: int) -> dict[str, Any]:
     interactive = extract_interactive_content(text) if text else None
     tx, provider = _transcript_for(binding)
     meta = await asyncio.to_thread(transcript.last_usage, tx) if tx else None
-    if meta is not None and (provider or "claude") == "claude":
-        meta["effort"] = await _effort(binding.window_id, tx)
+    if meta and not meta.get("effort") and (provider or "claude") == "claude":
+        meta["effort"] = await _launch_effort(binding.window_id)
     return {
         "alive": text is not None,
         "meta": meta,
