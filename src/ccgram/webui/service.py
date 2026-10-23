@@ -660,28 +660,6 @@ async def close_web_only(thread_id: int) -> dict[str, Any]:
     return {"ok": True}
 
 
-class _LaunchQuery:
-    """Duck-typed stand-in for the CallbackQuery ``launch_window`` edits.
-
-    The launch service reports progress by editing the query's message; here
-    that message is the bot's status post in the freshly created topic, so
-    the Telegram side reads exactly as if the quick-start button was tapped.
-    """
-
-    def __init__(self, bot: Bot, chat_id: int, thread_id: int) -> None:
-        # launch_window reads only the chat off the message, to bind the topic.
-        self.message = SimpleNamespace(
-            chat=SimpleNamespace(id=chat_id, type="supergroup")
-        )
-        self._status = _background(
-            bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                text="🌐 Starting a session from the web…",
-            )
-        )
-        self._last: asyncio.Task[Any] = self._status
-
 # Telegram calls a new web chat doesn't wait for. Every topic of the group
 # shares one Bot API budget (20 a minute); when status repaints have drained
 # it, each queued call costs seconds, and in a row they held the first message
@@ -702,6 +680,29 @@ def _background_done(task: asyncio.Task[Any]) -> None:
         logger.warning("webui: background Telegram call failed: %s", task.exception())
 
 
+class _LaunchQuery:
+    """Duck-typed stand-in for the CallbackQuery ``launch_window`` edits.
+
+    The launch service reports progress by editing the query's message; here
+    that message is the bot's status post in the freshly created topic, so
+    the Telegram side reads exactly as if the quick-start button was tapped.
+    The post and its edits go out in the background, in order.
+    """
+
+    def __init__(self, bot: Bot, chat_id: int, thread_id: int) -> None:
+        # launch_window reads only the chat off the message, to bind the topic.
+        self.message = SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id, type="supergroup")
+        )
+        self._status = _background(
+            bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text="🌐 Starting a session from the web…",
+            )
+        )
+        self._last: asyncio.Task[Any] = self._status
+
     async def edit_message_text(self, text: str, **kwargs: Any) -> None:
         previous = self._last
 
@@ -716,19 +717,7 @@ def _background_done(task: asyncio.Task[Any]) -> None:
     async def answer(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
-    The post and its edits go out in the background, in order.
 
-def _default_topic_name() -> str:
-    # Same shape as the session-topic-name hotfix: "kara MM-DD HH-MM".
-    return "kara " + time.strftime("%m-%d %H-%M")
-
-
-async def create_session(
-    bot: Bot,
-    text: str,
-    name: str | None,
-    model: str | None,
-    provider: str = "claude",
 class _LaunchBot:
     """``context.bot`` for ``launch_window``: the topic rename goes out in the
     background, every other call straight to the real bot."""
@@ -744,6 +733,17 @@ class _LaunchBot:
         return True
 
 
+def _default_topic_name() -> str:
+    # Same shape as the session-topic-name hotfix: "kara MM-DD HH-MM".
+    return "kara " + time.strftime("%m-%d %H-%M")
+
+
+async def create_session(
+    bot: Bot,
+    text: str,
+    name: str | None,
+    model: str | None,
+    provider: str = "claude",
     effort: str | None = None,
     cwd: str | None = None,
     resume_id: str | None = None,
