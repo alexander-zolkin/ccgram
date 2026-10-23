@@ -131,6 +131,38 @@ class TestParseStatusLine:
     def test_returns_none(self, pane: str):
         assert parse_status_line(pane) is None
 
+    @pytest.mark.parametrize(
+        "below",
+        [
+            pytest.param(
+                "  ⎿  Tip: Run /install-github-app to tag @claude right from your Github issues\n"
+                "     and PRs\n",
+                id="tip_wrapped_on_narrow_pane",
+            ),
+            pytest.param("  ⎿  Tip: Use /resume to pick up a session\n", id="one_line_tip"),
+            pytest.param(
+                "  ⎿  ☐ Fix the parser\n     ☐ Add tests\n     ☐ Deploy\n", id="todo_list"
+            ),
+        ],
+    )
+    def test_spinner_above_hint_block(self, below: str):
+        # The tip or the todo list Claude Code draws under the spinner must not
+        # hide it: the topic read idle mid-turn and flipped 🟢/🟡 every few seconds.
+        pane = f"● Bash(pytest)\n✻ Perambulating… (11m 27s · ↓ 51.0k tokens)\n{below}{_SEPARATOR}\n❯ \n{_SEPARATOR}\n"
+        assert parse_status_line(pane) == "Perambulating… (11m 27s · ↓ 51.0k tokens)"
+
+    @pytest.mark.parametrize(
+        "above",
+        [
+            pytest.param("● Ran the tests\n", id="tool_bullet"),
+            pytest.param("✻ Worked for 3m 30s · done 11:34 AM\n", id="done_line"),
+            pytest.param("✻ Doing work\n", id="spinner_without_ellipsis"),
+        ],
+    )
+    def test_idle_hint_block_is_not_status(self, above: str):
+        pane = f"{above}  ⎿  42 passed\n     in 3.1s\n{_SEPARATOR}\n❯ \n{_SEPARATOR}\n"
+        assert parse_status_line(pane) is None
+
     def test_adaptive_scan_finds_distant_separator(self):
         pane = f"✻ Doing work\n{_SEPARATOR}\n" + "trailing\n" * 16
         assert parse_status_line(pane) == "Doing work"

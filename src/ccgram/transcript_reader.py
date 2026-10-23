@@ -65,6 +65,9 @@ _MARKER_BYTES = 128
 _BOOKKEEPING_TYPES = frozenset(
     {
         "artifact-autoreact-ledger",
+        "artifact-comment-monitor",
+        "bridge-session",
+        "cost-state",
         "ai-title",
         "custom-title",
         "last-prompt",

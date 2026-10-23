@@ -661,10 +661,48 @@ def _find_status_line_index(lines: list[str], scan_start: int) -> int | None:
             # "active" and the web UI showed a turn in progress.
             if _DONE_LINE.search(candidate) and "\u2026" not in candidate:
                 break
+            # "⎿" opens a hint under the spinner, never the spinner itself.
+            if candidate[0] == "\u23bf":
+                break
             if is_likely_spinner(candidate[0]):
                 return j + 1
             break
+        # CCGRAM-HOTFIX:spinner-above-hint — a tip ("⎿  Tip: …", wrapped on a
+        # narrow pane) or the todo list under the spinner pushed it out of the
+        # two-line window: the topic read idle mid-turn and flipped 🟢/🟡.
+        k = _above_hint_block(lines, i, scan_start)
+        if k is not None and _is_live_spinner(lines[k]):
+            return k
     return None
+
+
+_HINT_BLOCK_MAX = 12
+
+
+def _above_hint_block(lines: list[str], sep: int, scan_start: int) -> int | None:
+    """Index of the line just above a "⎿ …" block (and its indented
+    continuation lines) that sits right above separator ``sep``."""
+    j = sep - 1
+    while j >= max(scan_start, sep - _HINT_BLOCK_MAX):
+        line = lines[j]
+        stripped = line.strip()
+        if stripped.startswith("⎿"):
+            return j - 1 if j - 1 >= scan_start else None
+        if stripped and not line.startswith("    "):
+            return None
+        j -= 1
+    return None
+
+
+def _is_live_spinner(line: str) -> bool:
+    """A running spinner line: a known spinner glyph and the "…" of work going on."""
+    stripped = line.strip()
+    return (
+        bool(stripped)
+        and stripped[0] in STATUS_SPINNERS
+        and "\u2026" in stripped
+        and not _DONE_LINE.search(stripped)
+    )
 
 
 # ── Status display formatting ──────────────────────────────────────────
