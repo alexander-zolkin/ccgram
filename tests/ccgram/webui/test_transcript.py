@@ -133,6 +133,56 @@ def test_message_typed_mid_turn_shows_where_the_model_got_it():
     assert transcript.parse_entry(other) == []
 
 
+def test_message_from_another_session_is_not_the_persons():
+    body = "Heads-up: I'm editing app.js too."
+    wrapped = (
+        '<cross-session-message from="uds:/tmp/cc-socks/1.sock" '
+        f'from-name="workspace-18" from-mode="bypass">\n{body}\n'
+        "</cross-session-message>"
+    )
+    peer = {"kind": "peer", "from": "uds:/tmp/cc-socks/1.sock", "name": "workspace-18"}
+    queued = {
+        "type": "attachment",
+        "uuid": "p1",
+        "timestamp": "2026-10-23T01:26:58.132Z",
+        "attachment": {
+            "type": "queued_command",
+            "prompt": wrapped,
+            "commandMode": "prompt",
+            "origin": {**peer, "body": body},
+            "isMeta": True,
+        },
+    }
+    (item,) = transcript.parse_entry(queued)
+    assert item["kind"] == "peer" and item["from"] == "workspace-18"
+    assert item["text"] == body and not item["handback"]
+
+    # A subagent's report delivered to an idle session: a meta ``user`` entry.
+    report = "Done: 4 workflows off."
+    idle = {
+        "type": "user",
+        "uuid": "p2",
+        "isMeta": True,
+        "message": {"content": '<agent-message from="a1">\n[Subagent hand-back] …'},
+        "origin": {
+            "kind": "peer",
+            "name": "n8n-workflow-editor",
+            "body": "[Subagent hand-back] …",
+            "handback": True,
+            "handbackReportText": report,
+        },
+    }
+    (item,) = transcript.parse_entry(idle)
+    assert item["kind"] == "peer" and item["handback"] and item["text"] == report
+    assert transcript._is_prompt(idle, [item])
+
+    boss = {
+        **queued,
+        "attachment": {**queued["attachment"], "origin": {"kind": "coordinator"}},
+    }
+    assert transcript.parse_entry(boss) == []
+
+
 def test_after_returns_late_result_standalone(tmp_path):
     p = tmp_path / "t.jsonl"
     call = _assistant(

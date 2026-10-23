@@ -511,6 +511,19 @@ function summaryNode(it) {
   return n;
 }
 
+// Another Claude session's message or a subagent's report: the model read it
+// as a prompt, but nobody typed it — so it is a card, never a user bubble.
+function peerNode(it) {
+  const n = el("details", "summary-card peer-card");
+  const who = it.handback ? `Отчёт субагента «${it.from}»` : `Сообщение от сессии «${it.from}»`;
+  const peek = String(it.text || "").split("\n").find((l) => l.trim()) || "";
+  n.innerHTML = `<summary><span class="peer-who">${esc(who)}</span><span class="peer-peek">${esc(peek)}</span><span class="msg-time">${esc(hhmm(it.ts))}</span></summary>`;
+  const body = renderMarkdown(String(it.text || ""));
+  body.className = "summary-body";
+  n.appendChild(body);
+  return n;
+}
+
 // "Baked for 19s" in Claude Code: how long a finished turn took, what it wrote.
 const secsRu = (sec) => (sec < 60 ? `${sec} с` : sec < 3600 ? `${Math.floor(sec / 60)} мин${sec % 60 ? ` ${sec % 60} с` : ""}` : `${Math.floor(sec / 3600)} ч ${Math.floor((sec % 3600) / 60)} мин`);
 const clock = (sec) => { const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = String(sec % 60).padStart(2, "0"); return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
@@ -569,7 +582,7 @@ function buildBlocks(items, continueFrom, live = false) {
       if (host && !host._filled) { host._fill(it); host._filled = true; continue; }
     }
     steps = null;
-    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode, turn: turnNode }[it.kind]?.(it) || assistantNode(it);
+    const node = { user: userNode, bash: bashNode, bash_result: bashNode, command: commandNode, command_result: commandNode, summary: summaryNode, peer: peerNode, turn: turnNode }[it.kind]?.(it) || assistantNode(it);
     // The transcript copy replaces the pending bubble in place: no re-entry.
     if ((it.kind === "user" || it.kind === "bash" || it.kind === "command") && clearPending()) node.classList.add("swap");
     frag.appendChild(node);
@@ -807,6 +820,8 @@ function groupOf(ts) {
 }
 
 function renderSessions() {
+  // A rename in progress lives in its row: a rebuild would throw the input away.
+  if (state.renaming) { state.renaming.stale = true; return; }
   const nav = $("session-list");
   const f = state.filter.trim().toLowerCase();
   nav.innerHTML = "";
@@ -902,6 +917,8 @@ function renameSession(s, item) {
   const original = host.innerHTML;
   host.innerHTML = "";
   host.appendChild(input);
+  // Updates from other chats wait until the edit is done (see renderSessions).
+  const hold = host === $("chat-name") ? null : (state.renaming = { stale: false });
   input.focus();
   input.select();
   input.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); };
@@ -911,12 +928,16 @@ function renameSession(s, item) {
     done = true;
     const name = input.value.trim();
     host.innerHTML = original;
-    if (!save || !name || name === s.name) return;
-    try {
-      await api(`/api/sessions/${s.thread_id}/rename`, { body: { name } });
-      s.name = name;
-      renderSessions();
-    } catch (e) { toast(e.message); }
+    if (hold && state.renaming === hold) state.renaming = null;
+    const changed = save && name && name !== s.name;
+    if (changed) {
+      try {
+        await api(`/api/sessions/${s.thread_id}/rename`, { body: { name } });
+        // The list may have been replaced meanwhile: name the live entry too.
+        for (const x of [s, sessionById(s.thread_id)]) if (x) x.name = name;
+      } catch (e) { toast(e.message); }
+    }
+    if (changed || hold?.stale) renderSessions();
   };
   input.onkeydown = (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); finish(true); }

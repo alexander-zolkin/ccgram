@@ -192,6 +192,9 @@ def _parse_user_text(
 
 
 def _parse_user(entry: dict[str, Any], content: Any, ts: Any, uuid: str) -> list:
+    origin = entry.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") == "peer":
+        return [_peer_item(origin, ts, uuid)]  # delivered to an idle session
     if entry.get("isMeta"):
         return []
     if isinstance(content, str):
@@ -247,6 +250,24 @@ def _parse_assistant(content: Any, ts: Any, uuid: str) -> list[dict[str, Any]]:
     return items
 
 
+def _peer_item(origin: dict[str, Any], ts: Any, uuid: str) -> dict[str, Any]:
+    """A message from another Claude session (SendMessage) or a subagent's
+    final report: Claude Code hands it to the model like a typed prompt,
+    but the person never wrote it."""
+    handback = bool(origin.get("handback"))
+    body = (origin.get("handbackReportText") if handback else None) or origin.get(
+        "body"
+    )
+    return {
+        "kind": "peer",
+        "from": str(origin.get("name") or origin.get("from") or ""),
+        "handback": handback,
+        "text": _clip(str(body or "").strip(), MAX_FIELD * 2),
+        "ts": ts,
+        "uuid": uuid,
+    }
+
+
 def _parse_queued(entry: dict[str, Any]) -> list[dict[str, Any]]:
     """A message typed while a turn runs: Claude Code queues it and hands it
     to the model at the next step, recorded as a ``queued_command``
@@ -255,7 +276,13 @@ def _parse_queued(entry: dict[str, Any]) -> list[dict[str, Any]]:
     att = entry.get("attachment")
     if not isinstance(att, dict) or att.get("type") != "queued_command":
         return []
-    human = (att.get("origin") or {}).get("kind") == "human"
+    origin = att.get("origin") or {}
+    ts, uuid = entry.get("timestamp"), entry.get("uuid", "")
+    if origin.get("kind") == "peer":
+        return [_peer_item(origin, ts, uuid)]
+    if origin.get("kind") not in (None, "human"):
+        return []  # coordinator, task notifications: not typed by anyone
+    human = origin.get("kind") == "human"
     if (att.get("commandMode") or ("prompt" if human else "")) != "prompt":
         return []  # background task notifications and the like
     prompt = att.get("prompt")
@@ -268,7 +295,6 @@ def _parse_queued(entry: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(prompt, str) or not prompt.strip() or _PLUMBING.match(prompt):
         return []
     text = _PASTED.sub("\n", prompt).strip("\n")
-    ts, uuid = entry.get("timestamp"), entry.get("uuid", "")
     return [{"kind": "user", "text": text, "ts": ts, "uuid": uuid, "queued": True}]
 
 
@@ -298,7 +324,7 @@ def parse_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
 # one message is its own entry and repeats that message's usage.
 
 TURN_BACK = 4 * 1024 * 1024
-_PROMPT_KINDS = ("user", "bash", "command")
+_PROMPT_KINDS = ("user", "bash", "command", "peer")
 
 
 class _Turn:
