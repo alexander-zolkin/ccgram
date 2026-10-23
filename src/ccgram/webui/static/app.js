@@ -2036,6 +2036,27 @@ const kTokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n 
 
 // The session's effort, in the composer next to the mode chip.
 const EFFORT_SHORT = { low: "низкое", medium: "среднее", high: "высокое", xhigh: "очень высокое", max: "макс." };
+// The effort chip is a speedometer: the needle and the filled arc show the
+// level (low … max), so it reads even where the label is hidden (phones).
+const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"];
+function gaugeSvg(level) {
+  const i = EFFORT_ORDER.indexOf(level || "xhigh");
+  const t = ((i < 0 ? 3 : i) + 1) / EFFORT_ORDER.length;
+  const a = Math.PI * (1 - t);
+  const px = (r) => [12 + r * Math.cos(a), 17 - r * Math.sin(a)].map((v) => v.toFixed(2));
+  const [ex, ey] = px(8);
+  const [nx, ny] = px(5.6);
+  return `<svg class="effort-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 17a8 8 0 0 1 16 0" opacity=".28"/><path d="M4 17A8 8 0 0 1 ${ex} ${ey}"/><path d="M12 17L${nx} ${ny}"/><circle cx="12" cy="17" r="1.3" fill="currentColor" stroke="none"/></svg>`;
+}
+function setGauge(button, level) {
+  const old = button.querySelector(".effort-ico");
+  if (old && old.dataset.level === (level || "")) return;
+  const tmp = el("span", "", gaugeSvg(level));
+  const svg = tmp.firstElementChild;
+  svg.dataset.level = level || "";
+  if (old) old.replaceWith(svg); else button.prepend(svg);
+}
+
 function renderSessEffort() {
   const b = $("sess-effort-btn");
   const s = currentSession();
@@ -2044,6 +2065,7 @@ function renderSessEffort() {
   if (b.hidden) return;
   $("sess-effort-name").textContent = EFFORT_SHORT[e] || e;
   b.dataset.level = e;
+  setGauge(b, e);
 }
 
 function renderMeta(meta) {
@@ -2510,6 +2532,7 @@ function renderEffort() {
   const e = EFFORTS.find(([id]) => id === state.effort) || EFFORTS[0];
   $("effort-name").innerHTML = e[0] ? `<span class="lbl-long">Усилие: </span>${esc(e[1].toLowerCase())}` : '<span class="lbl-long">Усилие</span>';
   $("effort-btn").classList.toggle("set", Boolean(e[0]));
+  setGauge($("effort-btn"), e[0] || "xhigh");
 }
 
 function pickModel(provider, model) {
