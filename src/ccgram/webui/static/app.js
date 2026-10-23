@@ -772,7 +772,7 @@ function startInlineEdit(node) {
   box.append(ta, bar);
   node.classList.add("editing");
   node.append(box);
-  const fit = () => { ta.style.height = "auto"; ta.style.height = `${Math.min(ta.scrollHeight, innerHeight * 0.5)}px`; };
+  const fit = () => fitTextarea(ta, innerHeight * 0.5);
   ta.oninput = fit;
   fit();
   ta.focus();
@@ -1777,7 +1777,7 @@ function renderHeader() {
   syncSendBtn();
   renderSoundBtn(s);
   $("gone-card").hidden = !s.topic_deleted;
-  $("disclaimer").textContent = showDevice(s) ? `Сессия работает на устройстве «${s.device_name}» — ответы идут и туда.` : s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
+  renderDisclaimer(s);
   setTitle(`${working ? "⏳ " : ""}${s.name} — Кара`);
   syncLiveRow();
   refreshMsgStatus();
@@ -2143,10 +2143,18 @@ async function pollPane() {
 }
 
 // ═══ composer ═══════════════════════════════════════════════════════════════
-function autosize() {
-  const t = $("input");
+// scrollHeight is rounded while lines are 23.25 px tall, so a textarea sized
+// to it can come out a pixel short and flash a scrollbar mid-typing: keep the
+// scrollbar off until the text really outgrows the cap.
+function fitTextarea(t, max) {
   t.style.height = "auto";
-  t.style.height = Math.min(t.scrollHeight, window.innerHeight * 0.4) + "px";
+  const want = t.scrollHeight + 1;
+  t.style.height = `${Math.min(want, max)}px`;
+  t.style.overflowY = want > max ? "auto" : "hidden";
+}
+
+function autosize() {
+  fitTextarea($("input"), window.innerHeight * 0.4);
   syncSendBtn();
 }
 
@@ -2370,7 +2378,7 @@ function showDraft(key) {
   $("title-btn").hidden = false;
   $("chat-name").textContent = draftName(d);
   $("chat-badge").hidden = !d.body.web_only;
-  $("disclaimer").textContent = d.body.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
+  $("disclaimer").textContent = tgDisclaimer(d.body.web_only);
   setTitle(`⏳ ${draftName(d)} — Кара`);
   updateLed();
   renderSessions();
@@ -2692,9 +2700,24 @@ const TG_RELAY = [
   ["final", "Только итог хода", "Финальный ответ, вопросы, запросы разрешений и ошибки"],
   ["off", "Ничего", "Сессии молчат в Telegram; всё — только здесь"],
 ];
+// The line under the composer: where else this chat's messages go.
+function renderDisclaimer(s = currentSession()) {
+  if (!s) return;
+  $("disclaimer").textContent = showDevice(s) ? `Сессия работает на устройстве «${s.device_name}» — ответы идут и туда.` : tgDisclaimer(s.web_only);
+}
+
+function tgDisclaimer(webOnly) {
+  if (webOnly) return "Этот чат только в вебе — в Telegram не дублируется.";
+  const relay = state.tgRelay || "all";
+  return relay === "final" ? "В Telegram-топик уходит только итог хода."
+    : relay === "off" ? "У чата есть Telegram-топик, но сейчас туда ничего не шлётся."
+    : "Этот чат дублируется в Telegram-топик.";
+}
+
 async function setTgRelay(mode) {
   try {
     state.tgRelay = (await api("/api/settings", { body: { tg_relay: mode } })).tg_relay;
+    renderDisclaimer();
     toast(`Telegram: ${(TG_RELAY.find(([id]) => id === state.tgRelay) || TG_RELAY[0])[1].toLowerCase()}`);
   } catch (e) { toast(e.message); }
 }
@@ -2982,7 +3005,7 @@ async function boot(me) {
     $("mic-btn").hidden = !micSupported();
     if (typeof r.new_chat_telegram === "boolean") { state.telegram = r.new_chat_telegram; store.set("kara-telegram", state.telegram ? "1" : "0"); renderToggle(); }
     const s = currentSession();
-    if (s) renderSoundBtn(s);
+    if (s) { renderSoundBtn(s); renderDisclaimer(s); }
   }).catch(() => {});
 }
 
