@@ -779,3 +779,24 @@ body.sheet-open { overflow: hidden; }
 .st-since { font-size: 12px; }
 .st-head { flex-wrap: wrap; row-gap: 8px; }
 .st-head h3, .st-since { white-space: nowrap; }
+/* the sheet loads block by block: skeletons, then each block rises in */
+.sk { background: var(--raised); border-radius: 7px; position: relative; overflow: hidden; }
+.sk::after { content: ""; position: absolute; inset: 0; transform: translateX(-100%); background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--panel) 75%, transparent), transparent); animation: sk-sweep 1.5s ease-in-out infinite; }
+@keyframes sk-sweep { to { transform: translateX(100%); } }
+.sk-title { height: 18px; width: 40%; margin: 2px 0 16px; }
+.sk-line { height: 11px; margin: 7px 0; }
+.sk-bar { height: 6px; border-radius: 3px; margin: 6px 0; }
+.sk-big { height: 32px; width: 150px; margin-bottom: 14px; }
+.sk-tile { height: 58px; border-radius: 10px; }
+.sk-chart { height: 150px; max-width: 640px; border-radius: 10px; }
+.sk-hm rect { fill: var(--raised); animation: sk-wave 1.8s ease-in-out infinite; animation-delay: calc(var(--w) * 40ms); }
+@keyframes sk-wave { 0%, 100% { fill: var(--raised); } 45% { fill: color-mix(in srgb, var(--chart-1) 30%, var(--raised)); } }
+.sk-say { font-size: 12.5px; margin: 8px 0 6px; min-height: 1.4em; transition: opacity .2s; }
+.st-in { animation: st-in .38s cubic-bezier(.2, .7, .3, 1) both; }
+@keyframes st-in { from { opacity: 0; transform: translateY(8px); } }
+.heatmap.reveal .hm { transform-box: fill-box; transform-origin: center; animation: hm-in .45s cubic-bezier(.2, .7, .3, 1) both; animation-delay: calc(var(--w) * 16ms); }
+@keyframes hm-in { from { opacity: 0; transform: scale(.4); } }
+.act-models { margin-top: 10px; }
+@media (prefers-reduced-motion: reduce) {
+  .sk::after, .sk-hm rect, .st-in, .heatmap.reveal .hm { animation: none; }
+}

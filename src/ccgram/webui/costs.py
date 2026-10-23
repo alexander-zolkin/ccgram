@@ -18,7 +18,10 @@ import os
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
 
 # $ per million tokens: input, output, cache read, cache write 5 min, 1 h.
 PRICES: dict[str, tuple[float, float, float, float, float]] = {
@@ -90,7 +93,7 @@ class Tally:
                 mine[i] += v
 
     def summary(self) -> dict[str, Any]:
-        rows = sorted(self.models.items(), key=lambda kv: -kv[1][4] or -kv[1][1])
+        rows = sorted(self.models.items(), key=lambda kv: (-kv[1][4], -kv[1][1]))
         total = [sum(r[i] for _m, r in rows) for i in range(5)]
         fed = total[0] + total[2] + total[3]
         return {
@@ -249,9 +252,10 @@ class _Period:
         self.days: dict[str, _Day] = {}
         self.spans: dict[str, list[float]] = {}  # session → [first, last]
 
-    def add_file(self, file: Path, sid: str, main: bool) -> None:
-        seen: set[str] = set()
-        for entry in _entries(file):
+    def add_file(
+        self, entries: Iterable[dict[str, Any]], sid: str, main: bool, seen: set[str]
+    ) -> None:
+        for entry in entries:
             when = _epoch(entry.get("timestamp"))
             if when is None:
                 continue
@@ -320,14 +324,17 @@ class _Period:
             run, day = run + 1, day - timedelta(days=1)
         return run
 
-    def result(self, names: dict[str, str]) -> dict[str, Any]:
+    def result(self, names: dict[str, str], born: date | None = None) -> dict[str, Any]:
         today = date.today()
         month_from = today - timedelta(days=PERIOD_DAYS - 1)
         week_from = today - timedelta(days=6)
         active = sorted(k for k, d in self.days.items() if d.costs)
         first = date.fromisoformat(active[0]) if active else today
+        first = min(first, born) if born else first
         # The heatmap: whole weeks back to the first activity, at least half a year.
-        grid_from = min(first, today - timedelta(weeks=HEATMAP_MIN_WEEKS))
+        grid_from = (
+            first if born else min(first, today - timedelta(weeks=HEATMAP_MIN_WEEKS))
+        )
         grid_from -= timedelta(days=grid_from.weekday())
 
         def row(key: str) -> dict[str, Any]:
@@ -360,6 +367,7 @@ class _Period:
             "month": self._window(month_from, today),
             "all": self._window(first, today),
         }
+        windows["all"]["since"] = first.isoformat()
         return {
             "days": span(month_from),
             "heatmap": span(grid_from),
@@ -370,25 +378,75 @@ class _Period:
             "models": windows["month"]["models"],
             "chats": [{"name": n, "cost": round(c, 2)} for n, c in named[:TOP_CHATS]],
             "chats_rest": round(rest, 2),
+            "born": born.isoformat() if born else None,
             "as_of": time.time(),
         }
 
 
-def period_stats(private_root: Path, names: dict[str, str]) -> dict[str, Any]:
-    """Everything the transcripts still hold: per day, windows, heatmap, chats.
+def _openclaw_entries(file: Path) -> Iterator[dict[str, Any]]:
+    """An OpenClaw session log, its assistant messages in transcript shape."""
+    try:
+        fh = file.open("rb")
+    except OSError:
+        return
+    with fh:
+        for raw in fh:
+            if b'"usage"' not in raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue
+            msg = entry.get("message") if isinstance(entry, dict) else None
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            usage = msg.get("usage")
+            if not isinstance(usage, dict) or msg.get("provider") == "openclaw":
+                continue  # "delivery-mirror": OpenClaw's own echo, not a model
+            yield {
+                "type": "assistant",
+                "timestamp": entry.get("timestamp"),
+                "message": {
+                    "id": msg.get("responseId") or entry.get("id"),
+                    "model": msg.get("model"),
+                    "usage": {
+                        "input_tokens": usage.get("input") or 0,
+                        "output_tokens": usage.get("output") or 0,
+                        "cache_read_input_tokens": usage.get("cacheRead") or 0,
+                        "cache_creation_input_tokens": usage.get("cacheWrite") or 0,
+                    },
+                },
+            }
+
+
+def period_stats(
+    private_root: Path,
+    names: dict[str, str],
+    *,
+    born: date | None = None,
+    history: Iterable[Path] = (),
+) -> dict[str, Any]:
+    """Everything the logs still hold: per day, windows, heatmap, chats.
 
     ``names`` maps a session id to its chat name; other sessions (SSH, cron
-    jobs, headless helpers) are summed as one "other" row.
+    jobs, headless helpers) are summed as one "other" row. ``history`` are
+    folders of OpenClaw session logs (the agent's life before Claude Code;
+    reset / deleted / checkpoint copies included, each reply counted once)
+    and ``born`` starts the "all" window and the heatmap.
     """
     period = _Period()
     for project in _project_dirs(private_root):
         for file in project.glob("**/*.jsonl"):
             # subagents/agent-*.jsonl belong to the session dir above them
             sub = file.parent.name == "subagents"
-            period.add_file(
-                file, file.parent.parent.name if sub else file.stem, not sub
-            )
-    return period.result(names)
+            sid = file.parent.parent.name if sub else file.stem
+            period.add_file(_entries(file), sid, not sub, set())
+    seen: set[str] = set()  # checkpoints repeat their session's replies
+    for folder in history:
+        for file in sorted(folder.glob("*.jsonl*")):
+            sid = "openclaw:" + file.name.split(".", 1)[0]
+            period.add_file(_openclaw_entries(file), sid, True, seen)
+    return period.result(names, born)
 
 
 # ── what the statistics sheet asks for ───────────────────────────────────────
@@ -412,9 +470,35 @@ async def _period_cached() -> dict[str, Any] | None:
                 tx, _ = service._transcript_for(service.find_binding(s["thread_id"]))
                 if tx:
                     names[tx.stem] = s["name"]
-        data = await asyncio.to_thread(period_stats, service._private_root(), names)
+        born, history = _life()
+        data = await asyncio.to_thread(
+            lambda: period_stats(
+                service._private_root(), names, born=born, history=history
+            )
+        )
         _period = (time.time(), data)
         return data
+
+
+def _life() -> tuple[date | None, list[Path]]:
+    """``[stats]`` in hub.toml: the agent's birthday and older session logs.
+
+    ::
+
+        [stats]
+        born = "2026-02-25"
+        history = ["~/.openclaw/agents/main/sessions"]
+    """
+    # Lazy: hub reads its config file on demand.
+    from . import hub
+
+    conf = hub.config().get("stats") or {}
+    try:
+        born = date.fromisoformat(str(conf["born"])) if conf.get("born") else None
+    except ValueError:
+        born = None
+    history = [Path(os.path.expanduser(str(h))) for h in conf.get("history") or []]
+    return born, [h for h in history if h.is_dir()]
 
 
 async def _chat(thread_id: int) -> dict[str, Any] | None:
@@ -431,17 +515,32 @@ async def _chat(thread_id: int) -> dict[str, Any] | None:
     return await asyncio.to_thread(chat_stats, tx) if tx and tx.exists() else None
 
 
-async def overview(thread_id: int | None) -> dict[str, Any]:
-    """Plan limits + credits, this chat, the last 30 days."""
+async def part(name: str, thread_id: int | None) -> Any:
+    """One block of the statistics sheet; each loads on its own."""
     # Lazy: usage pulls nothing heavy, but keep the pair side by side.
     from . import usage
 
-    plan, chat, period = await asyncio.gather(
-        usage.plan_usage(),
-        _chat(thread_id) if thread_id is not None else asyncio.sleep(0),
-        _period_cached(),
-    )
-    return {"usage": plan, "chat": chat, "period": period}
+    if name == "limits":
+        return await usage.plan_usage()
+    if name == "chat":
+        return await _chat(thread_id) if thread_id is not None else None
+    if name == "period":
+        return await _period_cached()
+    raise ValueError(name)
+
+
+_warming: asyncio.Task[Any] | None = None
+
+
+def warm() -> None:
+    """Start the long pass in the background (the home page calls this), so
+    the sheet usually opens on a warm cache."""
+    global _warming
+    stamp, data = _period
+    fresh = data is not None and time.time() - stamp < PERIOD_TTL_S
+    if fresh or (_warming is not None and not _warming.done()):
+        return
+    _warming = asyncio.get_running_loop().create_task(_period_cached())
 
 
 def reset_for_testing() -> None:

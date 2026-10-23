@@ -124,3 +124,37 @@ def test_activity_streaks_busiest_day_and_heatmap(tmp_path, monkeypatch):
     first = date.fromisoformat(got["heatmap"][0]["date"])
     assert first.weekday() == 0 and len(got["heatmap"]) >= 26 * 7
     assert got["heatmap"][-1]["date"] == date.today().isoformat()
+
+
+def test_life_since_birthday_counts_openclaw_replies_once(tmp_path, monkeypatch):
+    from datetime import date, timedelta
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    usage = {"input": 0, "output": 1_000_000, "cacheRead": 0, "cacheWrite": 0}
+
+    def reply(rid, provider="anthropic", model="claude-opus-4-6"):
+        msg = {"role": "assistant", "provider": provider, "model": model}
+        return {
+            "type": "message",
+            "id": rid,
+            "timestamp": NOW,
+            "message": {**msg, "responseId": rid, "usage": usage},
+        }
+
+    hist = tmp_path / "openclaw"
+    _write(
+        hist / "s1.jsonl.reset.2026-05-01",
+        [reply("r1"), reply("r2", "openclaw", "delivery-mirror")],
+    )
+    _write(hist / "s1.checkpoint.abc.jsonl", [reply("r1")])  # a copy of the same reply
+    born = date.today() - timedelta(days=40)
+    got = costs.period_stats(Path("/nowhere/private"), {}, born=born, history=[hist])
+    every = got["all"]
+    assert (every["since"], every["days"], got["born"]) == (
+        born.isoformat(),
+        41,
+        born.isoformat(),
+    )
+    assert every["cost"] == pytest.approx(25.0)  # Opus 4.6: $25 per 1M out, once
+    assert every["sessions"] == 1 and every["favorite"] == "claude-opus-4-6"
+    assert got["heatmap"][0]["date"] <= born.isoformat()

@@ -37,7 +37,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/uploads``                   file for a session not created yet
 - ``GET  /api/models``                    Claude models for the picker
 - ``GET  /api/usage?refresh=1``          plan limits, what /usage shows in Claude Code
-- ``GET  /api/stats?tid=``                limits + credits, this chat's cost, 30 days
+- ``GET  /api/stats/{limits|chat|period}?tid=``  the statistics sheet, block by block
 - ``GET  /api/events``                    SSE: messages + session-list changes
 - ``GET  /api/auth/methods``              which logins are open (no session needed)
 - ``POST /api/auth/passkey/login/options``, ``/api/auth/passkey/login``  passkey login
@@ -573,7 +573,10 @@ async def _settings(request: web.Request) -> web.Response:
 async def _stats(request: web.Request) -> web.Response:
     tid = request.query.get("tid")
     thread_id = int(tid) if tid and tid.lstrip("-").isdigit() else None
-    return web.json_response(await costs.overview(thread_id))
+    name = request.match_info["part"]
+    if name not in ("limits", "chat", "period"):
+        raise service.WebUIError("unknown part", 404)
+    return web.json_response({name: await costs.part(name, thread_id)})
 
 
 async def _usage(request: web.Request) -> web.Response:
@@ -582,6 +585,7 @@ async def _usage(request: web.Request) -> web.Response:
 
 
 async def _hub(_request: web.Request) -> web.Response:
+    costs.warm()  # the statistics sheet's long pass, ahead of the click
     return web.json_response(await hub.overview())
 
 
@@ -942,7 +946,7 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/answer", _answer)
     r.add_post("/api/tts", _tts)
     r.add_get("/api/usage", _usage)
-    r.add_get("/api/stats", _stats)
+    r.add_get("/api/stats/{part}", _stats)
     r.add_get("/api/events", _events)
     _add_auth_routes(r)
     _add_hub_routes(r)

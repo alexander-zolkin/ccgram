@@ -2817,8 +2817,15 @@ async function fetchLimits(refresh) {
 // The statistics sheet: plan limits, usage credits, this chat, all chats.
 const usd = (v) => (v || 0).toLocaleString("ru-RU", { style: "currency", currency: "USD", maximumFractionDigits: v >= 100 ? 0 : v >= 10 ? 1 : 2, minimumFractionDigits: v >= 100 ? 0 : v >= 10 ? 1 : 2 });
 function modelRu(id) {
-  const parts = String(id).replace(/^claude-/, "").split("-").filter((p) => !/^\d{8}$/.test(p));
-  const fam = parts.shift() || id;
+  const raw = String(id);
+  if (!raw.startsWith("claude-")) { // gpt-5.4, gemini-2.5-pro, grok-4.20-0309-reasoning
+    if (raw === "coder-model") return "Qwen Coder";
+    const words = raw.split("-").filter((w) => !/^\d{4}$/.test(w));
+    const head = words.shift() || raw;
+    return head === "gpt" ? `GPT-${words.join(" ")}` : [`${head[0].toUpperCase()}${head.slice(1)}`, ...words].join(" ");
+  }
+  const parts = raw.replace(/^claude-/, "").split("-").filter((part) => !/^\d{8}$/.test(part));
+  const fam = parts.shift() || raw;
   return `${fam[0].toUpperCase()}${fam.slice(1)} ${parts.join(".")}`.trim();
 }
 const CREDIT_REASON = { org_level_disabled: "выключены на уровне организации", user_disabled: "выключены в настройках аккаунта" };
@@ -2834,39 +2841,66 @@ function modelTable(models) {
   return `<div class="st-scroll"><table class="st-table"><tr><th>Модель</th><th>Ввод</th><th>Вывод</th><th>Кэш: чтение</th><th>Кэш: запись</th><th>≈ по API</th></tr>${models.map((m) => `<tr><td>${esc(modelRu(m.model))}</td><td>${tokRu(m.input)}</td><td>${tokRu(m.output)}</td><td>${tokRu(m.cache_read)}</td><td>${tokRu(m.cache_write)}</td><td>${m.priced ? usd(m.cost) : "—"}</td></tr>`).join("")}</table></div>`;
 }
 const tile = (big, small) => `<div class="st-tile"><b>${big}</b><span>${small}</span></div>`;
-function statsHtml(d) {
-  const u = d.usage, c = d.chat, p = d.period;
-  const out = [];
-  out.push(`<section class="st-sec"><div class="st-head"><h3>Лимиты подписки${u?.plan ? ` · ${esc(u.plan)}` : ""}</h3><button type="button" class="btn small" data-act="refresh">Обновить</button></div>
-    ${u ? `<div class="lim-grid">${limitsHtml(u)}</div>${creditsHtml(u.credits)}` : '<div class="muted">Лимиты сейчас недоступны — Claude Code ещё ни разу их не запрашивал.</div>'}</section>`);
-  if (c) {
-    const s = currentSession();
-    out.push(`<section class="st-sec"><h3>Этот чат${s ? ` · ${esc(s.name)}` : ""}</h3>
-      <div class="st-big">${usd(c.cost)}<span>по ценам API</span></div>
-      <div class="st-tiles">${tile(c.turns, pluralRu(c.turns, "ход", "хода", "ходов"))}${tile(secsRu(c.busy_s), "в работе")}${tile(secsRu(c.wall_s), "от первого до последнего ответа")}${tile(`+${c.lines_added} −${c.lines_removed}`, "строк кода")}${c.cache_hit != null ? tile(`${Math.round(c.cache_hit * 100)} %`, "ввода из кэша") : ""}${c.subagents ? tile(c.subagents, pluralRu(c.subagents, "субагент", "субагента", "субагентов")) : ""}</div>
-      ${modelTable(c.models)}</section>`);
-  }
-  if (p) {
-    const w = (x, label) => tile(usd(x.cost), `${label} · ${x.turns} ${pluralRu(x.turns, "ход", "хода", "ходов")} · ${tokRu(x.output)} ток.`);
-    out.push(`<section class="st-sec"><h3>Все чаты</h3>
-      <div class="st-tiles">${w(p.today, "сегодня")}${w(p.week, "7 дней")}${w(p.month, "30 дней")}</div>
-      ${usageChart(p.days, { val: (x) => x.cost, fmt: usd, unit: " по API", label: "Стоимость по ценам API по дням за 30 дней" })}
-      <div class="u-cols st-cols"><div><div class="hub-label">Модели за 30 дней</div>${modelTable(p.models)}</div>
-      <div><div class="hub-label">Дороже всего за неделю</div>${p.chats.length ? `<ul class="u-chats">${p.chats.map((x) => `<li><span>${esc(x.name)}</span><span class="u-num">${usd(x.cost)}</span><span class="u-share"><i style="width:${Math.max(3, (x.cost / (p.chats[0].cost || 1)) * 100)}%"></i></span></li>`).join("")}${p.chats_rest ? `<li><span class="muted">Остальное (SSH, фоновые задачи)</span><span class="u-num">${usd(p.chats_rest)}</span></li>` : ""}</ul>` : '<div class="muted">За неделю чаты не работали</div>'}</div></div></section>`);
-  }
-  const since = p?.all?.days ? new Date(Date.now() - (p.all.days - 1) * 86400000).toLocaleDateString("ru-RU", { day: "numeric", month: "long" }) : "";
-  if (p?.heatmap) out.push(`<section class="st-sec"><div class="st-head"><h3>Активность</h3>${since ? `<span class="muted st-since">журналы с ${since}</span>` : ""}<div class="seg" role="tablist">${ACT_WINDOWS.map(([k, label]) => `<button type="button" data-win="${k}"${k === state.actWin ? ' class="on"' : ""}>${label}</button>`).join("")}</div></div>
-    <div class="st-scroll">${heatmapSvg(p.heatmap)}</div>
-    <div class="hm-legend">Меньше <i class="hm-key l0"></i><i class="hm-key l1"></i><i class="hm-key l2"></i><i class="hm-key l3"></i><i class="hm-key l4"></i> Больше</div>
-    <div class="act-stats"></div></section>`);
-  out.push('<p class="st-note">«По ценам API» — сколько стоила бы та же работа без подписки, по тарифам Anthropic. По подписке платишь фиксированно; расход подписки — в лимитах выше. Приватные чаты не считаются.</p>');
-  return `<div class="stats">${out.join("")}</div>`;
+// Each block of the sheet has its own HTML; they arrive independently.
+function limitsSecHtml(u) {
+  return `<div class="st-head"><h3>Лимиты подписки${u?.plan ? ` · ${esc(u.plan)}` : ""}</h3><button type="button" class="btn small" data-act="refresh">Обновить</button></div>
+    ${u ? `<div class="lim-grid">${limitsHtml(u)}</div>${creditsHtml(u.credits)}` : '<div class="muted">Лимиты сейчас недоступны — Claude Code ещё ни разу их не запрашивал.</div>'}`;
 }
+function chatSecHtml(c) {
+  const s = currentSession();
+  return `<h3>Этот чат${s ? ` · ${esc(s.name)}` : ""}</h3>
+    <div class="st-big">${usd(c.cost)}<span>по ценам API</span></div>
+    <div class="st-tiles">${tile(c.turns, pluralRu(c.turns, "ход", "хода", "ходов"))}${tile(secsRu(c.busy_s), "в работе")}${tile(spanRu(c.wall_s), "от первого до последнего ответа")}${tile(`+${c.lines_added} −${c.lines_removed}`, "строк кода")}${c.cache_hit != null ? tile(`${Math.round(c.cache_hit * 100)} %`, "ввода из кэша") : ""}${c.subagents ? tile(c.subagents, pluralRu(c.subagents, "субагент", "субагента", "субагентов")) : ""}</div>
+    ${modelTable(c.models)}`;
+}
+function allSecHtml(p) {
+  const w = (x, label) => tile(usd(x.cost), `${label} · ${x.turns} ${pluralRu(x.turns, "ход", "хода", "ходов")} · ${tokRu(x.output)} ток.`);
+  return `<h3>Все чаты</h3>
+    <div class="st-tiles">${w(p.today, "сегодня")}${w(p.week, "7 дней")}${w(p.month, "30 дней")}</div>
+    ${usageChart(p.days, { val: (x) => x.cost, fmt: usd, unit: " по API", label: "Стоимость по ценам API по дням за 30 дней" })}
+    <div class="u-cols st-cols"><div><div class="hub-label">Модели за 30 дней</div>${modelTable(p.models)}</div>
+    <div><div class="hub-label">Дороже всего за неделю</div>${p.chats.length ? `<ul class="u-chats">${p.chats.map((x) => `<li><span>${esc(x.name)}</span><span class="u-num">${usd(x.cost)}</span><span class="u-share"><i style="width:${Math.max(3, (x.cost / (p.chats[0].cost || 1)) * 100)}%"></i></span></li>`).join("")}${p.chats_rest ? `<li><span class="muted">Остальное (SSH, фоновые задачи)</span><span class="u-num">${usd(p.chats_rest)}</span></li>` : ""}</ul>` : '<div class="muted">За неделю чаты не работали</div>'}</div></div>`;
+}
+function actSecHtml(p) {
+  const since = new Date(`${p.all.since}T12:00:00`);
+  const age = Math.round((Date.now() - since.getTime()) / 86400000);
+  const dm = since.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+  const sub = p.born ? `родилась ${dm} — ${daysRu(age)} назад` : `журналы с ${dm}`;
+  const wins = ACT_WINDOWS.map(([k, label]) => [k, k === "all" && p.born ? "С рождения" : label]);
+  return `<div class="st-head"><h3>Активность</h3><span class="muted st-since">${sub}</span><div class="seg" role="tablist">${wins.map(([k, label]) => `<button type="button" data-win="${k}"${k === state.actWin ? ' class="on"' : ""}>${label}</button>`).join("")}</div></div>
+    <div class="st-scroll">${heatmapSvg(p.heatmap, true)}</div>
+    <div class="hm-legend">Меньше <i class="hm-key l0"></i><i class="hm-key l1"></i><i class="hm-key l2"></i><i class="hm-key l3"></i><i class="hm-key l4"></i> Больше</div>
+    <div class="act-stats"></div>`;
+}
+
+// Skeletons in the shape of what comes: bars, tiles, a chart, the heatmap.
+const sk = (cls, style = "") => `<div class="sk ${cls}"${style ? ` style="${style}"` : ""}></div>`;
+function skLimits() {
+  const col = `<div>${sk("sk-line", "width:65%")}${sk("sk-bar")}${sk("sk-line", "width:45%")}</div>`;
+  return `${sk("sk-title")}<div class="lim-grid">${col.repeat(3)}</div>`;
+}
+function skChat() {
+  return `${sk("sk-title")}${sk("sk-big")}<div class="st-tiles">${sk("sk-tile").repeat(5)}</div>${sk("sk-line").repeat(2)}`;
+}
+function skAll() {
+  return `${sk("sk-title", "width:22%")}<div class="st-tiles">${sk("sk-tile").repeat(3)}</div>${sk("sk-chart")}`;
+}
+function skAct() {
+  const weeks = 34, step = 13;
+  let cells = "";
+  for (let w = 0; w < weeks; w += 1) for (let d = 0; d < 7; d += 1) cells += `<rect x="${24 + w * step}" y="${16 + d * step}" width="11" height="11" rx="2.5" style="--w:${w}"/>`;
+  return `<div class="st-head">${sk("sk-title", "width:30%;margin:0")}</div>
+    <div class="st-scroll"><svg class="heatmap sk-hm" viewBox="0 0 ${24 + weeks * step} ${16 + 7 * step}" style="max-width:${(24 + weeks * step) * 1.6}px">${cells}</svg></div>
+    <p class="sk-say muted"></p>${sk("sk-line").repeat(4)}`;
+}
+// What the slow block is busy with, while it is busy.
+const SK_SAY = ["Листаю журналы…", "Считаю токены…", "Складываю дни в недели…", "Ищу самую длинную серию…", "Вспоминаю, с чего всё начиналось…"];
+
 // «Активность»: Claude Code's /stats overview — a year of days, and the
 // favourite model, streaks, the busiest day for the chosen window.
 const ACT_WINDOWS = [["all", "Всё время"], ["month", "30 дней"], ["week", "7 дней"]];
 const MONTH_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
-function heatmapSvg(days) {
+function heatmapSvg(days, reveal = false) {
   const cell = 11, step = 13, left = 24, top = 16;
   const weeks = Math.ceil(days.length / 7);
   const W = left + weeks * step, H = top + 7 * step;
@@ -2885,9 +2919,9 @@ function heatmapSvg(days) {
     }
     const when = `${WEEKDAY[dt.getDay()]} ${dt.toLocaleDateString("ru-RU", { day: "numeric", month: "short" })}`;
     const tip = d.out ? `${when} · ${tokRu(d.out)} токенов · ${usd(d.cost)} · ${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}` : `${when} · без работы`;
-    svg += `<rect class="hm l${level(d.out)}" x="${left + w * step}" y="${top + wd * step}" width="${cell}" height="${cell}" rx="2.5" data-tip="${esc(tip)}"/>`;
+    svg += `<rect class="hm l${level(d.out)}" x="${left + w * step}" y="${top + wd * step}" width="${cell}" height="${cell}" rx="2.5" style="--w:${w}" data-tip="${esc(tip)}"/>`;
   });
-  return `<svg class="heatmap" viewBox="0 0 ${W} ${H}" style="max-width:${W * 1.6}px" role="img" aria-label="Активность по дням">${svg}</svg>`;
+  return `<svg class="heatmap${reveal ? " reveal" : ""}" viewBox="0 0 ${W} ${H}" style="max-width:${W * 1.6}px" role="img" aria-label="Активность по дням">${svg}</svg>`;
 }
 function daysRu(n) { return `${n} ${pluralRu(n, "день", "дня", "дней")}`; }
 // Long spans read in days, like Claude Code's "67d 18h 15m".
@@ -2907,7 +2941,8 @@ function actStatsHtml(x) {
     <div><span>Самый активный день</span><b>${busiest}</b></div>
     <div><span>Текущая серия</span><b>${daysRu(x.current_streak)}</b></div>
   </div>
-  <p class="st-line muted">Ввод ${tokRu(x.input)} · вывод ${tokRu(x.output)} · кэш: чтение ${tokRu(x.cache_read)}, запись ${tokRu(x.cache_write)} · ≈ ${usd(x.cost)} по ценам API${flights >= 2 ? ` · самая длинная сессия — как ${Math.round(flights)} ${pluralRu(Math.round(flights), "перелёт", "перелёта", "перелётов")} Москва — Владивосток` : ""}</p>`;
+  <p class="st-line muted">Ввод ${tokRu(x.input)} · вывод ${tokRu(x.output)} · кэш: чтение ${tokRu(x.cache_read)}, запись ${tokRu(x.cache_write)} · ≈ ${usd(x.cost)} по ценам API${flights >= 2 ? ` · самая длинная сессия — как ${Math.round(flights)} ${pluralRu(Math.round(flights), "перелёт", "перелёта", "перелётов")} Москва — Владивосток` : ""}</p>
+  <details class="u-table act-models"><summary>Модели за этот период</summary>${modelTable(x.models)}</details>`;
 }
 function renderActStats(p) {
   const box = $("sheet-body").querySelector(".act-stats");
@@ -2921,24 +2956,52 @@ async function openStats() {
   $("sheet-frame").hidden = true;
   const body = $("sheet-body");
   body.hidden = false;
-  body.innerHTML = '<div class="stats"><p class="muted">Считаю…</p></div>';
-  openSheet("Статистика");
   const tid = state.current;
-  let data;
-  try { data = await api(`/api/stats${tid != null ? `?tid=${tid}` : ""}`); } catch (e) { body.innerHTML = `<div class="stats"><p class="muted">${esc(e.message)}</p></div>`; return; }
-  if ($("sheet").hidden || $("sheet-title").textContent !== "Статистика") return;
-  body.innerHTML = statsHtml(data);
-  if (data.period) {
-    renderActStats(data.period);
-    body.querySelectorAll(".seg [data-win]").forEach((b) => { b.onclick = () => { state.actWin = b.dataset.win; renderActStats(data.period); }; });
-    const hm = body.querySelector(".heatmap")?.parentElement;
-    if (hm) hm.scrollLeft = hm.scrollWidth; // today is on the right
+  const run = (state.statsRun || 0) + 1;
+  state.statsRun = run;
+  body.innerHTML = `<div class="stats">
+    <section class="st-sec" data-part="limits">${skLimits()}</section>
+    ${tid != null ? `<section class="st-sec" data-part="chat">${skChat()}</section>` : ""}
+    <section class="st-sec" data-part="all">${skAll()}</section>
+    <section class="st-sec" data-part="act">${skAct()}</section>
+    <p class="st-note">«По ценам API» — сколько стоила бы та же работа без подписки, по тарифам Anthropic. По подписке платишь фиксированно; расход подписки — в лимитах выше. Приватные чаты не считаются.</p></div>`;
+  openSheet("Статистика");
+  const live = () => state.statsRun === run && !$("sheet").hidden;
+  const sec = (name) => body.querySelector(`[data-part="${name}"]`);
+  const fill = (name, html) => { const el = sec(name); if (el) { el.innerHTML = html; el.classList.add("st-in"); } };
+  let say = 0;
+  const ticker = setInterval(() => {
+    const line = body.querySelector(".sk-say");
+    if (!line || !live()) { clearInterval(ticker); return; }
+    line.textContent = SK_SAY[say % SK_SAY.length];
+    say += 1;
+  }, 1300);
+  body.querySelector(".sk-say").textContent = SK_SAY[say++];
+  const get = async (part) => (await api(`/api/stats/${part}${tid != null ? `?tid=${tid}` : ""}`))[part];
+  get("limits").then((u) => {
+    if (!live()) return;
+    fill("limits", limitsSecHtml(u));
+    sec("limits").querySelector('[data-act="refresh"]').onclick = async (ev) => {
+      ev.currentTarget.disabled = true;
+      const fresh = await fetchLimits(true);
+      if (live()) fill("limits", limitsSecHtml(fresh));
+      sec("limits").querySelector('[data-act="refresh"]').onclick = null;
+    };
+  }).catch((e) => live() && fill("limits", `<p class="muted">${esc(e.message)}</p>`));
+  if (tid != null) {
+    get("chat").then((c) => { if (live()) { if (c) fill("chat", chatSecHtml(c)); else sec("chat")?.remove(); } })
+      .catch(() => live() && sec("chat")?.remove());
   }
-  body.querySelector('[data-act="refresh"]').onclick = async (ev) => {
-    ev.currentTarget.disabled = true;
-    await fetchLimits(true);
-    openStats();
-  };
+  get("period").then((p) => {
+    clearInterval(ticker);
+    if (!live() || !p) return;
+    fill("all", allSecHtml(p));
+    fill("act", actSecHtml(p));
+    renderActStats(p);
+    sec("act").querySelectorAll(".seg [data-win]").forEach((btn) => { btn.onclick = () => { state.actWin = btn.dataset.win; renderActStats(p); }; });
+    const box = sec("act").querySelector(".heatmap")?.parentElement;
+    if (box) box.scrollLeft = box.scrollWidth; // today is on the right
+  }).catch((e) => { clearInterval(ticker); if (live()) fill("act", `<p class="muted">${esc(e.message)}</p>`); });
 }
 async function showUsage() { openStats(); }
 function renderLimits(u) {
