@@ -167,6 +167,51 @@ def _load_topic_names() -> None:
 _load_topic_names()
 
 
+# CCGRAM-HOTFIX:topic-state-persist — the state each topic's title was last
+# painted with survives a restart (<ccgram dir>/topic_states.json). An
+# inherited topic whose title already shows the state it is in is left
+# alone, instead of every topic being renamed on startup (each rename is a
+# service message in the chat: the restart "repaint flood").
+
+
+def _topic_states_path() -> str:
+    from ...utils import ccgram_dir
+
+    return str(ccgram_dir() / "topic_states.json")
+
+
+def _persist_topic_states() -> None:
+    """Atomically write the applied state tokens to disk."""
+    try:
+        data = {f"{c}:{t}": list(tok) for (c, t), tok in _topic_states.items()}
+        path = _topic_states_path()
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.debug("Could not persist topic states: %s", e)
+
+
+def _load_topic_states() -> None:
+    """Seed the applied state tokens from disk on startup."""
+    try:
+        with open(_topic_states_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except OSError, ValueError:
+        return
+    for k, v in data.items():
+        c, _, t = k.partition(":")
+        try:
+            state, mode, rc = v
+            _topic_states[(int(c), int(t))] = (str(state), str(mode), bool(rc))
+        except TypeError, ValueError:
+            continue
+
+
+_load_topic_states()
+
+
 def get_stored_topic_name(chat_id: int, thread_id: int) -> str | None:
     """CCGRAM-HOTFIX:sticky-bind-name — return the sticky clean base name for a
     topic, or None if never seen.
@@ -335,6 +380,7 @@ async def _edit_topic_name(
         )
         if state_token is not None:
             _topic_states[key] = state_token
+            _persist_topic_states()
         logger.debug(
             "Updated topic emoji: chat=%d thread=%d state=%s name='%s'",
             chat_id,
@@ -367,6 +413,7 @@ async def _edit_topic_name(
         ):
             if state_token is not None:
                 _topic_states[key] = state_token
+                _persist_topic_states()
         else:
             logger.debug("Failed to update topic emoji: %s", e)
     except TelegramError:
@@ -571,14 +618,16 @@ def update_stored_topic_name(chat_id: int, thread_id: int, new_clean_name: str) 
     """
     _topic_names[(chat_id, thread_id)] = new_clean_name
     _persist_topic_names()
-    _topic_states.pop((chat_id, thread_id), None)
+    if _topic_states.pop((chat_id, thread_id), None) is not None:
+        _persist_topic_states()
 
 
 @topic_state.register("chat")
 def clear_topic_emoji_state(chat_id: int, thread_id: int) -> None:
     """Clear emoji tracking for a topic (called on topic cleanup)."""
     key = (chat_id, thread_id)
-    _topic_states.pop(key, None)
+    if _topic_states.pop(key, None) is not None:
+        _persist_topic_states()  # CCGRAM-HOTFIX:topic-state-persist
     _pending_transitions.pop(key, None)
     if _topic_names.pop(key, None) is not None:
         _persist_topic_names()  # CCGRAM-HOTFIX:sticky-topic-name
@@ -586,7 +635,13 @@ def clear_topic_emoji_state(chat_id: int, thread_id: int) -> None:
 
 
 def mark_awaiting_first_paint(chat_id: int, thread_id: int) -> None:
-    """Let an inherited topic apply its next observed state without debounce."""
+    """Let an inherited topic apply its next observed state without debounce.
+
+    CCGRAM-HOTFIX:topic-state-persist — not one whose painted state is known
+    from before the restart: its title is right until the state really
+    changes, and then the usual debounce applies."""
+    if (chat_id, thread_id) in _topic_states:
+        return
     _awaiting_first_paint.add((chat_id, thread_id))
 
 

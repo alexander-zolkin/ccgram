@@ -863,3 +863,54 @@ class TestFirstPaintPacing:
 
         assert -100 not in _disabled_chats
         assert _last_chat_edit[-100] == (0.0, (-100, 1))
+
+
+class TestTopicStatePersists:
+    """CCGRAM-HOTFIX:topic-state-persist — a restart must not repaint a topic
+    whose title already shows the state it is in."""
+
+    async def _restart(self) -> None:
+        from ccgram.handlers.status import topic_emoji
+
+        topic_emoji._topic_states.clear()
+        topic_emoji._pending_transitions.clear()
+        topic_emoji._awaiting_first_paint.clear()
+        topic_emoji._load_topic_states()
+
+    async def test_painted_state_survives_and_is_not_repainted(self) -> None:
+        bot = AsyncMock()
+        await _debounced_update(bot, -100, 42, "idle", "myproject")
+        bot.edit_forum_topic.assert_called_once()
+        bot.edit_forum_topic.reset_mock()
+
+        await self._restart()
+        mark_awaiting_first_paint(-100, 42)  # what bootstrap does for bound windows
+        with patch(_PATCH_MONOTONIC, return_value=0.0):
+            await update_topic_emoji(bot, -100, 42, "idle", "myproject")
+        bot.edit_forum_topic.assert_not_called()
+
+    async def test_a_changed_state_after_restart_debounces_then_paints(self) -> None:
+        bot = AsyncMock()
+        await _debounced_update(bot, -100, 42, "active", "myproject")
+        bot.edit_forum_topic.reset_mock()
+
+        await self._restart()
+        mark_awaiting_first_paint(-100, 42)
+        with patch(_PATCH_MONOTONIC, return_value=0.0):
+            await update_topic_emoji(bot, -100, 42, "idle", "myproject")
+        bot.edit_forum_topic.assert_not_called()  # no instant first paint
+        await _debounced_update(bot, -100, 42, "idle", "myproject")
+        bot.edit_forum_topic.assert_called_once_with(
+            chat_id=-100, message_thread_id=42, name=f"{EMOJI_IDLE} myproject"
+        )
+
+    async def test_cleared_topic_is_forgotten_on_disk(self) -> None:
+        bot = AsyncMock()
+        await _debounced_update(bot, -100, 42, "idle", "myproject")
+        bot.edit_forum_topic.reset_mock()
+        clear_topic_emoji_state(-100, 42)
+        await self._restart()
+        mark_awaiting_first_paint(-100, 42)
+        with patch(_PATCH_MONOTONIC, return_value=0.0):
+            await update_topic_emoji(bot, -100, 42, "idle", "myproject")
+        bot.edit_forum_topic.assert_called_once()  # unknown again: first paint
