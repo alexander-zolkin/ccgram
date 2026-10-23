@@ -1099,7 +1099,9 @@ function soundMenu(s) {
 }
 
 function effortMenu(s) {
+  const info = $("chat-meta").hidden ? "" : $("chat-meta").dataset.info;
   return [
+    ...(info ? [{ heading: info }, "sep"] : []),
     { heading: "Усилие этой сессии" },
     ...EFFORTS.filter(([id]) => id).map(([id, label, sub]) => ({
       label, sub, action: async () => {
@@ -1174,11 +1176,16 @@ const kTokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n 
 function renderMeta(meta) {
   const box = $("chat-meta");
   if (!meta || !meta.context) { box.hidden = true; return; }
-  const cap = meta.context > 200000 || /1m/i.test(meta.model) ? 1000000 : 200000;
+  // The transcript names the model without «[1m]»; ccgram launches every
+  // Claude but Haiku on the 1M window (model_catalog.with_1m_context).
+  const oneM = meta.context > 200000 || /1m/i.test(meta.model) || (/^claude-/.test(meta.model) && !/haiku/i.test(meta.model));
+  const cap = oneM ? 1000000 : 200000;
   const pct = Math.min(100, Math.round((meta.context / cap) * 100));
   box.hidden = false;
   box.title = `${meta.model} · контекст ${meta.context.toLocaleString("ru-RU")} из ${kTokens(cap)} токенов`;
-  box.innerHTML = `<span class="m-name">${esc(prettyModel(meta.model))}</span><span class="ctx${pct >= 80 ? " hot" : ""}"><span class="ctx-bar"><i style="width:${pct}%"></i></span>${kTokens(meta.context)}</span>`;
+  // Phones show only the ring; the tap menu heads with this line.
+  box.dataset.info = `${prettyModel(meta.model)} · контекст ${kTokens(meta.context)} из ${kTokens(cap)} (${pct}%)`;
+  box.innerHTML = `<span class="m-name">${esc(prettyModel(meta.model))}</span><span class="ctx${pct >= 80 ? " hot" : ""}"><span class="ctx-bar"><i style="width:${pct}%"></i></span><span class="ctx-ring" style="--p:${pct}"></span><span class="ctx-n">${kTokens(meta.context)}</span></span>`;
 }
 
 async function pollPane() {
@@ -2312,7 +2319,9 @@ function applyMode(tid, r) {
   const m = MODE_RU[key];
   b.hidden = !m;
   if (!m) return;
-  b.innerHTML = `<span>${esc(m[0])}</span>${CHEV}`;
+  // Phones show only the icon; the label and description live in the menu.
+  b.innerHTML = `<span class="mode-ico">${MODE_ICON[key]}</span><span class="mode-lbl">${esc(m[0])}</span>${CHEV}`;
+  b.setAttribute("aria-label", `Режим: ${m[0]}`);
   b.dataset.mode = key;
   b.dataset.tip = `Режим Claude Code: ${m[1]}. Нажми, чтобы выбрать`;
 }

@@ -346,6 +346,8 @@ input:focus { border-color: var(--accent); }
 .ctx-bar { width: 34px; height: 4px; border-radius: 2px; background: var(--border-strong); overflow: hidden; }
 .ctx-bar i { display: block; height: 100%; background: var(--muted); border-radius: 2px; transition: width .4s; }
 .ctx.hot .ctx-bar i { background: var(--busy); }
+.ctx-ring { display: none; width: 16px; height: 16px; border-radius: 50%; background: conic-gradient(var(--muted) calc(var(--p) * 1%), var(--border-strong) 0); -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px)); mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px)); }
+.ctx.hot .ctx-ring { background: conic-gradient(var(--busy) calc(var(--p) * 1%), var(--border-strong) 0); }
 .search-hits .hit { display: grid; gap: 1px; padding: 6px 10px; border-radius: 8px; text-decoration: none; color: var(--text); font-size: 13px; }
 .search-hits .hit:hover { background: var(--hover); }
 .hit-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -435,11 +437,11 @@ input:focus { border-color: var(--accent); }
   .title-btn { max-width: 52vw; }
   .chat-state span:last-child { display: none; }
   .chat-meta .m-name { display: none; }
-  .chat-meta .ctx-bar { display: none; }
+  .chat-meta .ctx-bar, .chat-meta .ctx-n { display: none; }
+  .chat-meta .ctx-ring { display: inline-block; }
   .composer-bar #tg-toggle-text, #effort-btn .lbl-long, #effort-btn > svg:last-child { display: none; }
   .composer-bar { gap: 4px; }
   #cwd-name, #mic-time:empty { display: none; }
-  .mode-chip { padding: 3px 7px; font-size: 11.5px; }
   #effort-btn { flex: none; overflow: visible; padding-left: 4px; padding-right: 4px; }
   #model-btn { flex: 0 1 auto; }
   .chat-meta { padding: 4px; margin: 0; }
@@ -472,8 +474,17 @@ input:focus { border-color: var(--accent); }
 .mode-chip:hover { color: var(--text); border-color: var(--accent); }
 .mode-chip { display: inline-flex; align-items: center; gap: 3px; }
 .mode-chip .chev { width: 12px; height: 12px; opacity: .7; transition: transform .15s; }
+.mode-chip .mode-ico { display: none; }
+.mode-ico svg { width: 16px; height: 16px; }
 .mode-chip.menu-open .chev { transform: rotate(180deg); }
 .mode-chip.busy { opacity: .55; cursor: progress; }
+/* Phones: the chip is just the mode's icon, the menu says the rest. Kept
+   below the base rules so it wins (same specificity). */
+@media (max-width: 820px) {
+  .mode-chip { width: 30px; height: 30px; padding: 0; justify-content: center; flex: none; margin: 0 2px; }
+  .mode-chip .mode-lbl, .mode-chip .chev { display: none; }
+  .mode-chip .mode-ico { display: inline-grid; }
+}
 
 /* mode picker: a tile per mode, the current one ticked */
 .menu.mode-menu { width: 300px; padding: 6px; }
