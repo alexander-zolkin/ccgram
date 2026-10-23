@@ -1335,7 +1335,11 @@ async function loadOlder() {
 // ═══ routing: home screen vs a session ══════════════════════════════════════
 // Sessions on other machines have ids "<device>:<session uuid>" (devices.py).
 const REMOTE_ID = /^[a-z0-9_-]{1,24}:[0-9a-f-]{36}$/;
-const isRemote = (s) => Boolean(s && s.remote);
+// isRemote: a session of another machine seen by the OLD web inside ccgram,
+// which can only read and type there. In Kara Hub every session lives on a
+// device and gets everything; only the device badge marks non-home ones.
+const isRemote = (s) => Boolean(s && s.remote && !state.karaHub);
+const showDevice = (s) => Boolean(s && s.device && (state.karaHub ? s.device !== state.homeDevice : s.remote));
 
 function route() {
   $("cmd-palette").hidden = true;
@@ -1532,10 +1536,11 @@ state.kind = store.get("kara-kind") || "all";
 // Device filters come from the sessions themselves: «N100» = this server.
 function kindsWithDevices() {
   const devs = new Map();
-  for (const s of state.sessions) if (isRemote(s)) devs.set(s.device, s.device_name);
+  for (const s of state.sessions) if (s.remote) devs.set(s.device, s.device_name);
   if (!devs.size) return SESSION_KINDS;
-  return [...SESSION_KINDS, ["dev:local", "N100", "Этот сервер", (s) => !isRemote(s)],
-    ...[...devs].map(([id, name]) => [`dev:${id}`, name, "Сессии этого устройства", (s) => s.device === id])];
+  const home = (s) => !s.remote || s.device === state.homeDevice;
+  return [...SESSION_KINDS, ["dev:local", "N100", "Этот сервер", home],
+    ...[...devs].filter(([id]) => id !== state.homeDevice).map(([id, name]) => [`dev:${id}`, name, "Сессии этого устройства", (s) => s.device === id])];
 }
 $("kind-btn").onclick = () => {
   const b = $("kind-btn");
@@ -1625,9 +1630,9 @@ function sessionItem(s) {
   const flag = s.topic_deleted
     ? `<span class="s-flag gone" data-tip="${esc(TIP.gone)}">${SVG.tgGone}</span>`
     : s.web_only ? `<span class="s-flag" data-tip="${esc(TIP.web)}">${SVG.globe}</span>` : "";
-  const dev = isRemote(s) ? `<span class="s-dev${s.online ? "" : " off"}" data-tip="${esc(`${s.device_name}: ${s.online ? (s.writable ? "в сети" : "в сети, только чтение — сессия не в tmux") : "не в сети, только чтение"}`)}">${esc(s.device_name)}</span>` : "";
-  item.classList.toggle("offline", isRemote(s) && !s.online);
-  item.innerHTML = `<span class="dot ${esc(s.state)}" title="${esc(STATE_LABEL[s.state] || "")}"></span><span class="s-name">${esc(s.name)}</span>${dev}${isRemote(s) ? "" : flag}`;
+  const dev = showDevice(s) ? `<span class="s-dev${s.online ? "" : " off"}" data-tip="${esc(`${s.device_name}: ${s.online ? (s.writable ? "в сети" : "в сети, только чтение — сессия не в tmux") : "не в сети, только чтение"}`)}">${esc(s.device_name)}</span>` : "";
+  item.classList.toggle("offline", Boolean(s.remote) && !s.online);
+  item.innerHTML = `<span class="dot ${esc(s.state)}" title="${esc(STATE_LABEL[s.state] || "")}"></span><span class="s-name">${esc(s.name)}</span>${dev}${s.remote ? "" : flag}`;
   const more = el("button", "s-more", SVG.more);
   more.type = "button";
   more.title = "Действия";
@@ -1638,7 +1643,8 @@ function sessionItem(s) {
 }
 
 function sessionMenu(s, item) {
-  if (isRemote(s)) {
+  // Kara Hub: Telegram actions arrive with the ccgram adapter (HUB-PLAN step 3).
+  if (s.remote) {
     return [
       { heading: `${s.device_name} · ${s.online ? "в сети" : "не в сети"}` },
       { label: "Копировать путь", sub: s.cwd, icon: SVG.folder, action: () => copyText(s.cwd) },
@@ -1744,9 +1750,9 @@ function renderHeader() {
   if (!s) return;
   $("title-btn").hidden = false;
   if (!$("chat-name").querySelector("input")) $("chat-name").textContent = s.name;
-  $("chat-badge").hidden = !s.web_only || isRemote(s);
-  $("dev-badge").hidden = !isRemote(s);
-  if (isRemote(s)) {
+  $("chat-badge").hidden = !s.web_only || Boolean(s.remote);
+  $("dev-badge").hidden = !showDevice(s);
+  if (showDevice(s)) {
     $("dev-badge").textContent = s.device_name;
     $("dev-badge").classList.toggle("off", !s.online);
   }
@@ -1764,7 +1770,7 @@ function renderHeader() {
   syncSendBtn();
   renderSoundBtn(s);
   $("gone-card").hidden = !s.topic_deleted;
-  $("disclaimer").textContent = isRemote(s) ? `Сессия работает на устройстве «${s.device_name}» — ответы идут и туда.` : s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
+  $("disclaimer").textContent = showDevice(s) ? `Сессия работает на устройстве «${s.device_name}» — ответы идут и туда.` : s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
   setTitle(`${working ? "⏳ " : ""}${s.name} — Кара`);
   syncLiveRow();
   refreshMsgStatus();
@@ -1779,12 +1785,12 @@ function setTitle(base) {
 // A session on another machine takes messages only while that machine is up
 // and the session runs inside tmux (the kara-node wrapper).
 function syncRemoteComposer(s) {
-  const ro = isRemote(s) && (!s.online || !s.writable);
-  const why = !isRemote(s) ? "" : !s.online ? `«${s.device_name}» не в сети — только чтение` : !s.writable ? "Сессия запущена не через обёртку (не в tmux) — только чтение" : "";
+  const ro = Boolean(s && s.remote) && (!s.online || !s.writable);
+  const why = !ro ? "" : !s.online ? `«${s.device_name}» не в сети — только чтение` : "Сессия запущена не через обёртку (не в tmux) — только чтение";
   $("composer").classList.toggle("readonly", ro);
   $("input").disabled = ro;
   if (ro) $("input").placeholder = why;
-  else if (state.current != null) $("input").placeholder = isRemote(s) ? `Ответить (${s.device_name})…` : "Ответить Каре…";
+  else if (state.current != null) $("input").placeholder = showDevice(s) ? `Ответить (${s.device_name})…` : "Ответить Каре…";
   document.querySelector(".composer-bar label.tool-btn")?.classList.toggle("gone", isRemote(s));
 }
 
@@ -2059,7 +2065,7 @@ async function pollPane() {
   const tid = state.current;
   const s = currentSession();
   if (tid == null || !s) return;
-  if (isRemote(s) && !s.online) { state.paneTimer = setTimeout(pollPane, 10000); return; }
+  if (s && s.remote && !s.online) { state.paneTimer = setTimeout(pollPane, 10000); return; }
   if (!document.hidden && s.state !== "dead") {
     try {
       const wantTerm = !$("pane").hidden;
@@ -2084,7 +2090,7 @@ async function pollPane() {
         // then follows the transcript from here; with the feed up, a check
         // every 15 s catches anything an event missed.
         const feedUp = state.es && state.es.readyState === EventSource.OPEN;
-        if (state.structured && (!feedUp || isRemote(s) || Date.now() - (state.fetchAt || 0) > 15000)) fetchNew();
+        if (state.structured && (!feedUp || Boolean(s.remote) || Date.now() - (state.fetchAt || 0) > 15000)) fetchNew();
         const inter = data.interactive;
         $("prompt-card").hidden = !inter;
         if (inter) renderPrompt(inter, data.text);
@@ -2925,6 +2931,7 @@ async function boot(me) {
   if (me && "hub" in me) store.set("kara-hub", me.hub ? "1" : "0");
   if (me && "tts" in me) state.tts = me.tts;
   state.karaHub = Boolean(me && me.kara_hub);
+  state.homeDevice = (me && me.home_device) || null;
   $("login").hidden = true;
   $("app").hidden = false;
   if (store.get("kara-collapsed") === "1" && !isMobile()) $("app").classList.add("collapsed");
