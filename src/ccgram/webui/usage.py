@@ -128,10 +128,54 @@ def _plan() -> str:
     return sub.capitalize()
 
 
+def _money(value: Any) -> float | None:
+    """``{amount_minor, exponent}`` → units; plain numbers pass through."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict) and isinstance(value.get("amount_minor"), (int, float)):
+        return value["amount_minor"] / 10 ** int(value.get("exponent") or 0)
+    return None
+
+
+def _disabled_reason() -> str:
+    """Why extra usage is off, as Claude Code last heard it."""
+    try:
+        data = json.loads(Path(os.path.expanduser("~/.claude.json")).read_text())
+    except OSError, ValueError:
+        return ""
+    reason = (
+        data.get("cachedExtraUsageDisabledReason") if isinstance(data, dict) else ""
+    )
+    return str(reason or "")
+
+
+def _credits(raw: dict[str, Any]) -> dict[str, Any]:
+    """Usage credits ("extra usage"): what kicks in past the plan limits."""
+    extra = raw.get("extra_usage") if isinstance(raw.get("extra_usage"), dict) else {}
+    spend = raw.get("spend") if isinstance(raw.get("spend"), dict) else {}
+    used = spend.get("used") if isinstance(spend.get("used"), dict) else {}
+    enabled = bool(extra.get("is_enabled") or spend.get("enabled"))
+    reason = extra.get("disabled_reason") or spend.get("disabled_reason")
+    if not enabled and not reason:
+        reason = "user_disabled" if extra.get("user_disabled") else _disabled_reason()
+    return {
+        "enabled": enabled,
+        "reason": str(reason or ""),
+        "used": _money(spend.get("used"))
+        if spend
+        else _money(extra.get("used_credits")),
+        "limit": _money(spend.get("limit")) or _money(extra.get("monthly_limit")),
+        "balance": _money(spend.get("balance")),
+        "currency": str(used.get("currency") or extra.get("currency") or "USD"),
+        "percent": spend.get("percent"),
+        "limit_reached": bool(extra.get("spend_limit_reached")),
+        "can_buy": bool(spend.get("can_purchase_credits")),
+    }
+
+
 def _shape(raw: dict[str, Any], as_of: float, live: bool) -> dict[str, Any]:
     breakdown = raw.get("seven_day_breakdown") or {}
     rows = breakdown.get("rows") if isinstance(breakdown, dict) else None
-    extra = raw.get("extra_usage") or {}
     return {
         "live": live,
         "as_of": as_of,
@@ -145,7 +189,7 @@ def _shape(raw: dict[str, Any], as_of: float, live: bool) -> dict[str, Any]:
             for r in rows or []
             if isinstance(r, dict) and isinstance(r.get("percent"), (int, float))
         ],
-        "extra_enabled": bool(isinstance(extra, dict) and extra.get("is_enabled")),
+        "credits": _credits(raw),
     }
 
 

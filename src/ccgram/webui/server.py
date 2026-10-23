@@ -37,6 +37,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``POST /api/uploads``                   file for a session not created yet
 - ``GET  /api/models``                    Claude models for the picker
 - ``GET  /api/usage?refresh=1``          plan limits, what /usage shows in Claude Code
+- ``GET  /api/stats?tid=``                limits + credits, this chat's cost, 30 days
 - ``GET  /api/events``                    SSE: messages + session-list changes
 - ``GET  /api/auth/methods``              which logins are open (no session needed)
 - ``POST /api/auth/passkey/login/options``, ``/api/auth/passkey/login``  passkey login
@@ -70,7 +71,7 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from . import extras, hub, passkeys, push, security, service, tg_login, tts
+from . import costs, extras, hub, passkeys, push, security, service, tg_login, tts
 from . import usage as plan_usage
 from ..providers.claude import EFFORT_LEVELS
 from .auth import COOKIE_NAME, SESSION_TTL_S, LoginThrottle
@@ -569,6 +570,12 @@ async def _settings(request: web.Request) -> web.Response:
     )
 
 
+async def _stats(request: web.Request) -> web.Response:
+    tid = request.query.get("tid")
+    thread_id = int(tid) if tid and tid.lstrip("-").isdigit() else None
+    return web.json_response(await costs.overview(thread_id))
+
+
 async def _usage(request: web.Request) -> web.Response:
     data = await plan_usage.plan_usage(refresh=request.query.get("refresh") == "1")
     return web.json_response({"usage": data})
@@ -935,6 +942,7 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_post("/api/sessions/{tid}/answer", _answer)
     r.add_post("/api/tts", _tts)
     r.add_get("/api/usage", _usage)
+    r.add_get("/api/stats", _stats)
     r.add_get("/api/events", _events)
     _add_auth_routes(r)
     _add_hub_routes(r)

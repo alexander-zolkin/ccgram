@@ -2074,6 +2074,7 @@ $("sound-btn").onclick = () => {
   openMenu(soundMenu(s), { x: r.right - 260, y: r.bottom + 4, top: r.top }, $("sound-btn"));
 };
 $("pane-btn").onclick = () => { $("pane").hidden = !$("pane").hidden; pollPane(); };
+$("stats-btn").onclick = openStats;
 $("gone-keep").onclick = async () => {
   const s = currentSession();
   if (!s) return;
@@ -2754,31 +2755,37 @@ const colPath = (x, base, w, h) => {
   const r = Math.min(4, w / 2, h);
   return `M${x},${base}V${base - h + r}a${r},${r} 0 0 1 ${r},${-r}H${x + w - r}a${r},${r} 0 0 1 ${r},${r}V${base}Z`;
 };
-function usageChart(days) {
+// Bars per day: output tokens by default; ``opt.val`` / ``opt.fmt`` chart
+// anything else (the statistics sheet charts dollars over 30 days).
+function usageChart(days, opt = {}) {
+  const val = opt.val || ((d) => d.out), fmt = opt.fmt || tokRu, unit = opt.unit ?? " токенов";
   const W = 420, H = 160, left = 40, right = 6, top = 20, bottom = 24;
   const plotW = W - left - right, plotH = H - top - bottom, base = top + plotH;
-  const max = niceMax(Math.max(...days.map((d) => d.out)));
+  const max = niceMax(Math.max(...days.map(val)));
   const band = plotW / days.length;
   const bw = Math.min(24, band * 0.6);
-  const peak = days.reduce((best, d, i) => (d.out > days[best].out ? i : best), 0);
+  const peak = days.reduce((best, d, i) => (val(d) > val(days[best]) ? i : best), 0);
   const last = days.length - 1;
+  const many = days.length > 10; // a month: dates every week instead of weekdays
   let svg = "";
   for (const v of [0, max / 2, max]) {
     const yy = base - (v / max) * plotH;
-    svg += `<line class="u-grid" x1="${left}" x2="${W - right}" y1="${yy}" y2="${yy}"/><text class="u-tick" x="${left - 6}" y="${yy + 4}" text-anchor="end">${v ? tokRu(v) : "0"}</text>`;
+    svg += `<line class="u-grid" x1="${left}" x2="${W - right}" y1="${yy}" y2="${yy}"/><text class="u-tick" x="${left - 6}" y="${yy + 4}" text-anchor="end">${v ? fmt(v) : "0"}</text>`;
   }
   days.forEach((d, i) => {
+    const v = val(d);
     const x = left + band * i + (band - bw) / 2;
-    const h = d.out ? Math.max(2, (d.out / max) * plotH) : 0;
+    const h = v ? Math.max(2, (v / max) * plotH) : 0;
     const dt = new Date(`${d.date}T12:00:00`);
-    const name = i === last ? "сегодня" : WEEKDAY[dt.getDay()];
-    const tip = `${i === last ? "Сегодня" : `${WEEKDAY[dt.getDay()]} ${dt.toLocaleDateString("ru-RU", { day: "numeric", month: "numeric" })}`} · ${tokRu(d.out)} токенов · ${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}`;
+    const dm = dt.toLocaleDateString("ru-RU", { day: "numeric", month: "numeric" });
+    const name = i === last ? "сегодня" : many ? ((last - i) % 7 === 0 ? dm : "") : WEEKDAY[dt.getDay()];
+    const tip = `${i === last ? "Сегодня" : `${WEEKDAY[dt.getDay()]} ${dm}`} · ${fmt(v)}${unit} · ${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}`;
     svg += `<path class="u-col" d="${colPath(x, base, bw, h)}"/>`;
-    if (d.out && (i === last || i === peak)) svg += `<text class="u-val" x="${x + bw / 2}" y="${base - h - 6}" text-anchor="middle">${tokRu(d.out)}</text>`;
-    svg += `<text class="u-tick${i === last ? " now" : ""}" x="${x + bw / 2}" y="${H - 6}" text-anchor="middle">${name}</text>`;
+    if (v && (i === last || i === peak)) svg += `<text class="u-val" x="${x + bw / 2}" y="${base - h - 6}" text-anchor="middle">${fmt(v)}</text>`;
+    if (name) svg += `<text class="u-tick${i === last ? " now" : ""}" x="${x + bw / 2}" y="${H - 6}" text-anchor="middle">${name}</text>`;
     svg += `<rect class="u-hit" x="${left + band * i}" y="${top - 14}" width="${band}" height="${plotH + 14}" data-tip="${esc(tip)}"/>`;
   });
-  return `<svg class="u-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Токены ответа по дням за неделю">${svg}</svg>`;
+  return `<svg class="u-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(opt.label || "Токены ответа по дням за неделю")}">${svg}</svg>`;
 }
 
 // ═══ plan limits — what /usage shows in Claude Code ═════════════════════════
@@ -2806,22 +2813,68 @@ async function fetchLimits(refresh) {
   try { state.limits = (await api(`/api/usage${refresh ? "?refresh=1" : ""}`)).usage; } catch (_) { /* keep the last */ }
   return state.limits;
 }
-// "/usage" in a chat: a card in the thread, like Claude Code's own panel.
-async function showUsage() {
-  if (state.current == null) { // home: the "Расход" card has the same block
-    $("hub-usage").scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
-    renderLimits(await fetchLimits(true));
-    return;
-  }
-  const card = el("div", "usage-card", '<div class="uc-head"><b>Лимиты Claude</b><span class="uc-plan"></span></div><div class="uc-body muted">Узнаю у Anthropic…</div>');
-  $("thread").appendChild(card);
-  toBottom(true);
-  const u = await fetchLimits(true);
-  card.querySelector(".uc-body").classList.remove("muted");
-  card.querySelector(".uc-plan").textContent = u?.plan || "";
-  card.querySelector(".uc-body").innerHTML = u ? limitsHtml(u) : "Лимиты сейчас недоступны — Claude Code ещё ни разу их не запрашивал.";
-  toBottom(true);
+// The statistics sheet: plan limits, usage credits, this chat, all chats.
+const usd = (v) => (v || 0).toLocaleString("ru-RU", { style: "currency", currency: "USD", maximumFractionDigits: v >= 100 ? 0 : v >= 10 ? 1 : 2, minimumFractionDigits: v >= 100 ? 0 : v >= 10 ? 1 : 2 });
+function modelRu(id) {
+  const parts = String(id).replace(/^claude-/, "").split("-").filter((p) => !/^\d{8}$/.test(p));
+  const fam = parts.shift() || id;
+  return `${fam[0].toUpperCase()}${fam.slice(1)} ${parts.join(".")}`.trim();
 }
+const CREDIT_REASON = { org_level_disabled: "выключены на уровне организации", user_disabled: "выключены в настройках аккаунта" };
+function creditsHtml(cr) {
+  if (!cr) return "";
+  const what = '<span class="muted"> — оплачивают работу сверх лимитов подписки</span>';
+  if (!cr.enabled) return `<p class="st-line">Доп. кредиты ${esc(CREDIT_REASON[cr.reason] || (cr.reason ? `выключены (${cr.reason})` : "выключены"))}${what}</p>`;
+  const money = (v) => (v == null ? "—" : v.toLocaleString("ru-RU", { style: "currency", currency: cr.currency || "USD" }));
+  return `<p class="st-line">Доп. кредиты включены${what}: потрачено <b>${money(cr.used)}</b>${cr.limit != null ? ` из ${money(cr.limit)}` : ""}${cr.balance != null ? ` · баланс ${money(cr.balance)}` : ""}${cr.limit_reached ? ' · <b class="err">лимит исчерпан</b>' : ""}</p>`;
+}
+function modelTable(models) {
+  if (!models?.length) return '<div class="muted">Нет данных</div>';
+  return `<div class="st-scroll"><table class="st-table"><tr><th>Модель</th><th>Ввод</th><th>Вывод</th><th>Кэш: чтение</th><th>Кэш: запись</th><th>≈ по API</th></tr>${models.map((m) => `<tr><td>${esc(modelRu(m.model))}</td><td>${tokRu(m.input)}</td><td>${tokRu(m.output)}</td><td>${tokRu(m.cache_read)}</td><td>${tokRu(m.cache_write)}</td><td>${m.priced ? usd(m.cost) : "—"}</td></tr>`).join("")}</table></div>`;
+}
+const tile = (big, small) => `<div class="st-tile"><b>${big}</b><span>${small}</span></div>`;
+function statsHtml(d) {
+  const u = d.usage, c = d.chat, p = d.period;
+  const out = [];
+  out.push(`<section class="st-sec"><div class="st-head"><h3>Лимиты подписки${u?.plan ? ` · ${esc(u.plan)}` : ""}</h3><button type="button" class="btn small" data-act="refresh">Обновить</button></div>
+    ${u ? `<div class="lim-grid">${limitsHtml(u)}</div>${creditsHtml(u.credits)}` : '<div class="muted">Лимиты сейчас недоступны — Claude Code ещё ни разу их не запрашивал.</div>'}</section>`);
+  if (c) {
+    const s = currentSession();
+    out.push(`<section class="st-sec"><h3>Этот чат${s ? ` · ${esc(s.name)}` : ""}</h3>
+      <div class="st-big">${usd(c.cost)}<span>по ценам API</span></div>
+      <div class="st-tiles">${tile(c.turns, pluralRu(c.turns, "ход", "хода", "ходов"))}${tile(secsRu(c.busy_s), "в работе")}${tile(secsRu(c.wall_s), "от первого до последнего ответа")}${tile(`+${c.lines_added} −${c.lines_removed}`, "строк кода")}${c.cache_hit != null ? tile(`${Math.round(c.cache_hit * 100)} %`, "ввода из кэша") : ""}${c.subagents ? tile(c.subagents, pluralRu(c.subagents, "субагент", "субагента", "субагентов")) : ""}</div>
+      ${modelTable(c.models)}</section>`);
+  }
+  if (p) {
+    const w = (x, label) => tile(usd(x.cost), `${label} · ${x.turns} ${pluralRu(x.turns, "ход", "хода", "ходов")} · ${tokRu(x.out)} ток.`);
+    out.push(`<section class="st-sec"><h3>Все чаты</h3>
+      <div class="st-tiles">${w(p.today, "сегодня")}${w(p.week, "7 дней")}${w(p.month, "30 дней")}</div>
+      ${usageChart(p.days, { val: (x) => x.cost, fmt: usd, unit: " по API", label: "Стоимость по ценам API по дням за 30 дней" })}
+      <div class="u-cols st-cols"><div><div class="hub-label">Модели за 30 дней</div>${modelTable(p.models)}</div>
+      <div><div class="hub-label">Дороже всего за неделю</div>${p.chats.length ? `<ul class="u-chats">${p.chats.map((x) => `<li><span>${esc(x.name)}</span><span class="u-num">${usd(x.cost)}</span><span class="u-share"><i style="width:${Math.max(3, (x.cost / (p.chats[0].cost || 1)) * 100)}%"></i></span></li>`).join("")}${p.chats_rest ? `<li><span class="muted">Остальное (SSH, фоновые задачи)</span><span class="u-num">${usd(p.chats_rest)}</span></li>` : ""}</ul>` : '<div class="muted">За неделю чаты не работали</div>'}</div></div></section>`);
+  }
+  out.push('<p class="st-note">«По ценам API» — сколько стоила бы та же работа без подписки, по тарифам Anthropic. По подписке платишь фиксированно; расход подписки — в лимитах выше. Приватные чаты не считаются.</p>');
+  return `<div class="stats">${out.join("")}</div>`;
+}
+async function openStats() {
+  state.sheetPath = null;
+  $("sheet-frame").hidden = true;
+  const body = $("sheet-body");
+  body.hidden = false;
+  body.innerHTML = '<div class="stats"><p class="muted">Считаю…</p></div>';
+  openSheet("Статистика");
+  const tid = state.current;
+  let data;
+  try { data = await api(`/api/stats${tid != null ? `?tid=${tid}` : ""}`); } catch (e) { body.innerHTML = `<div class="stats"><p class="muted">${esc(e.message)}</p></div>`; return; }
+  if ($("sheet").hidden || $("sheet-title").textContent !== "Статистика") return;
+  body.innerHTML = statsHtml(data);
+  body.querySelector('[data-act="refresh"]').onclick = async (ev) => {
+    ev.currentTarget.disabled = true;
+    await fetchLimits(true);
+    openStats();
+  };
+}
+async function showUsage() { openStats(); }
 function renderLimits(u) {
   const box = $("hub-usage")?.querySelector(".u-limits");
   if (!box) return;
@@ -2849,7 +2902,7 @@ function renderUsage(u) {
   if (!u) return;
   const top = u.chats[0]?.out || 1;
   card.innerHTML = `
-    <header class="hub-head">${HUB_ICON.usage}<h2>Расход</h2><span class="hub-sub">за 7 дней ${tokRu(u.total)} токенов ответа</span></header>
+    <header class="hub-head">${HUB_ICON.usage}<h2>Расход</h2><span class="hub-sub">за 7 дней ${tokRu(u.total)} токенов ответа</span><button type="button" class="btn small hub-more" data-act="stats">Подробнее</button></header>
     <div class="u-limits" hidden></div>
     <div class="u-cols">
       <div>${usageChart(u.days)}
@@ -2859,6 +2912,7 @@ function renderUsage(u) {
         ${u.chats.length ? `<ul class="u-chats">${u.chats.map((c) => `<li><a href="#${c.thread_id}">${esc(c.name)}</a><span class="u-num">${tokRu(c.out)}</span><span class="u-share"><i style="width:${Math.max(3, (c.out / top) * 100)}%"></i></span></li>`).join("")}</ul>` : '<div class="muted ev-none">За неделю чаты не работали</div>'}
       </div>
     </div>`;
+  card.querySelector('[data-act="stats"]').onclick = openStats;
   if (state.limits) renderLimits(state.limits);
   if (!state.limitsAt || Date.now() - state.limitsAt > 60000) {
     state.limitsAt = Date.now();
