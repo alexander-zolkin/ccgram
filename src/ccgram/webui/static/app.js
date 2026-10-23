@@ -1797,15 +1797,17 @@ function setTitle(base) {
   document.title = n ? `(${n}) ${base}` : base;
 }
 
-// A session on another machine takes messages only while that machine is up
-// and the session runs inside tmux (the kara-node wrapper).
+// A session on another machine takes messages while that machine is up and
+// the session runs inside tmux (the kara-node wrapper) — or sleeps: then a
+// message wakes it there. A live one outside tmux (an old terminal) can't.
 function syncRemoteComposer(s) {
-  const ro = Boolean(s && s.remote) && (!s.online || !s.writable);
-  const why = !ro ? "" : !s.online ? `«${devLabel(s)}» не в сети — только чтение` : "Сессия запущена не через обёртку (не в tmux) — только чтение";
+  const ro = Boolean(s && s.remote) && (!s.online || (!s.writable && !s.wakeable));
+  const why = !ro ? "" : !s.online ? `«${devLabel(s)}» не в сети — только чтение`
+    : "Чат открыт в терминале без обёртки (не в tmux) — пиши там или закрой его (/exit), тогда и отсюда можно";
   $("composer").classList.toggle("readonly", ro);
   $("input").disabled = ro;
   if (ro) $("input").placeholder = why;
-  else if (state.current != null) $("input").placeholder = showDevice(s) ? `Ответить (${devLabel(s)})…` : "Ответить Каре…";
+  else if (state.current != null) $("input").placeholder = s?.wakeable && showDevice(s) ? `Ответить (${devLabel(s)}) — сессия проснётся…` : showDevice(s) ? `Ответить (${devLabel(s)})…` : "Ответить Каре…";
   document.querySelector(".composer-bar label.tool-btn")?.classList.toggle("gone", isRemote(s));
 }
 
