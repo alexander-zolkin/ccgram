@@ -729,7 +729,18 @@ class _LaunchBot:
         return getattr(self._bot, name)
 
     async def edit_forum_topic(self, **kwargs: Any) -> bool:
-        _background(self._bot.edit_forum_topic(**kwargs))
+        # Lazy: telegram errors only matter on this path.
+        from telegram.error import TelegramError
+
+        async def rename() -> None:
+            try:
+                await self._bot.edit_forum_topic(**kwargs)
+            except TelegramError as e:
+                # As in launch_window: an unchanged name (Topic_not_modified)
+                # or a failed rename is not worth a warning.
+                logger.debug("Failed to rename topic: %s", e)
+
+        _background(rename())
         return True
 
 

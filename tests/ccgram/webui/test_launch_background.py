@@ -51,3 +51,16 @@ async def test_status_post_and_edits_run_in_background_in_order():
         ("edit", "✅ one"),
         ("edit", "✅ two"),
     ]
+
+
+async def test_unchanged_topic_name_is_not_a_warning(caplog):
+    from telegram.error import BadRequest
+
+    class _Bot:
+        async def edit_forum_topic(self, **_kwargs):
+            raise BadRequest("Topic_not_modified")
+
+    await service._LaunchBot(_Bot()).edit_forum_topic(name="t")  # type: ignore[arg-type]
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
