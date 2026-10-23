@@ -649,7 +649,7 @@ function taskNode(it) {
 }
 
 // ── message actions: the «…» menu, right click, rewind ──
-const canRewind = (it) => Boolean(it && it.uuid && !it.queued && !it.task && state.structured && currentSession()?.provider === "claude");
+const canRewind = (it) => Boolean(it && it.uuid && !it.queued && !it.task && state.structured && currentSession()?.provider === "claude" && !isRemote(currentSession()));
 const plainText = (node) => (node.querySelector(".u-md, .a-msg > div:first-child, .err-body")?.innerText || node.innerText || "").trim();
 
 // The person's prompt next to a node: dir +1 = the next one below, -1 = above.
@@ -1019,13 +1019,15 @@ function renderAgentsLive(names) {
   const box = $("live-agents");
   const running = runningAgents();
   box.innerHTML = "";
+  box.classList.toggle("rows", running.length > 0);
   if (!running.length) {
     if (names.length) box.innerHTML = `<span class="la-ico">${ICONS.bot}</span><span>${names.length === 1 ? "Субагент" : `Субагентов: ${names.length}`} — ${names.map((a) => `<b>${esc(a)}</b>`).join(", ")}</span>`;
     return Boolean(names.length);
   }
   box.appendChild(el("div", "la-title", `${ICONS.bot}<span>${running.length === 1 ? "Работает субагент" : `Работают субагенты · ${running.length}`}</span>`));
   for (const a of running) {
-    const row = el("button", "la-row", `<span class="spin"></span><b>${esc(a.description || a.type || "Субагент")}</b><span class="la-act">${esc(a.action || "")}</span><span class="la-n">${a.tools} · <span${sinceAttr(a)}>${clock(agentSecs(a))}</span></span>`);
+    const row = el("button", "la-row", `<span class="spin"></span><b>${esc(a.description || a.type || "Субагент")}</b><span class="la-act">${esc(a.action || "")}</span><span class="la-n">${a.tools} ${plural(a.tools, "действие", "действия", "действий")} · <span${sinceAttr(a)}>${clock(agentSecs(a))}</span></span>`);
+    row.dataset.tip = "Открыть ход субагента";
     row.type = "button";
     row.onclick = () => openAgent(a.tool_id || a.id);
     box.appendChild(row);
@@ -1331,12 +1333,16 @@ async function loadOlder() {
 }
 
 // ═══ routing: home screen vs a session ══════════════════════════════════════
+// Sessions on other machines have ids "<device>:<session uuid>" (devices.py).
+const REMOTE_ID = /^[a-z0-9_-]{1,24}:[0-9a-f-]{36}$/;
+const isRemote = (s) => Boolean(s && s.remote);
+
 function route() {
   $("cmd-palette").hidden = true;
   const hash = location.hash.slice(1);
   if (hash.startsWith("c-")) { showDraft(hash); return; }
-  const id = parseInt(hash, 10);
-  if (!Number.isNaN(id)) openSession(id);
+  const id = /^-?\d+$/.test(hash) ? parseInt(hash, 10) : REMOTE_ID.test(hash) ? hash : NaN;
+  if (typeof id === "string" || !Number.isNaN(id)) openSession(id);
   else showHome();
 }
 
@@ -1428,6 +1434,10 @@ async function openSession(tid, { keep = false } = {}) {
     state.structured = data.structured;
     resetThread(state.structured && data.start > 0 ? '<div class="loader-row">Загружаю ранние сообщения при прокрутке…</div>' : "");
     $("thread").appendChild(buildBlocks(data.items, null));
+    if (data.source === "backup") {
+      const s = sessionById(tid);
+      $("thread").prepend(el("div", "backup-note", `${esc(s?.device_name || "Устройство")} не в сети — это копия переписки с сервера, она может отставать.`));
+    }
     if (!data.items.length) {
       const s = sessionById(tid);
       $("thread").innerHTML = `<div class="empty-chat">${s && s.state === "dead" ? "Истории этого чата здесь нет — транскрипт не найден. Напиши — сессия проснётся." : "Пока пусто — напиши первое сообщение."}</div>`;
@@ -1482,7 +1492,7 @@ async function fetchNew() {
 }
 
 // ═══ sessions sidebar ═══════════════════════════════════════════════════════
-const STATE_LABEL = { idle: "ждёт тебя", active: "работает", done: "завершена", dead: "спит", unknown: "" };
+const STATE_LABEL = { idle: "ждёт тебя", active: "работает", done: "завершена", dead: "спит", offline: "не в сети", unknown: "" };
 
 function currentSession() { return state.sessions.find((s) => s.thread_id === state.current); }
 function sessionById(id) { return state.sessions.find((s) => s.thread_id === id); }
@@ -1516,12 +1526,24 @@ const SESSION_KINDS = [
   ["asleep", "Спят", "Сессия выгружена, проснётся по сообщению", (s) => s.state === "dead"],
 ];
 state.kind = store.get("kara-kind") || "all";
+// Device filters come from the sessions themselves: «N100» = this server.
+function kindsWithDevices() {
+  const devs = new Map();
+  for (const s of state.sessions) if (isRemote(s)) devs.set(s.device, s.device_name);
+  if (!devs.size) return SESSION_KINDS;
+  return [...SESSION_KINDS, ["dev:local", "N100", "Этот сервер", (s) => !isRemote(s)],
+    ...[...devs].map(([id, name]) => [`dev:${id}`, name, "Сессии этого устройства", (s) => s.device === id])];
+}
 $("kind-btn").onclick = () => {
   const b = $("kind-btn");
-  openMenu([{ heading: "Показывать" }, ...SESSION_KINDS.map(([id, label, sub, test]) => ({
+  const kinds = kindsWithDevices();
+  openMenu([{ heading: "Показывать" }, ...kinds.slice(0, SESSION_KINDS.length).map(([id, label, sub, test]) => ({
     label, sub: `${sub ? `${sub} · ` : ""}${state.sessions.filter(test).length}`, check: id === (state.kind || "all"),
     action: () => { state.kind = id; store.set("kara-kind", id); renderSessions(); },
-  }))], menuBelow(b), b);
+  })), ...(kinds.length > SESSION_KINDS.length ? ["sep", { heading: "Устройство" }, ...kinds.slice(SESSION_KINDS.length).map(([id, label, sub, test]) => ({
+    label, sub: `${sub} · ${state.sessions.filter(test).length}`, check: id === state.kind,
+    action: () => { state.kind = id; store.set("kara-kind", id); renderSessions(); },
+  }))] : [])], menuBelow(b), b);
 };
 
 function renderSessions() {
@@ -1530,7 +1552,7 @@ function renderSessions() {
   const nav = $("session-list");
   const f = state.filter.trim().toLowerCase();
   nav.innerHTML = "";
-  const kind = SESSION_KINDS.find(([id]) => id === state.kind) || SESSION_KINDS[0];
+  const kind = kindsWithDevices().find(([id]) => id === state.kind) || SESSION_KINDS[0];
   const list = state.sessions.filter((s) => (!f || s.name.toLowerCase().includes(f)) && kind[3](s));
   $("kind-btn").classList.toggle("on", kind[0] !== "all");
   $("kind-btn").dataset.tip = kind[0] === "all" ? "Какие чаты показывать" : `Показаны: ${kind[1].toLowerCase()}`;
@@ -1555,7 +1577,7 @@ function renderSessions() {
   if (hits.length) nav.appendChild(hitsBox(state.hits.q, hits));
   else if (!list.length && !drafts.length) nav.appendChild(el("div", "group-label", f || state.kind !== "all" ? "Ничего не нашлось" : "Чатов пока нет"));
   if (state.kind && state.kind !== "all") {
-    const k = SESSION_KINDS.find(([id]) => id === state.kind);
+    const k = kindsWithDevices().find(([id]) => id === state.kind);
     const chip = el("button", "kind-chip", `${esc(k ? k[1] : state.kind)} <span>✕</span>`);
     chip.type = "button";
     chip.onclick = () => { state.kind = "all"; store.set("kara-kind", "all"); renderSessions(); };
@@ -1600,7 +1622,9 @@ function sessionItem(s) {
   const flag = s.topic_deleted
     ? `<span class="s-flag gone" data-tip="${esc(TIP.gone)}">${SVG.tgGone}</span>`
     : s.web_only ? `<span class="s-flag" data-tip="${esc(TIP.web)}">${SVG.globe}</span>` : "";
-  item.innerHTML = `<span class="dot ${esc(s.state)}" title="${esc(STATE_LABEL[s.state] || "")}"></span><span class="s-name">${esc(s.name)}</span>${flag}`;
+  const dev = isRemote(s) ? `<span class="s-dev${s.online ? "" : " off"}" data-tip="${esc(`${s.device_name}: ${s.online ? (s.writable ? "в сети" : "в сети, только чтение — сессия не в tmux") : "не в сети, только чтение"}`)}">${esc(s.device_name)}</span>` : "";
+  item.classList.toggle("offline", isRemote(s) && !s.online);
+  item.innerHTML = `<span class="dot ${esc(s.state)}" title="${esc(STATE_LABEL[s.state] || "")}"></span><span class="s-name">${esc(s.name)}</span>${dev}${isRemote(s) ? "" : flag}`;
   const more = el("button", "s-more", SVG.more);
   more.type = "button";
   more.title = "Действия";
@@ -1611,6 +1635,13 @@ function sessionItem(s) {
 }
 
 function sessionMenu(s, item) {
+  if (isRemote(s)) {
+    return [
+      { heading: `${s.device_name} · ${s.online ? "в сети" : "не в сети"}` },
+      { label: "Копировать путь", sub: s.cwd, icon: SVG.folder, action: () => copyText(s.cwd) },
+      { label: "Копировать id сессии", sub: "для claude --resume", icon: ACT.copy, action: () => copyText(String(s.thread_id).split(":")[1]) },
+    ];
+  }
   const items = [
     { label: s.pinned ? "Открепить" : "Закрепить", icon: SVG.pin, action: () => pinSession(s) },
     { label: "Переименовать", icon: SVG.edit, action: () => renameSession(s, item) },
@@ -1710,7 +1741,13 @@ function renderHeader() {
   if (!s) return;
   $("title-btn").hidden = false;
   if (!$("chat-name").querySelector("input")) $("chat-name").textContent = s.name;
-  $("chat-badge").hidden = !s.web_only;
+  $("chat-badge").hidden = !s.web_only || isRemote(s);
+  $("dev-badge").hidden = !isRemote(s);
+  if (isRemote(s)) {
+    $("dev-badge").textContent = s.device_name;
+    $("dev-badge").classList.toggle("off", !s.online);
+  }
+  syncRemoteComposer(s);
   const working = turnRunning(s);
   const shown = working && s.state === "idle" ? "active" : s.state;
   const label = STATE_LABEL[shown] || "";
@@ -1724,7 +1761,7 @@ function renderHeader() {
   syncSendBtn();
   renderSoundBtn(s);
   $("gone-card").hidden = !s.topic_deleted;
-  $("disclaimer").textContent = s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
+  $("disclaimer").textContent = isRemote(s) ? `Сессия работает на устройстве «${s.device_name}» — ответы идут и туда.` : s.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
   setTitle(`${working ? "⏳ " : ""}${s.name} — Кара`);
   syncLiveRow();
   refreshMsgStatus();
@@ -1734,6 +1771,18 @@ function renderHeader() {
 function setTitle(base) {
   const n = state.unread.size;
   document.title = n ? `(${n}) ${base}` : base;
+}
+
+// A session on another machine takes messages only while that machine is up
+// and the session runs inside tmux (the kara-node wrapper).
+function syncRemoteComposer(s) {
+  const ro = isRemote(s) && (!s.online || !s.writable);
+  const why = !isRemote(s) ? "" : !s.online ? `«${s.device_name}» не в сети — только чтение` : !s.writable ? "Сессия запущена не через обёртку (не в tmux) — только чтение" : "";
+  $("composer").classList.toggle("readonly", ro);
+  $("input").disabled = ro;
+  if (ro) $("input").placeholder = why;
+  else if (state.current != null) $("input").placeholder = isRemote(s) ? `Ответить (${s.device_name})…` : "Ответить Каре…";
+  document.querySelector(".composer-bar label.tool-btn")?.classList.toggle("gone", isRemote(s));
 }
 
 // ═══ favicon LED ════════════════════════════════════════════════════════════
@@ -2007,6 +2056,7 @@ async function pollPane() {
   const tid = state.current;
   const s = currentSession();
   if (tid == null || !s) return;
+  if (isRemote(s) && !s.online) { state.paneTimer = setTimeout(pollPane, 10000); return; }
   if (!document.hidden && s.state !== "dead") {
     try {
       const wantTerm = !$("pane").hidden;
@@ -2026,12 +2076,12 @@ async function pollPane() {
         state.lastLive = { tid, live };
         renderLive(live, s);
         if (turnRunning(s) || runningAgents().length) refreshAgents(tid);
-        if (s.provider === "claude" && (!state.modeAt || Date.now() - state.modeAt > 15000)) refreshMode(tid);
+        if (s.provider === "claude" && !isRemote(s) && (!state.modeAt || Date.now() - state.modeAt > 15000)) refreshMode(tid);
         // The live feed may be down (a restart, a network change): the thread
         // then follows the transcript from here; with the feed up, a check
         // every 15 s catches anything an event missed.
         const feedUp = state.es && state.es.readyState === EventSource.OPEN;
-        if (state.structured && (!feedUp || Date.now() - (state.fetchAt || 0) > 15000)) fetchNew();
+        if (state.structured && (!feedUp || isRemote(s) || Date.now() - (state.fetchAt || 0) > 15000)) fetchNew();
         const inter = data.interactive;
         $("prompt-card").hidden = !inter;
         if (inter) renderPrompt(inter, data.text);

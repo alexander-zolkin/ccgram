@@ -1036,3 +1036,16 @@ body.sheet-open { overflow: hidden; }
 .kind-chip { display: inline-flex; align-items: center; gap: 6px; margin: 2px 10px 4px; padding: 3px 10px; border-radius: 999px; border: .5px solid var(--border-strong); background: var(--raised); color: var(--text); font-size: 12.5px; cursor: pointer; }
 .kind-chip span { color: var(--faint); }
 .kind-chip:hover span { color: var(--text); }
+
+/* ── sessions on other devices ── */
+.s-dev { flex: none; font-size: 10.5px; line-height: 16px; padding: 0 6px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); margin-left: 4px; font-weight: 600; letter-spacing: .02em; }
+.s-dev.off { background: var(--raised); color: var(--faint); }
+.s-item.offline .s-name { color: var(--muted); }
+.dev-badge { font-size: 11px; padding: 1px 7px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); font-weight: 600; margin-left: 6px; }
+.dev-badge.off { background: var(--raised); color: var(--faint); }
+.composer.readonly { opacity: .7; }
+.composer.readonly #input { cursor: not-allowed; }
+.composer-bar .tool-btn.gone { display: none; }
+.backup-note { align-self: center; font-size: 12.5px; color: var(--muted); background: var(--raised); border-radius: 8px; padding: 5px 12px; }
+.dot.offline { background: transparent; box-shadow: inset 0 0 0 1.5px var(--faint); }
+#live-agents.rows { display: block; }
