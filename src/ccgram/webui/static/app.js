@@ -4976,4 +4976,12 @@ $("sheet-edit").onclick = editMemory;
 $("sheet-forget").onclick = forgetMemory;
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
+// A tapped notification (sw.js) or a launch of the installed app into this
+// window ("focus-existing" in the manifest) says which chat to show.
+const openUrl = (url) => {
+  const hash = new URL(url, location.href).hash;
+  if (hash !== location.hash) location.hash = hash || "#new";
+};
+navigator.serviceWorker?.addEventListener("message", (ev) => { if (ev.data?.type === "open") openUrl(ev.data.url); });
+window.launchQueue?.setConsumer((params) => { if (params.targetURL) openUrl(params.targetURL); });
 api("/api/me").then(boot).catch(() => showLogin());

@@ -48,17 +48,21 @@ async function answer(d, choice) {
   return false;
 }
 // Notifications are shown through the worker (the only way on Android);
-// a tap focuses an open tab on that chat, or opens one.
+// a tap brings a Kara window forward on that chat, or opens one.
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   const data = e.notification.data || {};
-  const url = data.url || "/";
+  const url = new URL(data.url || "/", self.location.origin).href;
   e.waitUntil((async () => {
     if ((e.action === "allow" || e.action === "deny") && data.prompt && (await answer(data, e.action))) return;
     const tabs = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    for (const tab of tabs) {
-      if ("focus" in tab) { await tab.navigate(url).catch(() => {}); return tab.focus(); }
-    }
-    return self.clients.openWindow(url);
+    // Chrome lists windows most recently focused first; a visible one wins.
+    const tab = tabs.find((t) => t.focused) || tabs.find((t) => t.visibilityState === "visible") || tabs[0];
+    if (!tab) return self.clients.openWindow(url);
+    // Focus while the click still counts as the user's, then let the page
+    // switch chats itself: navigate() fails silently on a window this worker
+    // doesn't control (and reloads the page when it does).
+    await tab.focus().catch(() => {});
+    tab.postMessage({ type: "open", url });
   })());
 });
