@@ -3112,6 +3112,7 @@ function allSecHtml(p) {
 // Providers keep their colour (app.css --pv-*); the small ones share the last.
 const PROVIDERS = [["anthropic", "Claude"], ["openai", "ChatGPT"], ["xai", "Grok"], ["google", "Gemini"]];
 const PROVIDER_RU = { alibaba: "Qwen", meta: "Llama", other: "другие" };
+const slotOf = (provider) => (PROVIDERS.some(([id]) => id === provider) ? provider : "other");
 function providerSlots(t) {
   const named = new Set(PROVIDERS.map(([id]) => id));
   const rest = t.providers.filter((p) => !named.has(p.provider));
@@ -3176,7 +3177,8 @@ function totalSecHtml(t) {
     ${monthChart(monthsSince(t), slots)}
     <details class="u-table"><summary>По месяцам таблицей</summary><div class="st-scroll"><table class="st-table"><tr><th>Месяц</th>${slots.map((s) => `<th>${esc(s.label)}</th>`).join("")}<th>Всего</th></tr>${monthsSince(t).map((m) => `<tr><td>${esc(monthRu(m.month))}</td>${slots.map((s) => `<td>${usd(s.ids.reduce((acc, id) => acc + (m.providers[id] || 0), 0))}</td>`).join("")}<td>${usd(m.cost)}</td></tr>`).join("")}</table></div></details>
     <div class="u-cols st-cols"><div><div class="hub-label">По машинам</div><ul class="u-chats st-where">${t.machines.map((m) => `<li><span>${esc(m.name)}<small>${m.tools.map((x) => `${esc(x.name)} ${usd(x.cost)}`).join(" · ")}</small></span><span class="u-num">${usd(m.cost)}</span><span class="u-share"><i style="width:${Math.max(3, (m.cost / top) * 100)}%"></i></span></li>`).join("")}</ul></div>
-    <div><div class="hub-label">Модели</div>${modelTable(t.models.slice(0, 8))}${t.models.length > 8 ? `<details class="u-table"><summary>Ещё ${t.models.length - 8}</summary>${modelTable(t.models.slice(8))}</details>` : ""}</div></div>
+    <div><div class="hub-label">Дороже всего</div><ul class="u-chats">${t.models.slice(0, 6).map((m) => `<li><span><i class="pv-sw pv-${slotOf(m.provider)}"></i>${esc(modelRu(m.model))}</span><span class="u-num">${m.priced ? usd(m.cost) : "—"}</span><span class="u-share"><i class="pv-${slotOf(m.provider)}" style="width:${Math.max(3, (m.cost / (t.models[0].cost || 1)) * 100)}%"></i></span></li>`).join("")}</ul></div></div>
+    <details class="u-table act-models"><summary>Все модели — ${t.models.length}</summary>${modelTable(t.models)}</details>
     <p class="st-line muted">Цены — нынешние прайс-листы Anthropic, OpenAI, xAI, Google и Alibaba, без надбавки за длинный контекст. Не вошли приватные чаты (и приватный Grok) и ChatGPT в браузере: в его выгрузке нет счёта токенов.</p>`;
 }
 function skTotal() {

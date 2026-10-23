@@ -843,3 +843,11 @@ body.sheet-open { overflow: hidden; }
 .pv-other { fill: var(--pv-other); background: var(--pv-other); }
 .pv-sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
 .st-where small { display: block; margin-top: 1px; font-size: 12px; color: var(--muted); }
+.u-share .pv-anthropic { background: var(--pv-anthropic); }
+.u-share .pv-openai { background: var(--pv-openai); }
+.u-share .pv-xai { background: var(--pv-xai); }
+.u-share .pv-google { background: var(--pv-google); }
+.u-share .pv-other { background: var(--pv-other); }
+/* a big sum keeps its "$"; the caption wraps under it on phones */
+.st-big { flex-wrap: wrap; row-gap: 2px; white-space: nowrap; }
+.st-big span { white-space: normal; }
