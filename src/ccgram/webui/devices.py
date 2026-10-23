@@ -189,9 +189,8 @@ async def _loop() -> None:
         await asyncio.sleep(POLL_S)
 
 
-def start() -> asyncio.Task[None] | None:
-    if not devices():
-        return None
+def start() -> asyncio.Task[None]:
+    """The poll loop; it idles while devices.json lists nothing (re-read each pass)."""
     return asyncio.get_running_loop().create_task(_loop())
 
 
