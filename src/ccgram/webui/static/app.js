@@ -3683,7 +3683,7 @@ state.device = store.get("kara-device") || "local";
 state.devCwd = (() => { try { return JSON.parse(store.get("kara-dev-cwd") || "{}"); } catch (_) { return {}; } })();
 async function loadDevices() {
   try { state.devices = (await api("/api/devices")).devices || []; } catch (_) { state.devices = []; }
-  if (state.device !== "local" && !state.devices.some((d) => d.id === state.device)) state.device = "local";
+  if (state.device === state.homeDevice || (state.device !== "local" && !state.devices.some((d) => d.id === state.device))) state.device = "local";
   renderDevice();
 }
 const remoteDevice = () => (state.device && state.device !== "local" ? (state.devices || []).find((d) => d.id === state.device) : null);
@@ -3709,10 +3709,15 @@ function recentCwds(device) {
 }
 $("dev-btn").onclick = () => {
   const b = $("dev-btn");
+  // On the hub this server is a device too: one row for it — the "local"
+  // one, which can also open a Telegram topic — not a second N100.
+  const all = state.devices || [];
+  const home = all.find((d) => d.id === state.homeDevice);
+  const offline = (d) => (d.seen ? `не в сети · был на связи ${agoRu(d.seen)}` : "не в сети");
   openMenu([{ heading: "Где запустить новый чат" },
-    { label: "N100", sub: "Этот сервер · Telegram, ccgram", check: !remoteDevice(), action: () => { state.device = "local"; store.set("kara-device", "local"); renderDevice(); } },
-    ...(state.devices || []).map((d) => ({
-      label: d.name, sub: d.online ? "в сети · сессия в tmux на устройстве" : "не в сети", check: state.device === d.id, disabled: !d.online,
+    { label: home?.name || "N100", sub: "Этот сервер · можно с Telegram-топиком", check: !remoteDevice(), action: () => { state.device = "local"; store.set("kara-device", "local"); renderDevice(); } },
+    ...all.filter((d) => d !== home).map((d) => ({
+      label: d.name, sub: d.online ? "в сети · сессия в tmux на устройстве" : offline(d), check: state.device === d.id, disabled: !d.online,
       action: () => { state.device = d.id; store.set("kara-device", d.id); renderDevice(); },
     }))], menuBelow(b), b);
 };
