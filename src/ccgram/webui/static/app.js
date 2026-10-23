@@ -975,10 +975,40 @@ function itemKey(it) {
 // Tool calls that speak to the person: cards in the thread, not steps.
 const STANDALONE = { SendUserFile: sentFilesNode, ExitPlanMode: planNode };
 
+// «Сегодня / Вчера / пятница, 17 октября» between days. A build that
+// continues a thread picks up the day it ends on.
+const dayKey = (ts) => { const d = ts ? new Date(ts) : null; return d && !Number.isNaN(d.getTime()) ? `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}` : ""; };
+function dayLabel0(ts) {
+  const d = new Date(ts);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = Math.round((today - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000);
+  if (diff === 0) return "Сегодня";
+  if (diff === 1) return "Вчера";
+  const opt = { weekday: "long", day: "numeric", month: "long" };
+  if (d.getFullYear() !== today.getFullYear()) opt.year = "numeric";
+  return d.toLocaleDateString("ru-RU", opt);
+}
+function daySep(ts) {
+  const n = el("div", "day-sep", `<span>${esc(dayLabel0(ts))}</span>`);
+  n.dataset.day = dayKey(ts);
+  return n;
+}
+// Two dividers of one day meet where an older page joins the thread.
+function dedupeDays(box) {
+  let prev = null;
+  for (const n of box.querySelectorAll(".day-sep")) { if (n.dataset.day === prev) n.remove(); else prev = n.dataset.day; }
+}
+const DAY_KINDS = new Set(["user", "assistant", "update", "bash", "command", "peer", "notice", "error", "task", "summary"]);
+
 function buildBlocks(items, continueFrom, live = false) {
   const frag = document.createDocumentFragment();
   let steps = continueFrom && continueFrom.classList.contains("steps") ? continueFrom : null;
+  let day = continueFrom?.parentElement ? ([...continueFrom.parentElement.querySelectorAll(".day-sep")].pop()?.dataset.day || null) : null;
   for (const it of items) {
+    if (DAY_KINDS.has(it.kind) && it.ts && dayKey(it.ts) && dayKey(it.ts) !== day && !(it.kind === "user" && it.queued && day)) {
+      day = dayKey(it.ts);
+      if (!state.seen.has(itemKey(it) || "")) { frag.appendChild(daySep(it.ts)); steps = null; }
+    }
     if (it.kind === "tool_result") {
       const node = state.steps.get(it.id);
       if (node) {
@@ -1073,7 +1103,11 @@ function appendItems(items) {
   markLast();
   refreshMsgStatus();
   autoOpenLive();
-  if (stick) toBottom(true); else if (items.length) $("jump-btn").hidden = false;
+  if (stick) toBottom(true);
+  else if (items.length) {
+    state.newBelow = (state.newBelow || 0) + items.filter((it) => it.kind === "assistant" || it.kind === "user").length;
+    syncJump();
+  }
 }
 
 function prependItems(items) {
@@ -1082,6 +1116,7 @@ function prependItems(items) {
   const before = s.scrollHeight;
   const anchor = thread.querySelector(".loader-row")?.nextSibling || thread.firstChild;
   thread.insertBefore(buildBlocks(items, null), anchor);
+  dedupeDays(thread);
   s.scrollTop += s.scrollHeight - before;
 }
 
@@ -1212,6 +1247,10 @@ async function openSession(tid, { keep = false } = {}) {
     state.structured = data.structured;
     resetThread(state.structured && data.start > 0 ? '<div class="loader-row">Загружаю ранние сообщения при прокрутке…</div>' : "");
     $("thread").appendChild(buildBlocks(data.items, null));
+    if (!data.items.length) {
+      const s = sessionById(tid);
+      $("thread").innerHTML = `<div class="empty-chat">${s && s.state === "dead" ? "Истории этого чата здесь нет — транскрипт не найден. Напиши — сессия проснётся." : "Пока пусто — напиши первое сообщение."}</div>`;
+    }
     const pending = state.pending.get(tid);
     if (pending) { const p = pendingNode(pending.text, pending.at); p.querySelector(".tick").innerHTML = TICK.sent; p.dataset.sent = "1"; $("thread").appendChild(p); }
     if (!keep) replay($("thread"), "fade");
@@ -1933,6 +1972,10 @@ async function send() {
   if (state.attachments.some((a) => a.uploading)) { toast("Файлы ещё загружаются…"); return; }
   const message = composeMessage();
   if (!message) return;
+  // iOS can commit a pending autocorrect into the field after it was cleared,
+  // which brought the whole sent text back (and it got sent twice).
+  const typed = $("input").value.trim();
+  if (typed) state.justSent = { text: typed, until: Date.now() + 2000 };
   // Claude Code's /usage opens a dialog in the terminal that the web never
   // sees: answer it here, from the same source, without bothering the session.
   if (/^\/usage\s*$/i.test(message)) { clearComposer(); autosize(); $("cmd-palette").hidden = true; showUsage(); return; }
@@ -2614,7 +2657,16 @@ $("login-form").onsubmit = async (ev) => {
 };
 window.addEventListener("hashchange", route);
 $("composer").onsubmit = (ev) => { ev.preventDefault(); send(); };
-$("input").addEventListener("input", () => { autosize(); store.set(draftKey(), $("input").value); });
+$("input").addEventListener("input", () => {
+  const j = state.justSent;
+  if (j && Date.now() < j.until) {
+    const v = $("input").value;
+    if (v.trim() === j.text) $("input").value = "";
+    else if (v.startsWith(j.text)) $("input").value = v.slice(j.text.length).replace(/^\s+/, "");
+  }
+  autosize();
+  store.set(draftKey(), $("input").value);
+});
 $("input").addEventListener("keydown", (ev) => {
   if (handleFormatKey(ev)) return;
   if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing && !isMobile()) { ev.preventDefault(); send(); }
@@ -2922,10 +2974,19 @@ $("model-btn").onclick = async () => {
   if (!items.length) items.push({ label: "Агенты недоступны" });
   openMenu(items, menuBelow($("model-btn")));
 };
-$("jump-btn").onclick = () => { toBottom(); $("jump-btn").hidden = true; };
+// «Вниз» whenever the thread is scrolled well up (with a count of what came since).
+function syncJump() {
+  const s = $("scroller");
+  const far = state.current != null && s.scrollHeight - s.scrollTop - s.clientHeight > Math.max(400, s.clientHeight * 1.2);
+  if (!far && nearBottom()) state.newBelow = 0;
+  const b = $("jump-btn");
+  b.hidden = !(far || (state.newBelow && !nearBottom()));
+  if (state.newBelow) b.dataset.n = state.newBelow > 99 ? "99+" : String(state.newBelow); else delete b.dataset.n;
+}
+$("jump-btn").onclick = () => { toBottom(true); state.newBelow = 0; $("jump-btn").hidden = true; };
 $("scroller").addEventListener("scroll", () => {
   const s = $("scroller");
-  if (nearBottom()) $("jump-btn").hidden = true;
+  syncJump();
   if (s.scrollTop < 400) loadOlder();
   closeMenu();
 });
