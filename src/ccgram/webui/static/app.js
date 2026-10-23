@@ -2589,6 +2589,10 @@ function profileMenu() {
     { label: "Тёмная", icon: SVG.sun, check: theme === "dark", action: () => setTheme("dark") },
     "sep",
   ];
+  // The standalone hub on trial (HUB-PLAN): Caddy routes by a cookie.
+  items.push(state.karaHub
+    ? { label: "Вернуться в старый веб", sub: "Сейчас открыт новый хаб (проба)", icon: SVG.out, action: () => { location.href = "/_hub/off"; } }
+    : { label: "Попробовать новый хаб", sub: "Тот же адрес; вернуться — в этом же меню", icon: SVG.globe, action: () => { location.href = "/_hub/on"; } });
   items.push({ heading: "Telegram" });
   items.push({
     label: "Новые чаты в Telegram",
@@ -2920,6 +2924,7 @@ $("security").querySelector("form").addEventListener("submit", (ev) => {
 async function boot(me) {
   if (me && "hub" in me) store.set("kara-hub", me.hub ? "1" : "0");
   if (me && "tts" in me) state.tts = me.tts;
+  state.karaHub = Boolean(me && me.kara_hub);
   $("login").hidden = true;
   $("app").hidden = false;
   if (store.get("kara-collapsed") === "1" && !isMobile()) $("app").classList.add("collapsed");
