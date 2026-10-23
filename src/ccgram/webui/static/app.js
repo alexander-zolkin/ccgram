@@ -498,7 +498,7 @@ function summaryNode(it) {
 // "Baked for 19s" in Claude Code: how long a finished turn took, what it wrote.
 const secsRu = (sec) => (sec < 60 ? `${sec} с` : sec < 3600 ? `${Math.floor(sec / 60)} мин${sec % 60 ? ` ${sec % 60} с` : ""}` : `${Math.floor(sec / 3600)} ч ${Math.floor((sec % 3600) / 60)} мин`);
 const clock = (sec) => { const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = String(sec % 60).padStart(2, "0"); return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
-const tokRu = (n) => (n < 1000 ? String(Math.round(n)) : n < 1e4 ? `${(n / 1000).toFixed(1).replace(".", ",")}k` : n < 1e6 ? `${Math.round(n / 1000)}k` : `${(n / 1e6).toFixed(1).replace(".", ",")}M`);
+const tokRu = (n) => (n < 1000 ? String(Math.round(n)) : n < 1e4 ? `${(n / 1000).toFixed(1).replace(".", ",")}k` : n < 1e6 ? `${Math.round(n / 1000)}k` : n < 1e9 ? `${(n / 1e6).toFixed(1).replace(".", ",")}M` : `${(n / 1e9).toFixed(1).replace(".", ",")}B`);
 
 function turnNode(it) {
   const sec = Math.max(1, Math.round((it.ms || 0) / 1000));
@@ -2854,7 +2854,8 @@ function statsHtml(d) {
       <div class="u-cols st-cols"><div><div class="hub-label">Модели за 30 дней</div>${modelTable(p.models)}</div>
       <div><div class="hub-label">Дороже всего за неделю</div>${p.chats.length ? `<ul class="u-chats">${p.chats.map((x) => `<li><span>${esc(x.name)}</span><span class="u-num">${usd(x.cost)}</span><span class="u-share"><i style="width:${Math.max(3, (x.cost / (p.chats[0].cost || 1)) * 100)}%"></i></span></li>`).join("")}${p.chats_rest ? `<li><span class="muted">Остальное (SSH, фоновые задачи)</span><span class="u-num">${usd(p.chats_rest)}</span></li>` : ""}</ul>` : '<div class="muted">За неделю чаты не работали</div>'}</div></div></section>`);
   }
-  if (p?.heatmap) out.push(`<section class="st-sec"><div class="st-head"><h3>Активность</h3><div class="seg" role="tablist">${ACT_WINDOWS.map(([k, label]) => `<button type="button" data-win="${k}"${k === state.actWin ? ' class="on"' : ""}>${label}</button>`).join("")}</div></div>
+  const since = p?.all?.days ? new Date(Date.now() - (p.all.days - 1) * 86400000).toLocaleDateString("ru-RU", { day: "numeric", month: "long" }) : "";
+  if (p?.heatmap) out.push(`<section class="st-sec"><div class="st-head"><h3>Активность</h3>${since ? `<span class="muted st-since">журналы с ${since}</span>` : ""}<div class="seg" role="tablist">${ACT_WINDOWS.map(([k, label]) => `<button type="button" data-win="${k}"${k === state.actWin ? ' class="on"' : ""}>${label}</button>`).join("")}</div></div>
     <div class="st-scroll">${heatmapSvg(p.heatmap)}</div>
     <div class="hm-legend">Меньше <i class="hm-key l0"></i><i class="hm-key l1"></i><i class="hm-key l2"></i><i class="hm-key l3"></i><i class="hm-key l4"></i> Больше</div>
     <div class="act-stats"></div></section>`);
@@ -2889,6 +2890,8 @@ function heatmapSvg(days) {
   return `<svg class="heatmap" viewBox="0 0 ${W} ${H}" style="max-width:${W * 1.6}px" role="img" aria-label="Активность по дням">${svg}</svg>`;
 }
 function daysRu(n) { return `${n} ${pluralRu(n, "день", "дня", "дней")}`; }
+// Long spans read in days, like Claude Code's "67d 18h 15m".
+const spanRu = (sec) => (sec < 86400 ? secsRu(sec) : `${Math.floor(sec / 86400)} д ${Math.floor((sec % 86400) / 3600)} ч`);
 function actStatsHtml(x) {
   if (!x) return "";
   const total = x.input + x.output + x.cache_read + x.cache_write;
@@ -2898,7 +2901,7 @@ function actStatsHtml(x) {
     <div><span>Любимая модель</span><b>${x.favorite ? esc(modelRu(x.favorite)) : "—"}</b></div>
     <div><span>Всего токенов</span><b>${tokRu(total)}</b></div>
     <div><span>Сессий</span><b>${x.sessions}</b></div>
-    <div><span>Самая длинная сессия</span><b>${secsRu(x.longest_session_s)}</b></div>
+    <div><span>Самая длинная сессия</span><b>${spanRu(x.longest_session_s)}</b></div>
     <div><span>Активных дней</span><b>${x.active_days} из ${x.days}</b></div>
     <div><span>Самая длинная серия</span><b>${daysRu(x.longest_streak)}</b></div>
     <div><span>Самый активный день</span><b>${busiest}</b></div>
