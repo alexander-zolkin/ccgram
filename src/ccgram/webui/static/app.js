@@ -2909,13 +2909,16 @@ function heatmapSvg(days, reveal = false) {
   const cuts = [q(0.25), q(0.5), q(0.75)];
   const level = (v) => (!v ? 0 : v <= cuts[0] ? 1 : v <= cuts[1] ? 2 : v <= cuts[2] ? 3 : 4);
   let svg = [["пн", 0], ["ср", 2], ["пт", 4]].map(([t, r]) => `<text class="hm-t" x="0" y="${top + r * step + 9}">${t}</text>`).join("");
-  let month = -1;
+  let month = -1, labelled = -9;
   days.forEach((d, i) => {
     const w = Math.floor(i / 7), wd = i % 7;
     const dt = new Date(`${d.date}T12:00:00`);
     if (wd === 0 && dt.getMonth() !== month) {
       month = dt.getMonth();
-      if (w < weeks - 1) svg += `<text class="hm-t" x="${left + w * step}" y="10">${MONTH_SHORT[month]}</text>`;
+      if (w < weeks - 1 && w - labelled >= 3) { // a month that starts a week after the last label waits
+        svg += `<text class="hm-t" x="${left + w * step}" y="10">${MONTH_SHORT[month]}</text>`;
+        labelled = w;
+      }
     }
     const when = `${WEEKDAY[dt.getDay()]} ${dt.toLocaleDateString("ru-RU", { day: "numeric", month: "short" })}`;
     const tip = d.out ? `${when} · ${tokRu(d.out)} токенов · ${usd(d.cost)} · ${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}` : `${when} · без работы`;

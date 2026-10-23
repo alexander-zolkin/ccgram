@@ -800,3 +800,4 @@ body.sheet-open { overflow: hidden; }
 @media (prefers-reduced-motion: reduce) {
   .sk::after, .sk-hm rect, .st-in, .heatmap.reveal .hm { animation: none; }
 }
+.act-grid b { white-space: nowrap; }
