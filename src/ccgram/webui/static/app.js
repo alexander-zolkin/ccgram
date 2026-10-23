@@ -2242,6 +2242,7 @@ function composeMessage() {
 // this device and, on the hub, for every device — a reload or another device
 // picks it up. The newer write wins; a page that is typing into the same
 // chat right now keeps its own text (its next save wins anyway).
+const typingNow = () => Date.now() - (state.typedAt || 0) < 2500;
 const draftId = () => String(state.current ?? state.draft ?? "new");
 const draftKey = () => `kara-draft-${draftId()}`;
 const draftTs = (id) => Number(store.get(`kara-draft-ts-${id}`) || 0);
@@ -2276,14 +2277,12 @@ async function pullDrafts() {
     setDraft(id, d.text, { ts: d.ts, sync: false });
     here = here || id === draftId();
   }
-  if (here && document.activeElement !== $("input")) loadDraft();
+  if (here && !typingNow()) loadDraft();
 }
 function onDraftEvent(e) {
   if (e.client === clientId || e.ts <= draftTs(e.key)) return;
-  const open = draftId() === e.key;
-  const typing = open && document.activeElement === $("input") && $("input").value !== (store.get(draftKey()) || "");
   setDraft(e.key, e.text, { ts: e.ts, sync: false });
-  if (open && !typing) loadDraft();
+  if (draftId() === e.key && !typingNow()) loadDraft();
 }
 function loadDraft() {
   $("input").value = store.get(draftKey()) || "";
@@ -3092,6 +3091,7 @@ $("input").addEventListener("input", () => {
     else if (v.startsWith(j.text)) $("input").value = v.slice(j.text.length).replace(/^\s+/, "");
   }
   autosize();
+  state.typedAt = Date.now();
   setDraft(draftId(), $("input").value);
 });
 $("input").addEventListener("keydown", (ev) => {
