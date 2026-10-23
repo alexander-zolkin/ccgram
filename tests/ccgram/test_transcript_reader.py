@@ -488,3 +488,36 @@ async def test_replaced_smaller_transcript_resumes_from_eof_no_replay(
     tracked = state.get_session("sess-replaced")
     assert tracked is not None
     assert tracked.parsed_offset == session_file.stat().st_size
+
+
+async def test_bookkeeping_lines_on_idle_session_are_not_activity(tmp_path) -> None:
+    """A published artifact's ledger line lands in an idle transcript every
+    hour or so; it must not paint the topic active (23.10 rename storm)."""
+    old = '{"type":"assistant","message":{"content":[{"type":"text","text":"a"}]}}\n'
+    session_file = tmp_path / "transcript.jsonl"
+    session_file.write_text(old, newline="\n")
+    state = MonitorState(state_file=tmp_path / "monitor_state.json")
+    state.update_session(
+        TrackedSession(
+            session_id="sess",
+            file_path=str(session_file),
+            last_byte_offset=len(old.encode()),
+        )
+    )
+    idle = IdleTracker()
+    reader = TranscriptReader(state, idle)
+    await reader._process_session_file("sess", session_file, [], window_id="@1")
+    with session_file.open("a") as transcript:
+        transcript.write(
+            '{"type":"artifact-autoreact-ledger","v":1,"sessionId":"sess"}\n'
+        )
+
+    await reader._process_session_file("sess", session_file, [], window_id="@1")
+    assert idle.get_last_activity("sess") is None
+
+    with session_file.open("a") as transcript:
+        transcript.write(
+            '{"type":"user","message":{"content":[{"type":"text","text":"b"}]}}\n'
+        )
+    await reader._process_session_file("sess", session_file, [], window_id="@1")
+    assert idle.get_last_activity("sess") is not None

@@ -58,6 +58,27 @@ class _GenerationCheck(NamedTuple):
 
 _MARKER_BYTES = 128
 
+# Lines Claude Code appends to an idle session's transcript: the comment-watch
+# ledger of a published artifact (every hour or so), titles, modes. They are
+# not the agent working; counted as activity, each one flipped the topic to
+# active and back to idle 30 s later (two renames, two notifications).
+_BOOKKEEPING_TYPES = frozenset(
+    {
+        "artifact-autoreact-ledger",
+        "ai-title",
+        "custom-title",
+        "last-prompt",
+        "mode",
+        "permission-mode",
+        "atis-latch",
+        "frame-link",
+    }
+)
+
+
+def _is_activity(entry: dict) -> bool:
+    return entry.get("type") not in _BOOKKEEPING_TYPES
+
 
 def _prefix_digest(file_path: Path, size: int) -> bytes:
     digest = hashlib.sha256()
@@ -93,7 +114,7 @@ def _resolve_provider_for_file(window_id: str, file_path: Path) -> Any:
         from .window_state_ports import identity_state
 
         provider_name = identity_state.get_provider_name(window_id)
-    except (ImportError, RuntimeError):
+    except ImportError, RuntimeError:
         pass
     provider = get_provider_for_window(window_id, provider_name=provider_name)
     inferred = detect_provider_from_transcript_path(str(file_path))
@@ -642,7 +663,7 @@ class TranscriptReader:
             self._parse_pos(tracked) >= startup_boundary.size
         ):
             self._startup_file_boundaries.pop(session_id, None)
-        if new_entries and has_live_entries:
+        if has_live_entries and any(_is_activity(e) for e in new_entries):
             self._idle_tracker.record_activity(session_id)
         self._append_provider_messages(
             session_id,
