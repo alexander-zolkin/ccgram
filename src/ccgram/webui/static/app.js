@@ -2555,8 +2555,8 @@ function pickModel(provider, model) {
 function notify(s, e) {
   if (!("Notification" in window) || Notification.permission !== "granted") return;
   if (s && (!webOn(s) || state.webMuted)) return;
-  if (document.hidden && state.pushOn) return; // the server's Web Push shows it
-  if (!document.hidden && e.thread_id === state.current) return;
+  if (!watching() && state.pushOn) return; // the server's Web Push shows it
+  if (watching() && e.thread_id === state.current) return;
   if (e.role !== "assistant" || e.content_type !== "text" || !e.is_complete) return;
   const title = s ? s.name : "Кара";
   const opts = { body: String(e.text).slice(0, 180), tag: `t${e.thread_id}`, icon: "/static/icon.svg", data: { url: `/#${e.thread_id}` } };
@@ -2781,12 +2781,17 @@ async function disablePush() {
 
 // While a Kara tab is on screen the server holds pushes back (the page shows
 // its own notification); it resumes 45 s after the last "visible" ping.
+// "Watching" is on screen AND focused: a PWA window left open behind other
+// windows must not hold back the pushes (the phone's included).
 const clientId = Math.random().toString(36).slice(2);
+const watching = () => !document.hidden && document.hasFocus();
 function reportPresence() {
-  api("/api/presence", { body: { client: clientId, visible: !document.hidden } }).catch(() => {});
+  api("/api/presence", { body: { client: clientId, visible: watching() } }).catch(() => {});
 }
 document.addEventListener("visibilitychange", reportPresence);
-setInterval(() => { if (!document.hidden) reportPresence(); }, 25000);
+addEventListener("focus", reportPresence);
+addEventListener("blur", reportPresence);
+setInterval(() => { if (watching()) reportPresence(); }, 25000);
 
 // ═══ auth / boot ════════════════════════════════════════════════════════════
 function showLogin() {
