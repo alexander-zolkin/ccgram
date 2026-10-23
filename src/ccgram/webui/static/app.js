@@ -1342,7 +1342,7 @@ async function send() {
   if (!message) return;
   // Claude Code's /usage opens a dialog in the terminal that the web never
   // sees: answer it here, from the same source, without bothering the session.
-  if (/^\/usage\s*$/i.test(message)) { clearComposer(); autosize(); showUsage(); return; }
+  if (/^\/usage\s*$/i.test(message)) { clearComposer(); autosize(); $("cmd-palette").hidden = true; showUsage(); return; }
   $("send-btn").disabled = true;
   try {
     if (state.current == null) {
@@ -2470,6 +2470,7 @@ async function updatePalette() {
   const box = $("cmd-palette");
   if (!m) { box.hidden = true; return; }
   const all = await loadCommands();
+  if ($("input").value !== v) return; // typed on (or sent) while the list loaded
   const q = m[1].toLowerCase();
   palette.list = all.filter((c) => c.name.slice(1).toLowerCase().includes(q))
     .sort((a, b) => (a.name.slice(1).toLowerCase().startsWith(q) ? 0 : 1) - (b.name.slice(1).toLowerCase().startsWith(q) ? 0 : 1)).slice(0, 40);
