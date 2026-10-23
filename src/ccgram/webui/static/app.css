@@ -755,3 +755,24 @@ body.sheet-open { overflow: hidden; }
 .st-cols > div { min-width: 0; } /* a wide table scrolls in its own box */
 .stats ul.u-chats { padding-left: 0; margin: 0; }
 .stats ul.u-chats li { margin: 0; }
+/* «Активность»: a year of days + the overview numbers */
+.seg { margin-left: auto; display: inline-flex; background: var(--raised); border-radius: 9px; padding: 2px; flex: none; }
+.seg button { border: 0; background: transparent; color: var(--muted); font: 12.5px var(--sans); padding: 4px 10px; border-radius: 7px; cursor: pointer; white-space: nowrap; }
+.seg button.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, .08); }
+.heatmap { width: 100%; height: auto; display: block; }
+.hm-t { fill: var(--muted); font: 9px var(--sans); }
+.hm, .hm-key { fill: var(--raised); }
+.hm.l1 { fill: color-mix(in srgb, var(--chart-1) 28%, var(--raised)); }
+.hm.l2 { fill: color-mix(in srgb, var(--chart-1) 52%, var(--raised)); }
+.hm.l3 { fill: color-mix(in srgb, var(--chart-1) 76%, var(--raised)); }
+.hm.l4 { fill: var(--chart-1); }
+.hm-legend { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 11.5px; color: var(--muted); margin: 6px 0 14px; }
+.hm-key { display: inline-block; width: 11px; height: 11px; border-radius: 2.5px; background: var(--raised); }
+.hm-key.l1 { background: color-mix(in srgb, var(--chart-1) 28%, var(--raised)); }
+.hm-key.l2 { background: color-mix(in srgb, var(--chart-1) 52%, var(--raised)); }
+.hm-key.l3 { background: color-mix(in srgb, var(--chart-1) 76%, var(--raised)); }
+.hm-key.l4 { background: var(--chart-1); }
+.act-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px 24px; }
+.act-grid div { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13.5px; }
+.act-grid span { color: var(--muted); }
+.act-grid b { font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }

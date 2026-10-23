@@ -93,3 +93,34 @@ def test_period_skips_the_private_root_and_names_chats(tmp_path, monkeypatch):
     assert got["month"]["sessions"] == 2 and len(got["days"]) == costs.PERIOD_DAYS
     assert got["chats"] == [{"name": "Финансы", "cost": 2.0}]
     assert got["chats_rest"] == pytest.approx(2.0)
+
+
+def test_activity_streaks_busiest_day_and_heatmap(tmp_path, monkeypatch):
+    from datetime import date, timedelta
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+    def at(days_ago, mid, out):
+        when = datetime.combine(
+            date.today() - timedelta(days=days_ago), datetime.min.time()
+        )
+        when = when.replace(hour=12).astimezone(UTC).isoformat()
+        return {
+            **_say(mid, "claude-opus-5-5", {"output_tokens": out}),
+            "timestamp": when,
+        }
+
+    _write(
+        tmp_path / "projects" / "-w" / "s1.jsonl",
+        [at(5, "a", 10), at(2, "b", 10), at(1, "c", 500), at(0, "d", 10)],
+    )
+    got = costs.period_stats(Path("/nowhere/private"), {})
+    every = got["all"]
+    assert (every["days"], every["active_days"]) == (6, 4)
+    assert (every["longest_streak"], every["current_streak"]) == (3, 3)
+    assert every["busiest"]["out"] == 500
+    assert every["favorite"] == "claude-opus-5-5"
+    assert got["week"]["output"] == 530 and got["today"]["output"] == 10
+    first = date.fromisoformat(got["heatmap"][0]["date"])
+    assert first.weekday() == 0 and len(got["heatmap"]) >= 26 * 7
+    assert got["heatmap"][-1]["date"] == date.today().isoformat()

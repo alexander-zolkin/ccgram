@@ -38,6 +38,7 @@ FAST_FACTOR = 2.0  # fast mode bills double
 PERIOD_DAYS = 30
 PERIOD_TTL_S = 180.0
 TOP_CHATS = 6
+HEATMAP_MIN_WEEKS = 26
 
 
 def price(model: str) -> tuple[float, float, float, float, float] | None:
@@ -228,81 +229,145 @@ def _project_dirs(private_root: Path) -> list[Path]:
     return [d for d in dirs if not d.name.startswith(hidden)]
 
 
-class _Period:
-    """30 days of every session, one transcript at a time."""
+class _Day:
+    __slots__ = ("costs", "tally", "turns")
 
     def __init__(self) -> None:
-        self.today = date.today().isoformat()
-        first = date.today() - timedelta(days=PERIOD_DAYS - 1)
-        self.since = datetime.combine(first, datetime.min.time()).timestamp()
-        self.week_from = (date.today() - timedelta(days=6)).isoformat()
-        self.days = {
-            (first + timedelta(days=n)).isoformat(): {"cost": 0.0, "out": 0, "turns": 0}
-            for n in range(PERIOD_DAYS)
-        }
-        self.models, self.week_models = Tally(), Tally()
-        self.chats: dict[str, float] = {}
-        self.sessions: dict[str, set[str]] = {
-            "today": set(),
-            "week": set(),
-            "month": set(),
-        }
+        self.tally = Tally()
+        self.turns = 0
+        self.costs: dict[str, float] = {}  # session → $ that day
 
-    def add_file(self, file: Path, sid: str) -> None:
+    @property
+    def out(self) -> int:
+        return int(sum(r[1] for r in self.tally.models.values()))
+
+
+class _Period:
+    """Every (non-private) session, tallied per local day."""
+
+    def __init__(self) -> None:
+        self.days: dict[str, _Day] = {}
+        self.spans: dict[str, list[float]] = {}  # session → [first, last]
+
+    def add_file(self, file: Path, sid: str, main: bool) -> None:
         seen: set[str] = set()
         for entry in _entries(file):
             when = _epoch(entry.get("timestamp"))
-            day = datetime.fromtimestamp(when).date().isoformat() if when else ""
-            if day not in self.days:
+            if when is None:
                 continue
+            day = self.days.setdefault(
+                datetime.fromtimestamp(when).date().isoformat(), _Day()
+            )
+            if main:  # a session's length: its own transcript, not subagents'
+                span = self.spans.setdefault(sid, [when, when])
+                span[0], span[1] = min(span[0], when), max(span[1], when)
             if _is_turn_end(entry):
-                self.days[day]["turns"] += 1
+                day.turns += main
                 continue
             priced = _priced_message(entry)
             if priced is None or priced[0] in seen:
                 continue
             seen.add(priced[0])
-            self._count(day, sid, priced[1], priced[2])
+            cost = day.tally.add(priced[1], priced[2])
+            day.costs[sid] = day.costs.get(sid, 0.0) + cost
 
-    def _count(self, day: str, sid: str, model: str, usage: dict[str, Any]) -> None:
-        cost = self.models.add(model, usage)
-        self.days[day]["cost"] += cost
-        self.days[day]["out"] += int(usage.get("output_tokens") or 0)
-        self.sessions["month"].add(sid)
-        if day >= self.week_from:
-            self.week_models.add(model, usage)
-            self.sessions["week"].add(sid)
-            self.chats[sid] = self.chats.get(sid, 0.0) + cost
-        if day == self.today:
-            self.sessions["today"].add(sid)
+    def _window(self, first: date, last: date) -> dict[str, Any]:
+        """Totals, streaks, favourite model and busiest day for a date range."""
+        tally, sessions, turns = Tally(), set(), 0
+        active, best, streak, run = 0, None, 0, 0
+        n = (last - first).days + 1
+        for i in range(n):
+            key = (first + timedelta(days=i)).isoformat()
+            day = self.days.get(key)
+            if day and day.costs:
+                tally.merge(day.tally)
+                sessions |= day.costs.keys()
+                active, run = active + 1, run + 1
+                if best is None or day.out > best[1]:
+                    best = (key, day.out)
+            else:
+                run = 0
+            streak = max(streak, run)
+            turns += day.turns if day else 0
+        current = run or self._streak_before(last)
+        summary = tally.summary()
+        favorite = max(summary["models"], key=lambda m: m["output"], default=None)
+        spans = [
+            self.spans[s][1] - self.spans[s][0] for s in sessions if s in self.spans
+        ]
+        return {
+            "cost": round(summary["cost"], 2),
+            "input": summary["input"],
+            "output": summary["output"],
+            "cache_read": summary["cache_read"],
+            "cache_write": summary["cache_write"],
+            "turns": turns,
+            "sessions": len(sessions),
+            "longest_session_s": round(max(spans, default=0)),
+            "active_days": active,
+            "days": n,
+            "longest_streak": streak,
+            "current_streak": current,
+            "busiest": {"date": best[0], "out": best[1]} if best else None,
+            "favorite": favorite["model"] if favorite else None,
+            "models": summary["models"],
+        }
+
+    def _streak_before(self, last: date) -> int:
+        """Today without work yet doesn't break the streak that ended yesterday."""
+        run, day = 0, last - timedelta(days=1)
+        while (d := self.days.get(day.isoformat())) and d.costs:
+            run, day = run + 1, day - timedelta(days=1)
+        return run
 
     def result(self, names: dict[str, str]) -> dict[str, Any]:
-        rows = [
-            {"date": d, **v, "cost": round(v["cost"], 4)} for d, v in self.days.items()
-        ]
+        today = date.today()
+        month_from = today - timedelta(days=PERIOD_DAYS - 1)
+        week_from = today - timedelta(days=6)
+        active = sorted(k for k, d in self.days.items() if d.costs)
+        first = date.fromisoformat(active[0]) if active else today
+        # The heatmap: whole weeks back to the first activity, at least half a year.
+        grid_from = min(first, today - timedelta(weeks=HEATMAP_MIN_WEEKS))
+        grid_from -= timedelta(days=grid_from.weekday())
 
-        def window(n: int, key: str) -> dict[str, Any]:
-            part = rows[-n:]
+        def row(key: str) -> dict[str, Any]:
+            d = self.days.get(key)
             return {
-                "cost": round(sum(r["cost"] for r in part), 2),
-                "out": sum(r["out"] for r in part),
-                "turns": sum(r["turns"] for r in part),
-                "sessions": len(self.sessions[key]),
+                "date": key,
+                "cost": round(sum(d.costs.values()), 4) if d else 0.0,
+                "out": d.out if d else 0,
+                "turns": d.turns if d else 0,
             }
 
+        def span(start: date) -> list[dict[str, Any]]:
+            n = (today - start).days + 1
+            return [row((start + timedelta(days=i)).isoformat()) for i in range(n)]
+
+        week_cost: dict[str, float] = {}
+        for i in range(7):
+            d = self.days.get((week_from + timedelta(days=i)).isoformat())
+            for sid, cost in d.costs.items() if d else ():
+                week_cost[sid] = week_cost.get(sid, 0.0) + cost
         named = sorted(
-            ((names[s], c) for s, c in self.chats.items() if s in names),
+            ((names[s], c) for s, c in week_cost.items() if s in names),
             key=lambda x: -x[1],
         )
-        rest = sum(c for s, c in self.chats.items() if s not in names)
+        rest = sum(c for s, c in week_cost.items() if s not in names)
         rest += sum(c for _n, c in named[TOP_CHATS:])
+        windows = {
+            "today": self._window(today, today),
+            "week": self._window(week_from, today),
+            "month": self._window(month_from, today),
+            "all": self._window(first, today),
+        }
         return {
-            "days": rows,
-            "today": window(1, "today"),
-            "week": window(7, "week"),
-            "month": window(PERIOD_DAYS, "month"),
-            "models": self.models.summary()["models"],
-            "week_models": self.week_models.summary()["models"],
+            "days": span(month_from),
+            "heatmap": span(grid_from),
+            "today": windows["today"],
+            "week": windows["week"],
+            "month": windows["month"],
+            "all": windows["all"],
+            "models": windows["month"]["models"],
             "chats": [{"name": n, "cost": round(c, 2)} for n, c in named[:TOP_CHATS]],
             "chats_rest": round(rest, 2),
             "as_of": time.time(),
@@ -310,7 +375,7 @@ class _Period:
 
 
 def period_stats(private_root: Path, names: dict[str, str]) -> dict[str, Any]:
-    """Cost per day for 30 days, windows (today / 7 / 30 days), models, chats.
+    """Everything the transcripts still hold: per day, windows, heatmap, chats.
 
     ``names`` maps a session id to its chat name; other sessions (SSH, cron
     jobs, headless helpers) are summed as one "other" row.
@@ -318,14 +383,11 @@ def period_stats(private_root: Path, names: dict[str, str]) -> dict[str, Any]:
     period = _Period()
     for project in _project_dirs(private_root):
         for file in project.glob("**/*.jsonl"):
-            try:
-                if file.stat().st_mtime < period.since:
-                    continue
-            except OSError:
-                continue
             # subagents/agent-*.jsonl belong to the session dir above them
             sub = file.parent.name == "subagents"
-            period.add_file(file, file.parent.parent.name if sub else file.stem)
+            period.add_file(
+                file, file.parent.parent.name if sub else file.stem, not sub
+            )
     return period.result(names)
 
 

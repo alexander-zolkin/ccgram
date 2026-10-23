@@ -345,6 +345,7 @@ const state = {
   paneTimer: null,
   attachments: [],
   pending: new Map(),     // session id → {text, at} shown until the transcript has it
+  actWin: "all",          // «Активность» window in the statistics sheet
   providers: null,          // [{id, name, models, default}]
   provider: store.get("kara-provider") || "claude",
   model: store.get("kara-model") || "",
@@ -2846,16 +2847,72 @@ function statsHtml(d) {
       ${modelTable(c.models)}</section>`);
   }
   if (p) {
-    const w = (x, label) => tile(usd(x.cost), `${label} · ${x.turns} ${pluralRu(x.turns, "ход", "хода", "ходов")} · ${tokRu(x.out)} ток.`);
+    const w = (x, label) => tile(usd(x.cost), `${label} · ${x.turns} ${pluralRu(x.turns, "ход", "хода", "ходов")} · ${tokRu(x.output)} ток.`);
     out.push(`<section class="st-sec"><h3>Все чаты</h3>
       <div class="st-tiles">${w(p.today, "сегодня")}${w(p.week, "7 дней")}${w(p.month, "30 дней")}</div>
       ${usageChart(p.days, { val: (x) => x.cost, fmt: usd, unit: " по API", label: "Стоимость по ценам API по дням за 30 дней" })}
       <div class="u-cols st-cols"><div><div class="hub-label">Модели за 30 дней</div>${modelTable(p.models)}</div>
       <div><div class="hub-label">Дороже всего за неделю</div>${p.chats.length ? `<ul class="u-chats">${p.chats.map((x) => `<li><span>${esc(x.name)}</span><span class="u-num">${usd(x.cost)}</span><span class="u-share"><i style="width:${Math.max(3, (x.cost / (p.chats[0].cost || 1)) * 100)}%"></i></span></li>`).join("")}${p.chats_rest ? `<li><span class="muted">Остальное (SSH, фоновые задачи)</span><span class="u-num">${usd(p.chats_rest)}</span></li>` : ""}</ul>` : '<div class="muted">За неделю чаты не работали</div>'}</div></div></section>`);
   }
+  if (p?.heatmap) out.push(`<section class="st-sec"><div class="st-head"><h3>Активность</h3><div class="seg" role="tablist">${ACT_WINDOWS.map(([k, label]) => `<button type="button" data-win="${k}"${k === state.actWin ? ' class="on"' : ""}>${label}</button>`).join("")}</div></div>
+    <div class="st-scroll">${heatmapSvg(p.heatmap)}</div>
+    <div class="hm-legend">Меньше <i class="hm-key l0"></i><i class="hm-key l1"></i><i class="hm-key l2"></i><i class="hm-key l3"></i><i class="hm-key l4"></i> Больше</div>
+    <div class="act-stats"></div></section>`);
   out.push('<p class="st-note">«По ценам API» — сколько стоила бы та же работа без подписки, по тарифам Anthropic. По подписке платишь фиксированно; расход подписки — в лимитах выше. Приватные чаты не считаются.</p>');
   return `<div class="stats">${out.join("")}</div>`;
 }
+// «Активность»: Claude Code's /stats overview — a year of days, and the
+// favourite model, streaks, the busiest day for the chosen window.
+const ACT_WINDOWS = [["all", "Всё время"], ["month", "30 дней"], ["week", "7 дней"]];
+const MONTH_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
+function heatmapSvg(days) {
+  const cell = 11, step = 13, left = 24, top = 16;
+  const weeks = Math.ceil(days.length / 7);
+  const W = left + weeks * step, H = top + 7 * step;
+  const vals = days.map((d) => d.out).filter((v) => v > 0).sort((a, b) => a - b);
+  const q = (f) => (vals.length ? vals[Math.min(vals.length - 1, Math.floor(f * vals.length))] : 0);
+  const cuts = [q(0.25), q(0.5), q(0.75)];
+  const level = (v) => (!v ? 0 : v <= cuts[0] ? 1 : v <= cuts[1] ? 2 : v <= cuts[2] ? 3 : 4);
+  let svg = [["пн", 0], ["ср", 2], ["пт", 4]].map(([t, r]) => `<text class="hm-t" x="0" y="${top + r * step + 9}">${t}</text>`).join("");
+  let month = -1;
+  days.forEach((d, i) => {
+    const w = Math.floor(i / 7), wd = i % 7;
+    const dt = new Date(`${d.date}T12:00:00`);
+    if (wd === 0 && dt.getMonth() !== month) {
+      month = dt.getMonth();
+      if (w < weeks - 1) svg += `<text class="hm-t" x="${left + w * step}" y="10">${MONTH_SHORT[month]}</text>`;
+    }
+    const when = `${WEEKDAY[dt.getDay()]} ${dt.toLocaleDateString("ru-RU", { day: "numeric", month: "short" })}`;
+    const tip = d.out ? `${when} · ${tokRu(d.out)} токенов · ${usd(d.cost)} · ${d.turns} ${pluralRu(d.turns, "ход", "хода", "ходов")}` : `${when} · без работы`;
+    svg += `<rect class="hm l${level(d.out)}" x="${left + w * step}" y="${top + wd * step}" width="${cell}" height="${cell}" rx="2.5" data-tip="${esc(tip)}"/>`;
+  });
+  return `<svg class="heatmap" viewBox="0 0 ${W} ${H}" style="max-width:${W * 1.6}px" role="img" aria-label="Активность по дням">${svg}</svg>`;
+}
+function daysRu(n) { return `${n} ${pluralRu(n, "день", "дня", "дней")}`; }
+function actStatsHtml(x) {
+  if (!x) return "";
+  const total = x.input + x.output + x.cache_read + x.cache_write;
+  const busiest = x.busiest ? new Date(`${x.busiest.date}T12:00:00`).toLocaleDateString("ru-RU", { day: "numeric", month: "long" }) : "—";
+  const flights = x.longest_session_s / (8.5 * 3600);
+  return `<div class="act-grid">
+    <div><span>Любимая модель</span><b>${x.favorite ? esc(modelRu(x.favorite)) : "—"}</b></div>
+    <div><span>Всего токенов</span><b>${tokRu(total)}</b></div>
+    <div><span>Сессий</span><b>${x.sessions}</b></div>
+    <div><span>Самая длинная сессия</span><b>${secsRu(x.longest_session_s)}</b></div>
+    <div><span>Активных дней</span><b>${x.active_days} из ${x.days}</b></div>
+    <div><span>Самая длинная серия</span><b>${daysRu(x.longest_streak)}</b></div>
+    <div><span>Самый активный день</span><b>${busiest}</b></div>
+    <div><span>Текущая серия</span><b>${daysRu(x.current_streak)}</b></div>
+  </div>
+  <p class="st-line muted">Ввод ${tokRu(x.input)} · вывод ${tokRu(x.output)} · кэш: чтение ${tokRu(x.cache_read)}, запись ${tokRu(x.cache_write)} · ≈ ${usd(x.cost)} по ценам API${flights >= 2 ? ` · самая длинная сессия — как ${Math.round(flights)} ${pluralRu(Math.round(flights), "перелёт", "перелёта", "перелётов")} Москва — Владивосток` : ""}</p>`;
+}
+function renderActStats(p) {
+  const box = $("sheet-body").querySelector(".act-stats");
+  if (!box) return;
+  box.innerHTML = actStatsHtml(p[state.actWin]);
+  $("sheet-body").querySelectorAll(".seg [data-win]").forEach((b) => b.classList.toggle("on", b.dataset.win === state.actWin));
+}
+
 async function openStats() {
   state.sheetPath = null;
   $("sheet-frame").hidden = true;
@@ -2868,6 +2925,12 @@ async function openStats() {
   try { data = await api(`/api/stats${tid != null ? `?tid=${tid}` : ""}`); } catch (e) { body.innerHTML = `<div class="stats"><p class="muted">${esc(e.message)}</p></div>`; return; }
   if ($("sheet").hidden || $("sheet-title").textContent !== "Статистика") return;
   body.innerHTML = statsHtml(data);
+  if (data.period) {
+    renderActStats(data.period);
+    body.querySelectorAll(".seg [data-win]").forEach((b) => { b.onclick = () => { state.actWin = b.dataset.win; renderActStats(data.period); }; });
+    const hm = body.querySelector(".heatmap")?.parentElement;
+    if (hm) hm.scrollLeft = hm.scrollWidth; // today is on the right
+  }
   body.querySelector('[data-act="refresh"]').onclick = async (ev) => {
     ev.currentTarget.disabled = true;
     await fetchLimits(true);
