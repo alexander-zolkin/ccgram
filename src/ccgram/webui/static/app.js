@@ -1450,7 +1450,7 @@ async function openSession(tid, { keep = false } = {}) {
     $("thread").appendChild(buildBlocks(data.items, null));
     if (data.source === "backup") {
       const s = sessionById(tid);
-      $("thread").prepend(el("div", "backup-note", `${esc(s?.device_name || "Устройство")} не в сети — это копия переписки с сервера, она может отставать.`));
+      $("thread").prepend(el("div", "backup-note", `${esc(s ? devLabel(s) : "Устройство")} не в сети — это копия переписки с сервера, она может отставать.`));
     }
     if (!data.items.length) {
       const s = sessionById(tid);
@@ -1540,14 +1540,20 @@ const SESSION_KINDS = [
   ["asleep", "Спят", "Сессия выгружена, проснётся по сообщению", (s) => s.state === "dead"],
 ];
 state.kind = store.get("kara-kind") || "all";
-// Device filters come from the sessions themselves: «N100» = this server.
+// Device filters come from the sessions themselves: «N100» = this server;
+// a device with two sides gets one per side («ПК · WSL», «ПК · Windows»).
 function kindsWithDevices() {
-  const devs = new Map();
-  for (const s of state.sessions) if (s.remote) devs.set(s.device, s.device_name);
+  const devs = new Map(); // "pc" or "pc/windows" → [label, test]
+  for (const s of state.sessions) {
+    if (!s.remote || s.device === state.homeDevice) continue;
+    const env = s.env || "linux";
+    const key = s.env_name ? `${s.device}/${env}` : s.device;
+    if (!devs.has(key)) devs.set(key, [devLabel(s), (x) => x.device === s.device && (!s.env_name || (x.env || "linux") === env)]);
+  }
   if (!devs.size) return SESSION_KINDS;
   const home = (s) => !s.remote || s.device === state.homeDevice;
   return [...SESSION_KINDS, ["dev:local", "N100", "Этот сервер", home],
-    ...[...devs].filter(([id]) => id !== state.homeDevice).map(([id, name]) => [`dev:${id}`, name, "Сессии этого устройства", (s) => s.device === id])];
+    ...[...devs].sort(([a], [b]) => a.localeCompare(b)).map(([key, [name, test]]) => [`dev:${key}`, name, "Сессии этого устройства", test])];
 }
 $("kind-btn").onclick = () => {
   const b = $("kind-btn");
@@ -1795,7 +1801,7 @@ function setTitle(base) {
 // and the session runs inside tmux (the kara-node wrapper).
 function syncRemoteComposer(s) {
   const ro = Boolean(s && s.remote) && (!s.online || !s.writable);
-  const why = !ro ? "" : !s.online ? `«${s.device_name}» не в сети — только чтение` : "Сессия запущена не через обёртку (не в tmux) — только чтение";
+  const why = !ro ? "" : !s.online ? `«${devLabel(s)}» не в сети — только чтение` : "Сессия запущена не через обёртку (не в tmux) — только чтение";
   $("composer").classList.toggle("readonly", ro);
   $("input").disabled = ro;
   if (ro) $("input").placeholder = why;
