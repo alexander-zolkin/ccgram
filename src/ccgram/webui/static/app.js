@@ -1506,7 +1506,7 @@ function sessionById(id) { return state.sessions.find((s) => s.thread_id === id)
 
 function tgLink(s) {
   if (!s || s.web_only || !s.chat_id) return null;
-  return `https://t.me/c/${String(s.chat_id).replace(/^-100/, "")}/${s.thread_id}`;
+  return `https://t.me/c/${String(s.chat_id).replace(/^-100/, "")}/${s.tg_thread || s.thread_id}`;
 }
 
 function groupOf(ts) {
@@ -1643,8 +1643,8 @@ function sessionItem(s) {
 }
 
 function sessionMenu(s, item) {
-  // Kara Hub: Telegram actions arrive with the ccgram adapter (HUB-PLAN step 3).
-  if (s.remote) {
+  // The old web, a session of another machine: it can only read and type there.
+  if (isRemote(s)) {
     return [
       { heading: `${s.device_name} · ${s.online ? "в сети" : "не в сети"}` },
       { label: "Копировать путь", sub: s.cwd, icon: SVG.folder, action: () => copyText(s.cwd) },
@@ -1658,7 +1658,9 @@ function sessionMenu(s, item) {
   const link = tgLink(s);
   if (link) items.push({ label: "Открыть в Telegram", icon: SVG.tg, href: link });
   if (!s.web_only) items.push({ label: "Убрать из Telegram", sub: "Топик удалится, чат останется здесь", icon: SVG.unlink, action: () => detachSession(s) });
-  items.push("sep", { label: "Удалить", icon: SVG.trash, danger: true, action: () => deleteSession(s) });
+  if (s.cwd) items.push({ label: "Копировать путь", sub: s.cwd, icon: SVG.folder, action: () => copyText(s.cwd) });
+  // Kara Hub can end only a chat ccgram owns (with a topic) for now.
+  if (!s.remote || !s.web_only) items.push("sep", { label: "Удалить", icon: SVG.trash, danger: true, action: () => deleteSession(s) });
   return items;
 }
 
