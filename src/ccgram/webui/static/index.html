@@ -149,15 +149,15 @@
           <button id="model-btn" type="button" class="model-btn" hidden><span id="model-name">Модель</span>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
           </button>
-          <button id="mic-btn" type="button" class="mic-btn" hidden aria-label="Голосом" data-tip="Надиктовать сообщение">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
-            <span id="mic-time"></span>
-          </button>
           <button id="sess-effort-btn" type="button" class="model-btn sess-effort" hidden data-tip="Усилие этой сессии: сколько модель думает">
             <svg class="effort-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 18a8 8 0 1 1 16 0"/><path d="M12 18l4-6"/></svg>
             <span id="sess-effort-name"></span>
           </button>
           <button id="mode-btn" type="button" class="mode-chip" hidden data-tip="Режим Claude Code — нажми, чтобы переключить (Shift+Tab)"></button>
+          <button id="mic-btn" type="button" class="mic-btn" hidden aria-label="Голосом" data-tip="Надиктовать сообщение">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+            <span id="mic-time"></span>
+          </button>
           <button id="send-btn" type="submit" class="send-btn" disabled aria-label="Отправить">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
           </button>
@@ -234,6 +234,7 @@
 </dialog>
 <div id="toast" class="toast" hidden></div>
 <div id="lightbox" class="lightbox" hidden>
+  <div class="lb-backdrop"></div>
   <img alt="">
   <div class="lb-bar"><a class="lb-open" target="_blank" rel="noopener">Открыть отдельно</a><button type="button" class="lb-close" aria-label="Закрыть"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
 </div>

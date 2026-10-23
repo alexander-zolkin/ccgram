@@ -757,21 +757,110 @@ function thumb(src, alt = "") {
   img.alt = alt;
   img.src = src;
   img.onerror = () => img.replaceWith(el("span", "img-gone", `🖼 ${esc(alt || "картинка недоступна")}`));
-  img.onclick = (ev) => { ev.stopPropagation(); openImage(src, alt); };
+  img.onclick = (ev) => { ev.stopPropagation(); openImage(src, alt, img); };
   return img;
 }
 
-function openImage(src, alt = "") {
-  const box = $("lightbox");
-  box.querySelector("img").src = src;
-  box.querySelector("img").alt = alt;
-  box.querySelector(".lb-open").href = src;
-  box.hidden = false;
-  replay(box, "fade");
+// The lightbox zooms the picture out of its thumbnail and back into it
+// (FLIP: the full-size image starts scaled and clipped onto the thumbnail's
+// rect). On touch screens a vertical swipe sends it back too.
+const LB_EASE = "cubic-bezier(.2,.9,.25,1)";
+function lbFrom(thumbEl, img) {
+  if (!thumbEl || !thumbEl.isConnected) return null;
+  const t = thumbEl.getBoundingClientRect();
+  const f = img.getBoundingClientRect();
+  if (!t.width || !f.width || t.bottom < 0 || t.top > innerHeight) return null;
+  // Uniform scale that covers the thumbnail, cropped to it by the clip.
+  const s = Math.max(t.width / f.width, t.height / f.height);
+  const ix = Math.max(0, (f.width - t.width / s) / 2);
+  const iy = Math.max(0, (f.height - t.height / s) / 2);
+  return {
+    transform: `translate(${t.left + t.width / 2 - (f.left + f.width / 2)}px, ${t.top + t.height / 2 - (f.top + f.height / 2)}px) scale(${s})`,
+    clipPath: `inset(${iy}px ${ix}px round ${10 / s}px)`,
+  };
 }
-function closeImage() { $("lightbox").hidden = true; $("lightbox").querySelector("img").removeAttribute("src"); }
-$("lightbox").addEventListener("click", (ev) => { if (!ev.target.closest(".lb-open")) closeImage(); });
+
+async function openImage(src, alt = "", thumbEl = null) {
+  const box = $("lightbox");
+  const img = box.querySelector("img");
+  img.getAnimations().forEach((a) => a.cancel());
+  img.style.transform = "";
+  img.src = src;
+  img.alt = alt;
+  box.querySelector(".lb-open").href = src;
+  state.lb = { thumb: thumbEl };
+  try { await img.decode(); } catch (_) { /* shown as is */ }
+  box.hidden = false;
+  const from = reducedMotion() ? null : lbFrom(thumbEl, img);
+  const fade = [{ opacity: 0 }, { opacity: 1 }];
+  box.querySelector(".lb-backdrop").animate(fade, { duration: 260, easing: "ease-out" });
+  box.querySelector(".lb-bar").animate(fade, { duration: 260, easing: "ease-out" });
+  if (from) {
+    thumbEl.style.visibility = "hidden";
+    img.animate([from, { transform: "none", clipPath: "inset(0px 0px round 6px)" }], { duration: 320, easing: LB_EASE });
+  } else img.animate([{ opacity: 0, transform: "scale(.96)" }, { opacity: 1, transform: "none" }], { duration: 200, easing: "ease-out" });
+}
+
+async function closeImage() {
+  const box = $("lightbox");
+  if (box.hidden || state.lb?.closing) return;
+  const img = box.querySelector("img");
+  const lb = state.lb || {};
+  lb.closing = true;
+  const drag = img.style.transform || "none";
+  const to = reducedMotion() ? null : lbFrom(lb.thumb, img);
+  const fade = [{ opacity: Number(getComputedStyle(box.querySelector(".lb-backdrop")).opacity) }, { opacity: 0 }];
+  const ms = to ? 260 : 180;
+  box.querySelector(".lb-backdrop").animate(fade, { duration: ms, easing: "ease-in", fill: "forwards" });
+  box.querySelector(".lb-bar").animate(fade, { duration: ms, fill: "forwards" });
+  const anim = to
+    ? img.animate([{ transform: drag, clipPath: "inset(0px 0px round 6px)" }, to], { duration: ms, easing: LB_EASE, fill: "forwards" })
+    : img.animate([{ transform: drag, opacity: 1 }, { transform: `${drag === "none" ? "" : drag} scale(.94)`, opacity: 0 }], { duration: ms, easing: "ease-in", fill: "forwards" });
+  try { await anim.finished; } catch (_) { /* cancelled */ }
+  if (lb.thumb) lb.thumb.style.visibility = "";
+  box.hidden = true;
+  box.querySelectorAll(".lb-backdrop, .lb-bar, img").forEach((n) => n.getAnimations().forEach((a) => a.cancel()));
+  img.style.transform = "";
+  img.removeAttribute("src");
+  state.lb = null;
+}
+$("lightbox").addEventListener("click", (ev) => {
+  if (ev.target.closest(".lb-open")) return;
+  if (state.lb?.dragged) { state.lb.dragged = false; return; }
+  closeImage();
+});
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("lightbox").hidden) { ev.stopImmediatePropagation(); closeImage(); } }, true);
+// Swipe up or down to dismiss: the picture follows the finger, the backdrop fades.
+(() => {
+  const box = $("lightbox");
+  const img = box.querySelector("img");
+  const back = box.querySelector(".lb-backdrop");
+  let start = null;
+  box.addEventListener("pointerdown", (ev) => {
+    if (ev.pointerType === "mouse" || !state.lb || state.lb.closing) return;
+    start = { x: ev.clientX, y: ev.clientY };
+  });
+  box.addEventListener("pointermove", (ev) => {
+    if (!start || !state.lb) return;
+    const dx = ev.clientX - start.x;
+    const dy = ev.clientY - start.y;
+    if (Math.abs(dy) < 6 && !state.lb.dragged) return;
+    state.lb.dragged = true;
+    img.style.transform = `translate(${dx * 0.4}px, ${dy}px) scale(${1 - Math.min(0.25, Math.abs(dy) / 1200)})`;
+    back.style.opacity = String(Math.max(0.15, 1 - Math.abs(dy) / 400));
+  });
+  const end = () => {
+    if (!start || !state.lb) { start = null; return; }
+    const dy = Number((img.style.transform.match(/translate\([^,]+,\s*(-?[\d.]+)px/) || [])[1] || 0);
+    start = null;
+    if (Math.abs(dy) > 90) { back.style.opacity = ""; closeImage(); return; }
+    img.animate([{ transform: img.style.transform || "none" }, { transform: "none" }], { duration: 180, easing: LB_EASE });
+    img.style.transform = "";
+    back.style.opacity = "";
+  };
+  box.addEventListener("pointerup", end);
+  box.addEventListener("pointercancel", end);
+})();
 
 function stepImages(node) {
   const refs = node._tool.result?.imgs || [];
@@ -3430,7 +3519,7 @@ const MSG_STATUS = {
   sent: ["в терминале", "Сервер вписал сообщение в Claude Code, но модель его ещё не взяла (обычно секунда-две)"],
   queued: ["в очереди", "Кара сейчас работает: Claude Code отдаст ей сообщение на следующем шаге, работу не прерывает"],
   read: ["получено", "Сообщение у модели — оно в транскрипте сессии"],
-  working: ["Кара работает", "Сообщение у модели, она работает над ним"],
+  working: ["в работе", "Сообщение у модели, она работает над ним"],
 };
 function refreshMsgStatus() {
   const thread = $("thread");
