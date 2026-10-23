@@ -77,6 +77,13 @@ class TestRenderedText:
 
 
 class TestCursorPosition:
+    def test_capture_pane_rows_start_at_column_zero(self):
+        # tmux capture-pane ends rows with a bare LF; fed as is, each row
+        # started where the one above ended and the spinner line was lost.
+        buf = ScreenBuffer(columns=40, rows=5)
+        buf.feed("● reply line\n✻ Working… (3s)\n" + "─" * 40 + "\n❯ ")
+        assert buf.display[:4] == ["● reply line", "✻ Working… (3s)", "─" * 40, "❯"]
+
     def test_cursor_after_text(self):
         buf = ScreenBuffer(columns=40, rows=5)
         buf.feed("hello")

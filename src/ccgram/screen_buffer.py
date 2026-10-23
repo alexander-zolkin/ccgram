@@ -7,10 +7,15 @@ Used by terminal_parser.py for robust status and interactive UI detection.
 Key class: ScreenBuffer — create, feed raw text, read rendered lines.
 """
 
+import re
+
 import structlog
 import pyte
 
 logger = structlog.get_logger()
+
+
+_BARE_LF = re.compile(r"(?<!\r)\n")
 
 
 class ScreenBuffer:
@@ -34,9 +39,15 @@ class ScreenBuffer:
         return self._screen.lines
 
     def feed(self, raw_text: str) -> None:
-        """Feed raw terminal text (with ANSI escapes) into the screen."""
+        """Feed raw terminal text (with ANSI escapes) into the screen.
+
+        ``tmux capture-pane`` ends rows with a bare LF, which pyte takes as
+        "down one row, same column": every row then started where the one
+        above ended and the screen came out sheared — the status line was
+        missed or a reply's line was read as one. A bare LF is a CRLF here.
+        """
         try:
-            self._stream.feed(raw_text)
+            self._stream.feed(_BARE_LF.sub("\r\n", raw_text))
         except (TypeError, ValueError, KeyError, IndexError, UnicodeDecodeError):
             logger.debug("pyte feed error, resetting screen", exc_info=True)
             self._screen.reset()
