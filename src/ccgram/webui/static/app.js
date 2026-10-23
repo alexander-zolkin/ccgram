@@ -3531,8 +3531,16 @@ function syncLiveRow() {
   if ($("working-meta").dataset.tip) row.dataset.tip = $("working-meta").dataset.tip;
 }
 $("live-row").onclick = () => {
-  const st = [...$("thread").querySelectorAll(".steps:not(.thought-only)")].pop();
-  if (st) { st.classList.add("open"); st.scrollIntoView({ block: "nearest", behavior: "smooth" }); }
+  // This turn's steps only: the card after the human's last message. An older
+  // card (an earlier turn) would just throw the view up the thread.
+  const kids = [...$("thread").children];
+  const since = kids.map((n) => n.classList.contains("u-msg")).lastIndexOf(true);
+  const st = kids.slice(since + 1).reverse().find((n) => n.classList.contains("steps") && !n.classList.contains("thought-only"));
+  if (!st) { toast("В этом ходе ещё нет шагов — Кара думает"); return; }
+  const stick = nearBottom();
+  st.classList.toggle("open");
+  if (stick) toBottom();
+  else st.scrollIntoView({ block: "nearest", behavior: "smooth" });
 };
 
 function tickWork() {
