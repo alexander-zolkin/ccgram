@@ -731,7 +731,7 @@ async function rewindTo(it, { edit = false, files = false, back = false, send = 
     state.pending.delete(tid);
     await openSession(tid);
     $("input").value = res.text || "";
-    store.set(draftKey(), $("input").value);
+    setDraft(draftId(), $("input").value);
     autosize();
     $("input").focus();
     toast(res.relaunched ? "Откатила. Сообщение — в поле ввода" : "Откатила — сессия проснётся уже с этого места");
@@ -2237,7 +2237,54 @@ function composeMessage() {
   return [...files, text].filter(Boolean).join("\n\n");
 }
 
-const draftKey = () => `kara-draft-${state.current ?? state.draft ?? "new"}`;
+// ═══ drafts ═════════════════════════════════════════════════════════════════
+// What is typed in the composer, per chat ("new" for the home one): kept on
+// this device and, on the hub, for every device — a reload or another device
+// picks it up. The newer write wins; a page that is typing into the same
+// chat right now keeps its own text (its next save wins anyway).
+const draftId = () => String(state.current ?? state.draft ?? "new");
+const draftKey = () => `kara-draft-${draftId()}`;
+const draftTs = (id) => Number(store.get(`kara-draft-ts-${id}`) || 0);
+const draftSynced = (id) => !id.startsWith("c-"); // a chat still being created stays local
+const draftTimers = new Map();
+function setDraft(id, text, { ts = Date.now(), sync = true } = {}) {
+  store.set(`kara-draft-${id}`, text);
+  store.set(`kara-draft-ts-${id}`, String(ts));
+  if (!sync || !draftSynced(id)) return;
+  clearTimeout(draftTimers.get(id));
+  draftTimers.set(id, setTimeout(() => pushDraft(id), 700));
+}
+function pushDraft(id) {
+  clearTimeout(draftTimers.get(id));
+  draftTimers.delete(id);
+  // keepalive: the last keystrokes still go out when the page is closing
+  fetch("/api/drafts", {
+    method: "POST", credentials: "same-origin", keepalive: true,
+    headers: { "Content-Type": "application/json", "X-CCGram": "1" },
+    body: JSON.stringify({ key: id, text: store.get(`kara-draft-${id}`) || "", ts: draftTs(id), client: clientId }),
+  }).catch(() => {});
+}
+const flushDrafts = () => { for (const id of [...draftTimers.keys()]) pushDraft(id); };
+addEventListener("pagehide", flushDrafts);
+document.addEventListener("visibilitychange", () => { if (document.hidden) flushDrafts(); });
+async function pullDrafts() {
+  let drafts = {};
+  try { drafts = (await api("/api/drafts")).drafts || {}; } catch (_) { return; } // no hub: local only
+  let here = false;
+  for (const [id, d] of Object.entries(drafts)) {
+    if (d.ts <= draftTs(id)) continue;
+    setDraft(id, d.text, { ts: d.ts, sync: false });
+    here = here || id === draftId();
+  }
+  if (here && document.activeElement !== $("input")) loadDraft();
+}
+function onDraftEvent(e) {
+  if (e.client === clientId || e.ts <= draftTs(e.key)) return;
+  const open = draftId() === e.key;
+  const typing = open && document.activeElement === $("input") && $("input").value !== (store.get(draftKey()) || "");
+  setDraft(e.key, e.text, { ts: e.ts, sync: false });
+  if (open && !typing) loadDraft();
+}
 function loadDraft() {
   $("input").value = store.get(draftKey()) || "";
   autosize();
@@ -2245,7 +2292,7 @@ function loadDraft() {
 
 function clearComposer() {
   $("input").value = "";
-  store.set(draftKey(), "");
+  setDraft(draftId(), "");
   state.attachments = [];
   renderAttachments();
 }
@@ -2425,7 +2472,7 @@ function dropDraft(d) {
   state.drafts.delete(d.key);
   saveDrafts();
   store.set(`kara-draft-${d.key}`, "");
-  store.set("kara-draft-new", [d.text, ...d.queue.map((m) => m.text)].join("\n\n"));
+  setDraft("new", [d.text, ...d.queue.map((m) => m.text)].join("\n\n"));
   location.hash = "#new";
 }
 
@@ -2488,7 +2535,7 @@ async function adoptDraft(d, res) {
   // Whatever was typed here meanwhile belongs to the chat now.
   const typed = store.get(`kara-draft-${d.key}`);
   store.set(`kara-draft-${d.key}`, "");
-  if (typed) store.set(`kara-draft-${tid}`, typed);
+  if (typed) setDraft(String(tid), typed);
   if (state.draft === d.key) {
     startInflight(tid);
     state.turnClock.start = d.at; // the clock keeps running from the click
@@ -2606,6 +2653,8 @@ function connect() {
       notify(sessionById(e.thread_id), e);
     } else if (e.type === "resync" && state.current != null) {
       openSession(state.current);
+    } else if (e.type === "draft") {
+      onDraftEvent(e);
     }
   };
 }
@@ -3007,6 +3056,7 @@ async function boot(me) {
   offerPasskey();
   reportPresence();
   refreshPushState();
+  pullDrafts();
   api("/api/settings").then((r) => {
     state.tgMuted = r.tg_muted;
     state.tgRelay = r.tg_relay || "all";
@@ -3042,7 +3092,7 @@ $("input").addEventListener("input", () => {
     else if (v.startsWith(j.text)) $("input").value = v.slice(j.text.length).replace(/^\s+/, "");
   }
   autosize();
-  store.set(draftKey(), $("input").value);
+  setDraft(draftId(), $("input").value);
 });
 $("input").addEventListener("keydown", (ev) => {
   if (handleFormatKey(ev)) return;
