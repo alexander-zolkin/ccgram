@@ -462,12 +462,13 @@ details.task-line[open] > summary { margin-bottom: 6px; }
 #effort-btn .effort-ico { width: 15px; height: 15px; }
 /* The new-chat row (device, folder, Telegram, effort, model) is wider than the
    768px composer. Chips keep their size and stay on one line; the model name
-   takes the squeeze, and labels drop out as the row narrows. */
+   takes the squeeze. A chosen effort reads from the gauge and the level word,
+   so «Усилие:» goes; in a narrow row the folder and Telegram chips go icon-only. */
 .composer-bar { container: cbar / inline-size; }
 .composer-bar .tool-btn { flex: none; white-space: nowrap; }
 .composer-bar .tool-btn svg { flex: none; }
 #effort-btn { flex: none; }
-@container cbar (max-width: 820px) { #effort-btn .lbl-long { display: none; } }
+#effort-btn.set .lbl-long { display: none; }
 @container cbar (max-width: 640px) { #tg-toggle-text, #cwd-name { display: none; } }
 .send-btn { width: 32px; height: 32px; border-radius: 9px; border: 0; background: var(--accent); color: #fff; cursor: pointer; display: grid; place-items: center; }
 .send-btn svg { width: 17px; height: 17px; }
