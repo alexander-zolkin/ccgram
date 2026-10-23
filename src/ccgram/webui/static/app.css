@@ -220,8 +220,11 @@ input:focus { border-color: var(--accent); }
 .a-msg { font: 16.5px/1.65 var(--serif); overflow-wrap: anywhere; padding: 0 2px; }
 .a-msg > :first-child { margin-top: 0; }
 .a-msg p { margin: 0 0 14px; }
-.a-update { font-size: 15px; color: var(--muted); }
+.a-update { font-size: 15px; color: var(--muted); border-left: 2px solid var(--border-strong); padding: 0 0 0 12px; margin-left: 2px; }
+.a-update::before { content: "размышления"; display: block; font: 11px var(--sans); letter-spacing: .04em; text-transform: uppercase; color: var(--faint); margin-bottom: 2px; }
+.a-update + .a-update::before { content: none; }
 .a-update p { margin: 0 0 8px; }
+.a-update > :last-child > :last-child { margin-bottom: 0; }
 .a-msg h1, .a-msg h2, .a-msg h3, .a-msg h4 { font-family: var(--serif); font-weight: 600; line-height: 1.3; margin: 22px 0 10px; }
 .a-msg h1 { font-size: 1.4em; } .a-msg h2 { font-size: 1.22em; } .a-msg h3, .a-msg h4 { font-size: 1.06em; }
 .a-msg ul, .a-msg ol { margin: 0 0 14px; padding-left: 26px; }
@@ -961,3 +964,9 @@ body.sheet-open { overflow: hidden; }
   .prompt-card:not([hidden]) ~ .live { max-height: 18vh; }
   .send-btn { flex: none; }
 }
+/* A reply in the middle of a turn keeps no room for its actions: they float
+   over the gap below it on hover / tap. The closing reply keeps its row. */
+.a-msg { position: relative; }
+.a-msg:not(.final):not(.last) .msg-actions { position: absolute; left: 2px; bottom: -30px; z-index: 3; background: var(--bg); border-radius: 9px; padding: 0 4px 0 6px; box-shadow: var(--shadow); pointer-events: none; }
+.a-msg:not(.final):not(.last):hover .msg-actions, .a-msg.show-act .msg-actions, .a-msg.menu-open .msg-actions { pointer-events: auto; }
+.a-msg:not(.final):not(.last) { padding-bottom: 0; }

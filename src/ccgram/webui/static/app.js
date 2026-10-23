@@ -1246,12 +1246,19 @@ async function fetchNew() {
   const tid = state.current;
   if (tid == null) return;
   if (!state.structured) { openSession(tid); return; }
+  // One read at a time from the cursor; a call meanwhile reads again after it.
+  if (state.fetching) { state.fetchAgain = true; return; }
+  state.fetching = true;
+  state.fetchAt = Date.now();
   try {
     const data = await api(`/api/sessions/${tid}/entries?after=${state.end}`);
     if (tid !== state.current) return;
     state.end = data.end;
     appendItems(data.items);
-  } catch (_) { /* next event retries */ }
+  } catch (_) { /* next event retries */ } finally {
+    state.fetching = false;
+    if (state.fetchAgain) { state.fetchAgain = false; scheduleFetch(); }
+  }
 }
 
 // ═══ sessions sidebar ═══════════════════════════════════════════════════════
@@ -1769,6 +1776,11 @@ async function pollPane() {
         renderLive(live, s);
         if (turnRunning(s) || runningAgents().length) refreshAgents(tid);
         if (s.provider === "claude" && (!state.modeAt || Date.now() - state.modeAt > 15000)) refreshMode(tid);
+        // The live feed may be down (a restart, a network change): the thread
+        // then follows the transcript from here; with the feed up, a check
+        // every 15 s catches anything an event missed.
+        const feedUp = state.es && state.es.readyState === EventSource.OPEN;
+        if (state.structured && (!feedUp || Date.now() - (state.fetchAt || 0) > 15000)) fetchNew();
         const inter = data.interactive;
         $("prompt-card").hidden = !inter;
         if (inter) renderPrompt(inter, data.text);
