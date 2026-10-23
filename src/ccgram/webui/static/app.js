@@ -1504,13 +1504,36 @@ function groupOf(ts) {
   return "Раньше";
 }
 
+// The sidebar filter (next to the search box), remembered per browser.
+const SESSION_KINDS = [
+  ["all", "Все чаты", "", () => true],
+  ["working", "Работают", "Идёт ход", (s) => turnRunning(s) || s.state === "active"],
+  ["waiting", "Ждут меня", "Закончили и ждут ответа", (s) => s.state === "idle" && !turnRunning(s)],
+  ["unread", "Непрочитанные", "Пришёл ответ, пока ты был в другом чате", (s) => state.unread.has(s.thread_id)],
+  ["pinned", "Закреплённые", "", (s) => s.pinned],
+  ["telegram", "С Telegram-топиком", "", (s) => !s.web_only],
+  ["web", "Только в вебе", "Без топика в Telegram", (s) => s.web_only],
+  ["asleep", "Спят", "Сессия выгружена, проснётся по сообщению", (s) => s.state === "dead"],
+];
+state.kind = store.get("kara-kind") || "all";
+$("kind-btn").onclick = () => {
+  const b = $("kind-btn");
+  openMenu([{ heading: "Показывать" }, ...SESSION_KINDS.map(([id, label, sub, test]) => ({
+    label, sub: `${sub ? `${sub} · ` : ""}${state.sessions.filter(test).length}`, check: id === (state.kind || "all"),
+    action: () => { state.kind = id; store.set("kara-kind", id); renderSessions(); },
+  }))], menuBelow(b), b);
+};
+
 function renderSessions() {
   // A rename in progress lives in its row: a rebuild would throw the input away.
   if (state.renaming) { state.renaming.stale = true; return; }
   const nav = $("session-list");
   const f = state.filter.trim().toLowerCase();
   nav.innerHTML = "";
-  const list = state.sessions.filter((s) => !f || s.name.toLowerCase().includes(f));
+  const kind = SESSION_KINDS.find(([id]) => id === state.kind) || SESSION_KINDS[0];
+  const list = state.sessions.filter((s) => (!f || s.name.toLowerCase().includes(f)) && kind[3](s));
+  $("kind-btn").classList.toggle("on", kind[0] !== "all");
+  $("kind-btn").dataset.tip = kind[0] === "all" ? "Какие чаты показывать" : `Показаны: ${kind[1].toLowerCase()}`;
   const pinned = list.filter((s) => s.pinned);
   if (pinned.length) {
     nav.appendChild(el("div", "group-label", "Закреплённые"));
@@ -1530,7 +1553,14 @@ function renderSessions() {
   }
   const hits = state.hits && state.hits.q === state.filter.trim() ? state.hits.results : [];
   if (hits.length) nav.appendChild(hitsBox(state.hits.q, hits));
-  else if (!list.length && !drafts.length) nav.appendChild(el("div", "group-label", f ? "Ничего не нашлось" : "Чатов пока нет"));
+  else if (!list.length && !drafts.length) nav.appendChild(el("div", "group-label", f || state.kind !== "all" ? "Ничего не нашлось" : "Чатов пока нет"));
+  if (state.kind && state.kind !== "all") {
+    const k = SESSION_KINDS.find(([id]) => id === state.kind);
+    const chip = el("button", "kind-chip", `${esc(k ? k[1] : state.kind)} <span>✕</span>`);
+    chip.type = "button";
+    chip.onclick = () => { state.kind = "all"; store.set("kara-kind", "all"); renderSessions(); };
+    nav.prepend(chip);
+  }
   renderHeader();
 }
 
