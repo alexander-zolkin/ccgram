@@ -19,6 +19,7 @@ IDLE_STATUS_TEXT = "\u2713 Ready"
 
 _WAITING_INPUT = "Waiting for input"
 _PLAN_APPROVAL = "Plan approval needed"
+_APPROVAL = "Approval needed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,13 +479,19 @@ def classify_wait_message(message: str) -> str | None:
         return None
     if stripped == "Claude is waiting for your input":
         return _WAITING_INPUT
+    # Newer Claude Code drops the tool name (and words a plan prompt its own
+    # way); unmatched, a waiting prompt raised no status line and no push.
+    if stripped == "Claude needs your permission":
+        return _APPROVAL
+    if stripped == "Claude Code needs your approval for the plan":
+        return _PLAN_APPROVAL
     prefix = "Claude needs your permission to use "
     if stripped.startswith(prefix):
         tool_name = stripped.removeprefix(prefix).strip()
         if tool_name == "Updated plan":
             return _PLAN_APPROVAL
         if tool_name:
-            return f"Approval needed: {tool_name}"
+            return f"{_APPROVAL}: {tool_name}"
     return None
 
 

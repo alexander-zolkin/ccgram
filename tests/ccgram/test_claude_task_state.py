@@ -439,6 +439,11 @@ class TestClassifyWaitMessage:
                 "Claude needs your permission to use Updated plan",
                 "Plan approval needed",
             ),
+            ("Claude needs your permission", "Approval needed"),
+            (
+                "Claude Code needs your approval for the plan",
+                "Plan approval needed",
+            ),
             ("something else", None),
         ],
     )
