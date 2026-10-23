@@ -1015,3 +1015,33 @@ class TestDetectRemoteControl:
         from ccgram.terminal_parser import detect_remote_control
 
         assert detect_remote_control([]) is False
+
+
+def test_finished_turn_line_is_not_a_running_spinner():
+    """«✻ Worked for 3m 30s · done 11:34 AM» closes a turn; nothing runs."""
+    sep = "─" * 60
+    for done in ("✻ Worked for 3m 30s · done 11:34 AM", "✻ Baked for 19s · done"):
+        pane = "\n".join(
+            [
+                "  Скрипт для пересчёта сохранила.",
+                "",
+                done,
+                "",
+                sep,
+                "❯ а сколько бы стоило на Sonnet 5.5?",
+                sep,
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ]
+        )
+        assert parse_status_block(pane) is None, done
+    running = "\n".join(
+        [
+            "✻ Combobulating… (12s · ↓ 2.1k tokens · esc to interrupt)",
+            "",
+            sep,
+            "❯ ",
+            sep,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+    )
+    assert "Combobulating" in (parse_status_block(running) or "")

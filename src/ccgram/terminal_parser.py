@@ -411,6 +411,7 @@ _NON_SPINNER_CHARS = frozenset("─│┌┐└┘├┤┬┴┼═║╔╗╚
 _SPINNER_CATEGORIES = frozenset({"So", "Sm"})
 _MAX_STATUS_PROGRESS_LINES = 8
 _PROGRESS_MARKS = frozenset("✔◼◻◔")
+_DONE_LINE = re.compile(r"·\s*done\b", re.IGNORECASE)
 _STATUS_PROGRESS_RE = re.compile(r"^\s*(?:⎿\s*)?[✔◼◻◔]\s+\S")
 
 
@@ -539,6 +540,13 @@ def _find_status_line_index(lines: list[str], scan_start: int) -> int | None:
             # notice, never the spinner line. Reading one as a spinner kept
             # idle topics "active" (🔄 updating…) indefinitely.
             if candidate[0] in _PROGRESS_MARKS:
+                break
+            # CCGRAM-HOTFIX:done-not-spinner — the line a finished turn leaves,
+            # "✻ Worked for 3m 30s · done 11:34 AM" (older: "✻ Baked for 19s ·
+            # done"), starts with a spinner glyph but nothing runs: a live
+            # spinner always carries "…". Read as one, idle topics stayed
+            # "active" and the web UI showed a turn in progress.
+            if _DONE_LINE.search(candidate) and "\u2026" not in candidate:
                 break
             if is_likely_spinner(candidate[0]):
                 return j
