@@ -1342,3 +1342,47 @@ class TestShutdownDrain:
             new=AsyncMock(side_effect=block_dispatch),
         ):
             await asyncio.wait_for(shutdown_workers(drain_timeout=0.3), timeout=5.0)
+
+
+class TestTelegramRelay:
+    """The web UI's «что слать в Telegram»: only the turn's end, or nothing."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        from ccgram import quiet_threads
+
+        quiet_threads.reset_for_testing()
+        yield
+        quiet_threads.reset_for_testing()
+
+    async def test_final_mode_drops_steps_and_keeps_the_final_reply(
+        self, bot, queue, lock
+    ) -> None:
+        from ccgram import quiet_threads
+        from ccgram.handlers.messaging_pipeline.message_queue import (
+            _handle_content_task,
+        )
+
+        quiet_threads.set_relay("final")
+        sent: list[str] = []
+
+        async def send(_client, _chat_id, text, *_a, **_kw):
+            sent.append(text)
+            return type("Sent", (), {"message_id": len(sent)})()
+
+        mod = "ccgram.handlers.messaging_pipeline.message_queue"
+        with patch(f"{mod}.rate_limit_send_message", send):
+            step = await _handle_content_task(bot, 1, _content_task("шаг"), queue, lock)
+            final = ContentTask(
+                window_id="@0",
+                parts=("итог",),
+                thread_id=42,
+                chat_id=-1001,
+                turn_end=True,
+            )
+            await _handle_content_task(bot, 1, final, queue, lock)
+            quiet_threads.set_relay("off")
+            off = await _handle_content_task(bot, 1, final, queue, lock)
+        assert step.outcome.name == "INTENTIONALLY_DROPPED"
+        assert off.outcome.name == "INTENTIONALLY_DROPPED"
+        assert len(sent) == 1 and "итог" in sent[0]

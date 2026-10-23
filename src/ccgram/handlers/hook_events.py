@@ -360,6 +360,11 @@ async def _handle_stop_failure(event: HookEvent, client: TelegramClient) -> None
 
     detail = f": {error_details}" if error_details else ""
     text = f"⚠ API error — {error}{detail}"
+    # Lazy: leaf module (CCGRAM-HOTFIX:tg-relay).
+    from .. import quiet_threads
+
+    if quiet_threads.relay() == "off":
+        return
 
     for user_id, thread_id, _window_id in users:
         chat_id = thread_router.resolve_chat_id(user_id, thread_id)

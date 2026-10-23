@@ -33,6 +33,12 @@ _turn_quiet = False
 # Set while that final reply is being sent (see ``final_reply``).
 _final: ContextVar[bool] = ContextVar("quiet_threads_final", default=False)
 MODES = ("auto", "on", "off")
+# What reaches Telegram from the sessions at all (web UI setting): "all" —
+# everything, as before; "final" — only the reply that ends a turn, plus
+# questions/permission prompts and API errors; "off" — nothing. Input from
+# Telegram keeps working either way. CCGRAM-HOTFIX:tg-relay
+RELAY_MODES = ("all", "final", "off")
+_relay = "all"
 
 
 def _key(chat_id: Any, thread_id: Any) -> tuple[int, int] | None:
@@ -83,6 +89,22 @@ def all_muted() -> bool:
     return _all_muted
 
 
+def set_relay(new_mode: str) -> None:
+    global _relay
+    _relay = new_mode if new_mode in RELAY_MODES else "all"
+
+
+def relay() -> str:
+    return _relay
+
+
+def relays_content(content_type: str, turn_end: bool) -> bool:
+    """Whether a session's message goes to Telegram under the relay mode."""
+    if _relay == "off":
+        return False
+    return _relay == "all" or (content_type == "text" and turn_end)
+
+
 def set_turn_quiet(on: bool) -> None:
     global _turn_quiet
     _turn_quiet = bool(on)
@@ -118,8 +140,9 @@ def apply(chat_id: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def reset_for_testing() -> None:
-    global _all_muted, _turn_quiet
+    global _all_muted, _turn_quiet, _relay
     _quiet.clear()
     _modes.clear()
     _all_muted = False
     _turn_quiet = False
+    _relay = "all"

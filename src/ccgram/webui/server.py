@@ -73,7 +73,18 @@ from urllib.parse import quote
 
 from aiohttp import web
 
-from . import costs, extras, hub, passkeys, push, security, service, tg_login, tts
+from . import (
+    costs,
+    devices,
+    extras,
+    hub,
+    passkeys,
+    push,
+    security,
+    service,
+    tg_login,
+    tts,
+)
 from . import usage as plan_usage
 from ..providers.claude import EFFORT_LEVELS
 from .auth import COOKIE_NAME, SESSION_TTL_S, LoginThrottle
@@ -169,13 +180,109 @@ async def _middleware(
     if request.method == "POST" and request.headers.get("X-CCGram") != "1":
         return web.json_response({"error": "missing X-CCGram header"}, status=403)
     try:
-        response = await handler(request)
+        remote = _REMOTE_PATH.match(path) if path.startswith("/api/sessions/") else None
+        response = await (_remote_api(request, remote) if remote else handler(request))
     except service.WebUIError as exc:
+        response = web.json_response({"error": str(exc)}, status=exc.status)
+    except devices.DeviceError as exc:
         response = web.json_response({"error": str(exc)}, status=exc.status)
     if isinstance(response, web.StreamResponse) and not response.prepared:
         for name, value in _SECURITY_HEADERS.items():
             response.headers.setdefault(name, value)
     return response
+
+
+# ── sessions on other devices (devices.py) ─────────────────────────────────
+# Their ids are "<device>:<session uuid>"; the same /api/sessions/{tid}/…
+# paths reach them here instead of the Telegram-topic handlers.
+_REMOTE_PATH = re.compile(
+    r"^/api/sessions/([a-z0-9_-]{1,24}:[0-9a-f-]{36})/([a-z]+)(?:/([A-Za-z0-9_-]{1,64})/entries)?$"
+)
+
+
+def _query_int(request: web.Request, name: str) -> int | None:
+    raw = request.query.get(name)
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        raise service.WebUIError(f"bad {name}") from None
+
+
+def _paging(request: web.Request) -> dict[str, Any]:
+    return {
+        "limit": _query_int(request, "limit") or service.DEFAULT_HISTORY,
+        "before": _query_int(request, "before"),
+        "after": _query_int(request, "after"),
+    }
+
+
+async def _r_entries(request: web.Request, tid: str, _aid: str | None) -> Any:
+    return await devices.entries(tid, **_paging(request))
+
+
+async def _r_send(request: web.Request, tid: str, _aid: str | None) -> Any:
+    return await devices.send(tid, str((await _json_body(request)).get("text", "")))
+
+
+async def _r_key(request: web.Request, tid: str, _aid: str | None) -> Any:
+    return await devices.key(tid, str((await _json_body(request)).get("key", "")))
+
+
+async def _r_pane(_request: web.Request, tid: str, _aid: str | None) -> Any:
+    return await devices.pane(tid)
+
+
+async def _r_terminal(_request: web.Request, tid: str, _aid: str | None) -> Any:
+    pane = await devices.pane(tid)
+    return {"alive": pane["alive"], "ansi": pane["text"]}
+
+
+async def _r_image(request: web.Request, tid: str, _aid: str | None) -> Any:
+    media, data = await devices.image(tid, request.query.get("ref", ""))
+    return web.Response(
+        body=data,
+        content_type=media,
+        headers={"Cache-Control": "private, max-age=604800"},
+    )
+
+
+async def _r_agents(request: web.Request, tid: str, aid: str | None) -> Any:
+    if aid:
+        return await devices.agent_entries(tid, aid, **_paging(request))
+    return await devices.agents(tid)
+
+
+async def _r_empty(_request: web.Request, _tid: str, _aid: str | None) -> Any:
+    return {}
+
+
+_REMOTE_ROUTES = {
+    ("GET", "entries"): _r_entries,
+    ("POST", "send"): _r_send,
+    ("POST", "key"): _r_key,
+    ("GET", "pane"): _r_pane,
+    ("GET", "terminal"): _r_terminal,
+    ("GET", "image"): _r_image,
+    ("GET", "agents"): _r_agents,
+    ("GET", "live"): _r_empty,
+    ("POST", "probe"): _r_empty,
+}
+
+
+async def _remote_api(request: web.Request, m: re.Match[str]) -> web.StreamResponse:
+    route = _REMOTE_ROUTES.get((request.method, m.group(2)))
+    if route is None:
+        raise service.WebUIError(
+            "для сессий на других устройствах это пока недоступно", 409
+        )
+    result = await route(request, m.group(1), m.group(3))
+    return (
+        result if isinstance(result, web.StreamResponse) else web.json_response(result)
+    )
+
+
+async def _devices(_request: web.Request) -> web.Response:
+    return web.json_response({"devices": devices.status()})
 
 
 async def _json_body(request: web.Request) -> dict[str, Any]:
@@ -418,7 +525,9 @@ async def _me(_request: web.Request) -> web.Response:
 
 
 async def _sessions(_request: web.Request) -> web.Response:
-    return web.json_response({"sessions": await service.list_sessions()})
+    return web.json_response(
+        {"sessions": await service.list_sessions() + devices.sessions()}
+    )
 
 
 # The new-chat composer sends a one-time ``key`` with each create. A phone that
@@ -456,6 +565,17 @@ async def _create(request: web.Request) -> web.Response:
 
 async def _launch(request: web.Request, body: dict[str, Any]) -> dict[str, Any]:
     """Start a session as the new-chat composer asks (``POST /api/sessions``)."""
+    device = body.get("device")
+    if isinstance(device, str) and device and device != "local":
+        # Another machine: its node starts Claude there, in its own tmux.
+        args: list[str] = []
+        if service.valid_model(body.get("model")):
+            args += ["--model", str(body.get("model"))]
+        if body.get("effort") in EFFORT_LEVELS:
+            args += ["--effort", str(body.get("effort"))]
+        return await devices.create(
+            device, str(body.get("cwd") or "~"), str(body.get("text", "")), args
+        )
     name = body.get("name") if isinstance(body.get("name"), str) else None
     model = service.valid_model(body.get("model"))
     provider = service.valid_provider(body.get("provider"))
@@ -606,6 +726,7 @@ async def _settings(request: web.Request) -> web.Response:
     from .. import quiet_threads
     from .prefs import new_chat_telegram, set_new_chat_telegram, set_tg_muted
     from .prefs import set_notify_mode as save_notify_mode
+    from .prefs import set_tg_relay
     from .prefs import set_web_muted as save_web_muted
 
     if request.method == "POST":
@@ -613,6 +734,9 @@ async def _settings(request: web.Request) -> web.Response:
         if "tg_muted" in body:
             quiet_threads.set_all_muted(bool(body["tg_muted"]))
             set_tg_muted(bool(body["tg_muted"]))
+        if body.get("tg_relay") in quiet_threads.RELAY_MODES:
+            quiet_threads.set_relay(body["tg_relay"])
+            set_tg_relay(body["tg_relay"])
         if "new_chat_telegram" in body:
             # Server-side on purpose: an iOS home-screen app has its own
             # localStorage, so a browser-only choice silently reset there.
@@ -626,6 +750,7 @@ async def _settings(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "tg_muted": quiet_threads.all_muted(),
+            "tg_relay": quiet_threads.relay(),
             "new_chat_telegram": new_chat_telegram(),
             "notify_mode": extras.notify_mode(),
             "web_muted": push.web_muted(),
@@ -957,7 +1082,7 @@ async def _events(request: web.Request) -> web.StreamResponse:
         while True:
             now = loop.time()
             if now >= next_poll:
-                sessions = await service.list_sessions()
+                sessions = await service.list_sessions() + devices.sessions()
                 if sessions != last_sessions:
                     await resp.write(_sse({"type": "sessions", "sessions": sessions}))
                     last_sessions = sessions
@@ -1014,6 +1139,7 @@ def build_app(*, bot: Bot | Any, bot_token: str, password: str) -> web.Applicati
     r.add_get("/api/sessions/{tid}/file", _file)
     r.add_get("/api/sessions/{tid}/image", _image)
     r.add_get("/api/sessions/{tid}/agents", _agents)
+    r.add_get("/api/devices", _devices)
     r.add_post("/api/sessions/{tid}/rewind", _rewind)
     r.add_get("/api/sessions/{tid}/agents/{aid}/entries", _agent_entries)
     r.add_get("/api/search", _search)
@@ -1078,6 +1204,7 @@ def _add_hub_routes(r: web.UrlDispatcher) -> None:
 _runner: web.AppRunner | None = None
 _autotitle_task: asyncio.Task[None] | None = None
 _hub_task: asyncio.Task[None] | None = None
+_devices_task: asyncio.Task[None] | None = None
 
 
 async def start_webui(bot: Bot | Any) -> None:
@@ -1096,12 +1223,13 @@ async def start_webui(bot: Bot | Any) -> None:
     try:
         # Lazy: leaf modules, only needed once the UI is actually enabled.
         from .. import quiet_threads
-        from .prefs import notify_mode, sound_modes, tg_muted
+        from .prefs import notify_mode, sound_modes, tg_muted, tg_relay
         from .prefs import web_muted as prefs_web_muted
         from .prefs import web_off as prefs_web_off
 
         quiet_threads.load_modes(sound_modes())
         quiet_threads.set_all_muted(tg_muted())
+        quiet_threads.set_relay(tg_relay())
         extras.set_notify_mode(notify_mode())
         push.set_web_muted(prefs_web_muted())
         push.load_web_off(prefs_web_off())
@@ -1123,6 +1251,8 @@ async def start_webui(bot: Bot | Any) -> None:
         global _autotitle_task, _hub_task
         _autotitle_task = autotitle.start(bot)
         _hub_task = hub.start()
+        global _devices_task
+        _devices_task = devices.start()
     except OSError as exc:
         logger.error("web UI failed to bind: %s", exc)
 

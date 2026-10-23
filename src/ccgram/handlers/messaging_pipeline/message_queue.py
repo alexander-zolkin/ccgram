@@ -515,6 +515,9 @@ async def _handle_content_task(
     """Route a content task through batching or normal processing."""
     if dispatch_state is None:
         dispatch_state = DispatchState()
+    # The web UI's "Telegram: только итог / ничего" (CCGRAM-HOTFIX:tg-relay).
+    if not quiet_threads.relays_content(task.content_type, task.turn_end):
+        return DispatchResult(0, DeliveryOutcome.INTENTIONALLY_DROPPED)
     if task.content_type == "thinking" and config.hide_thinking:
         return DispatchResult(0, DeliveryOutcome.INTENTIONALLY_DROPPED)
     if task.content_type in ("tool_use", "tool_result") and is_tool_calls_hidden(
@@ -590,7 +593,10 @@ async def _dispatch(
             # to insert a status bubble causes a visible flicker (formatted
             # tool calls vanish, plain status appears, then the assistant
             # text replaces that).
-            if has_ephemeral_active_batch(user_id, thread_key(st.thread_id)):
+            relay_off = quiet_threads.relay() != "all"  # CCGRAM-HOTFIX:tg-relay
+            if relay_off or has_ephemeral_active_batch(
+                user_id, thread_key(st.thread_id)
+            ):
                 # Drop any siblings the coalescer would have consumed so
                 # the next poll cycle sees a clean queue.
                 _, dropped = await _coalesce_status_updates(queue, st, lock)

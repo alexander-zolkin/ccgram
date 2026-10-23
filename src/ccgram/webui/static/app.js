@@ -2591,6 +2591,15 @@ function profileMenu() {
     check: state.telegram,
     action: () => $("tg-toggle").click(),
   });
+  const relay = TG_RELAY.find(([id]) => id === (state.tgRelay || "all")) || TG_RELAY[0];
+  items.push({
+    label: `Что слать в Telegram: ${relay[1].toLowerCase()}`,
+    sub: relay[2],
+    icon: relay[0] === "off" ? SVG.tgGone : SVG.tg,
+    action: () => setTimeout(() => openMenu([{ heading: "Что слать в Telegram из сессий" }, ...TG_RELAY.map(([id, label, sub]) => ({
+      label, sub, check: id === (state.tgRelay || "all"), action: () => setTgRelay(id),
+    })), "sep", { heading: "Писать в топики можно при любом режиме" }], menuBelow($("profile-btn")), $("profile-btn")), 0),
+  });
   items.push({ heading: "Уведомления" });
   items.push({
     label: "Когда уведомлять",
@@ -2628,6 +2637,19 @@ async function setWebMuted(on) {
     toast(on ? "Веб-уведомления выключены везде — выключенные чаты так и останутся выключенными" : "Веб-уведомления снова приходят — по настройкам каждого чата");
     const s = currentSession();
     if (s) renderSoundBtn(s);
+  } catch (e) { toast(e.message); }
+}
+
+// What sessions send to Telegram at all (quiet_threads.RELAY_MODES).
+const TG_RELAY = [
+  ["all", "Всё", "Каждый шаг, размышления и ответы — как раньше"],
+  ["final", "Только итог хода", "Финальный ответ, вопросы, запросы разрешений и ошибки"],
+  ["off", "Ничего", "Сессии молчат в Telegram; всё — только здесь"],
+];
+async function setTgRelay(mode) {
+  try {
+    state.tgRelay = (await api("/api/settings", { body: { tg_relay: mode } })).tg_relay;
+    toast(`Telegram: ${(TG_RELAY.find(([id]) => id === state.tgRelay) || TG_RELAY[0])[1].toLowerCase()}`);
   } catch (e) { toast(e.message); }
 }
 
@@ -2904,6 +2926,7 @@ async function boot(me) {
   refreshPushState();
   api("/api/settings").then((r) => {
     state.tgMuted = r.tg_muted;
+    state.tgRelay = r.tg_relay || "all";
     state.notifyMode = r.notify_mode || "done";
     state.webMuted = Boolean(r.web_muted);
     state.webOff = new Set(r.web_off || []);

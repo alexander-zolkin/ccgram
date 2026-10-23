@@ -108,3 +108,19 @@ def test_final_reply_rings_through_turn_quiet_only():
         quiet_threads.set_all_muted(False)
         assert quiet_threads.apply(-100, dict(kw))["disable_notification"] is True
     quiet_threads.reset_for_testing()
+
+
+def test_relay_modes_decide_what_reaches_telegram():
+    quiet_threads.reset_for_testing()
+    assert quiet_threads.relay() == "all"
+    assert quiet_threads.relays_content("tool_use", False)
+    quiet_threads.set_relay("final")
+    assert not quiet_threads.relays_content("tool_use", False)
+    assert not quiet_threads.relays_content("thinking", False)
+    assert not quiet_threads.relays_content("text", False)
+    assert quiet_threads.relays_content("text", True)
+    quiet_threads.set_relay("off")
+    assert not quiet_threads.relays_content("text", True)
+    quiet_threads.set_relay("bogus")
+    assert quiet_threads.relay() == "all"
+    quiet_threads.reset_for_testing()

@@ -25,6 +25,7 @@ import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 
+from ... import quiet_threads
 from ...providers import get_provider_for_window
 from ...telegram_client import TelegramClient
 from ...window_query import get_window_provider
@@ -571,6 +572,8 @@ async def handle_interactive_ui(
     multi-pane windows such as agent teams).  The pane context is shown
     in the message and the keyboard routes responses to that pane.
     """
+    if quiet_threads.relay() == "off":  # CCGRAM-HOTFIX:tg-relay
+        return False
     captured = await _capture_interactive_content(window_id, pane_id=pane_id)
     if not captured:
         return False

@@ -71,6 +71,17 @@ def set_tg_muted(on: bool) -> None:
     _save()
 
 
+def tg_relay() -> str:
+    """What reaches Telegram: all | final | off (quiet_threads.RELAY_MODES)."""
+    value = _load().get("tg_relay", "all")
+    return value if value in ("all", "final", "off") else "all"
+
+
+def set_tg_relay(value: str) -> None:
+    _load()["tg_relay"] = value
+    _save()
+
+
 def new_chat_telegram() -> bool:
     """Whether new web chats get a Telegram topic (shared by every device)."""
     return bool(_load().get("new_chat_telegram", True))
