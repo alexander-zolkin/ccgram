@@ -6,6 +6,7 @@ Routes (everything under ``/api`` except login requires the session cookie):
 - ``GET  /api/me``                        200 when logged in, 401 otherwise
 - ``GET  /api/sessions``                  bound topics, newest activity first
 - ``POST /api/sessions``                  new topic + quick-start session
+  (a repeated ``key`` returns the same session)
 - ``GET  /api/sessions/{tid}/messages``   transcript tail (``?limit=``)
 - ``POST /api/sessions/{tid}/send``       text into the session (wakes it)
 - ``GET  /api/sessions/{tid}/pane``       current pane snapshot
@@ -419,8 +420,37 @@ async def _sessions(_request: web.Request) -> web.Response:
     return web.json_response({"sessions": await service.list_sessions()})
 
 
+# The new-chat composer sends a one-time ``key`` with each create. A phone that
+# backgrounds the page drops the request while the server carries on, so the
+# page asks again with the same key: it gets the same chat, not a second one.
+_CREATE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_CREATE_KEY_TTL_S = 600.0
+_creates: dict[str, tuple[float, asyncio.Task[dict[str, Any]]]] = {}
+
+
 async def _create(request: web.Request) -> web.Response:
-    return web.json_response(await _launch(request, await _json_body(request)))
+    body = await _json_body(request)
+    key = body.get("key")
+    if not isinstance(key, str) or not _CREATE_KEY_RE.match(key):
+        return web.json_response(await _launch(request, body))
+    now = asyncio.get_running_loop().time()
+    for old, (at, _task) in list(_creates.items()):
+        if now - at > _CREATE_KEY_TTL_S:
+            del _creates[old]
+    if key in _creates:
+        task = _creates[key][1]
+    else:
+        task = asyncio.get_running_loop().create_task(_launch(request, body))
+        _creates[key] = (now, task)
+
+        def _forget_failed(done: asyncio.Task[dict[str, Any]]) -> None:
+            # A failed create may be retried under its key; a finished one stays.
+            if done.cancelled() or done.exception() is not None:
+                _creates.pop(key, None)
+
+        task.add_done_callback(_forget_failed)
+    # Shielded: a dropped connection must not cancel a launch half-way.
+    return web.json_response(await asyncio.shield(task))
 
 
 async def _launch(request: web.Request, body: dict[str, Any]) -> dict[str, Any]:

@@ -33,6 +33,8 @@ from ..thread_router import thread_router
 from . import transcript
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from telegram import Bot
 
 logger = logging.getLogger(__name__)
@@ -666,15 +668,55 @@ class _LaunchQuery:
     the Telegram side reads exactly as if the quick-start button was tapped.
     """
 
-    def __init__(self, message: Any) -> None:
-        self.message = message
+    def __init__(self, bot: Bot, chat_id: int, thread_id: int) -> None:
+        # launch_window reads only the chat off the message, to bind the topic.
+        self.message = SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id, type="supergroup")
+        )
+        self._status = _background(
+            bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text="🌐 Starting a session from the web…",
+            )
+        )
+        self._last: asyncio.Task[Any] = self._status
 
-    async def edit_message_text(self, text: str, **kwargs: Any) -> Any:
-        return await self.message.edit_text(text, **kwargs)
+# Telegram calls a new web chat doesn't wait for. Every topic of the group
+# shares one Bot API budget (20 a minute); when status repaints have drained
+# it, each queued call costs seconds, and in a row they held the first message
+# back from the agent for up to 40 s.
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _background(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    task = asyncio.get_running_loop().create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_done)
+    return task
+
+
+def _background_done(task: asyncio.Task[Any]) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("webui: background Telegram call failed: %s", task.exception())
+
+
+    async def edit_message_text(self, text: str, **kwargs: Any) -> None:
+        previous = self._last
+
+        async def edit() -> None:
+            with contextlib.suppress(Exception):
+                await previous
+            status = await self._status
+            await status.edit_text(text, **kwargs)
+
+        self._last = _background(edit())
 
     async def answer(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
+    The post and its edits go out in the background, in order.
 
 def _default_topic_name() -> str:
     # Same shape as the session-topic-name hotfix: "kara MM-DD HH-MM".
@@ -687,6 +729,21 @@ async def create_session(
     name: str | None,
     model: str | None,
     provider: str = "claude",
+class _LaunchBot:
+    """``context.bot`` for ``launch_window``: the topic rename goes out in the
+    background, every other call straight to the real bot."""
+
+    def __init__(self, bot: Bot) -> None:
+        self._bot = bot
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._bot, name)
+
+    async def edit_forum_topic(self, **kwargs: Any) -> bool:
+        _background(self._bot.edit_forum_topic(**kwargs))
+        return True
+
+
     effort: str | None = None,
     cwd: str | None = None,
     resume_id: str | None = None,
@@ -729,11 +786,7 @@ async def create_session(
     # user), so seed the sticky name the way topic_created_handler would.
     update_stored_topic_name(chat_id, thread_id, title)
     thread_router.set_group_chat_id(user_id, thread_id, chat_id)
-    status = await bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=thread_id,
-        text="🌐 Starting a session from the web…",
-    )
+    query = _LaunchQuery(bot, chat_id, thread_id)
 
     provider = provider or QUICKSTART_DEFAULT_PROVIDER
     model_id = valid_model(model)
@@ -749,12 +802,12 @@ async def create_session(
         bool(text)
         and provider_registry.get(provider).capabilities.launch_accepts_initial_prompt
     )
-    context = SimpleNamespace(bot=bot, user_data={})
+    context = SimpleNamespace(bot=_LaunchBot(bot), user_data={})
     # pending_text is NOT handed to launch_window: it would be injected with a
     # Telegram-origin marker and so never relayed into the topic. Send it
     # ourselves once the window is up, through the plain web path.
     result = await launch_window(
-        _LaunchQuery(status),  # type: ignore[arg-type]
+        query,  # type: ignore[arg-type]
         context,  # type: ignore[arg-type]
         WindowLaunchRequest(
             user_id=user_id,

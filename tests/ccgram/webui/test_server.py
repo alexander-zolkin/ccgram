@@ -177,6 +177,49 @@ async def test_send_and_create(client, calls):
         assert calls[-1] == want
 
 
+async def test_create_key_gives_one_session(client, monkeypatch):
+    await _login(client)
+    made: list[int] = []
+    gate = asyncio.Event()
+
+    async def slow_create(bot, text, name, model, *args, **kwargs):
+        made.append(8 + len(made))
+        tid = made[-1]
+        await gate.wait()
+        if text == "fail":
+            raise service.WebUIError("launch failed", 502)
+        return {"thread_id": tid, "window_id": "@4", "name": "kara"}
+
+    monkeypatch.setattr(service, "create_session", slow_create)
+    body = {"text": "go", "key": "k-0123456789"}
+    # A phone dropped the first request; the page asks again while it runs.
+    first = asyncio.ensure_future(
+        client.post("/api/sessions", json=body, headers=POST_HEADERS)
+    )
+    await asyncio.sleep(0.05)
+    second = asyncio.ensure_future(
+        client.post("/api/sessions", json=body, headers=POST_HEADERS)
+    )
+    await asyncio.sleep(0.05)
+    gate.set()
+    for resp in (await first, await second):
+        assert (await resp.json())["thread_id"] == 8
+    resp = await client.post("/api/sessions", json=body, headers=POST_HEADERS)
+    assert (await resp.json())["thread_id"] == 8
+    assert made == [8]
+    resp = await client.post(
+        "/api/sessions", json={**body, "key": "k-another-one"}, headers=POST_HEADERS
+    )
+    assert (await resp.json())["thread_id"] == 9
+    # A failed create may be retried under the same key.
+    fail = {"text": "fail", "key": "k-failing-key"}
+    resp = await client.post("/api/sessions", json=fail, headers=POST_HEADERS)
+    assert resp.status == 502
+    resp = await client.post("/api/sessions", json=fail, headers=POST_HEADERS)
+    assert resp.status == 502
+    assert made == [8, 9, 10, 11]
+
+
 async def test_invalid_json_is_400(client):
     await _login(client)
     resp = await client.post(

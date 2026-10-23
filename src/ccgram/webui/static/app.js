@@ -37,16 +37,23 @@ async function api(path, opts = {}) {
   return data;
 }
 
-function toast(text) {
+// action = {label, run}: a button in the toast, which then stays a bit longer.
+function toast(text, action) {
   const t = $("toast");
   t.textContent = text;
+  if (action) {
+    const b = el("button", "toast-act", esc(action.label));
+    b.type = "button";
+    b.onclick = () => { t.hidden = true; action.run(); };
+    t.append(" ", b);
+  }
   t.classList.remove("out");
   t.hidden = false;
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => {
     t.classList.add("out");
     toast.timer = setTimeout(() => { t.hidden = true; t.classList.remove("out"); }, 200);
-  }, 3500);
+  }, action ? 6000 : 3500);
 }
 
 const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -361,6 +368,8 @@ const state = {
   paneTimer: null,
   attachments: [],
   pending: new Map(),     // session id → {text, at} shown until the transcript has it
+  drafts: new Map(),      // key → a chat still being created (see «a chat being created»)
+  draft: null,            // key of the draft on screen
   actWin: "all",          // «Активность» window in the statistics sheet
   providers: null,          // [{id, name, models, default}]
   provider: store.get("kara-provider") || "claude",
@@ -677,7 +686,9 @@ async function loadOlder() {
 // ═══ routing: home screen vs a session ══════════════════════════════════════
 function route() {
   $("cmd-palette").hidden = true;
-  const id = parseInt(location.hash.slice(1), 10);
+  const hash = location.hash.slice(1);
+  if (hash.startsWith("c-")) { showDraft(hash); return; }
+  const id = parseInt(hash, 10);
   if (!Number.isNaN(id)) openSession(id);
   else showHome();
 }
@@ -690,6 +701,7 @@ function greeting() {
 
 function showHome() {
   state.current = null;
+  state.draft = null;
   $("gone-card").hidden = true;
   clearTimeout(state.paneTimer);
   $("app").classList.add("home-mode");
@@ -726,7 +738,8 @@ function showHome() {
   if (!isMobile()) $("input").focus();
 }
 
-async function openSession(tid) {
+// The chat layout without the home screen's composer extras.
+function enterChat() {
   $("app").classList.remove("home-mode", "drawer");
   $("home").hidden = true;
   $("tg-toggle").hidden = true;
@@ -739,15 +752,22 @@ async function openSession(tid) {
   $("mode-btn").hidden = true;
   $("mode-btn").dataset.mode = "";
   $("input").placeholder = "Ответить Каре…";
+  $("prompt-card").hidden = true;
+  $("chat-meta").hidden = true;
+}
+
+// keep: leave the thread as it is until the transcript arrives (a draft
+// turning into its chat), instead of a loader and a fade.
+async function openSession(tid, { keep = false } = {}) {
+  enterChat();
   state.current = tid;
+  state.draft = null;
   state.unread.delete(tid);
   loadDraft();
   if (location.hash !== `#${tid}`) history.replaceState(null, "", `#${tid}`);
   $("pane-btn").hidden = false;
-  $("prompt-card").hidden = true;
-  $("chat-meta").hidden = true;
   renderSessions();
-  resetThread('<div class="loader-row">Загружаю…</div>');
+  if (!keep) resetThread('<div class="loader-row">Загружаю…</div>');
   try {
     const data = await api(`/api/sessions/${tid}/entries?limit=200`);
     if (state.current !== tid) return;
@@ -758,7 +778,7 @@ async function openSession(tid) {
     $("thread").appendChild(buildBlocks(data.items, null));
     const pending = state.pending.get(tid);
     if (pending) { const p = pendingNode(pending.text, pending.at); p.querySelector(".tick").innerHTML = TICK.sent; p.dataset.sent = "1"; $("thread").appendChild(p); }
-    replay($("thread"), "fade");
+    if (!keep) replay($("thread"), "fade");
     refreshMsgStatus();
     markLast();
     autoOpenLive();
@@ -832,6 +852,12 @@ function renderSessions() {
     for (const s of pinned) nav.appendChild(sessionItem(s));
   }
   let group = null;
+  const drafts = [...state.drafts.values()].filter((d) => !d.tid && (!f || draftName(d).toLowerCase().includes(f)));
+  if (drafts.length) {
+    group = "Сегодня";
+    nav.appendChild(el("div", "group-label", group));
+    for (const d of drafts) nav.appendChild(draftItem(d));
+  }
   for (const s of list.filter((s) => !s.pinned)) {
     const g = groupOf(s.last_activity);
     if (g !== group) { nav.appendChild(el("div", "group-label", esc(g))); group = g; }
@@ -839,7 +865,7 @@ function renderSessions() {
   }
   const hits = state.hits && state.hits.q === state.filter.trim() ? state.hits.results : [];
   if (hits.length) nav.appendChild(hitsBox(state.hits.q, hits));
-  else if (!list.length) nav.appendChild(el("div", "group-label", f ? "Ничего не нашлось" : "Чатов пока нет"));
+  else if (!list.length && !drafts.length) nav.appendChild(el("div", "group-label", f ? "Ничего не нашлось" : "Чатов пока нет"));
   renderHeader();
 }
 
@@ -1044,6 +1070,7 @@ function setLed(mode) {
 
 function updateLed() {
   const s = currentSession();
+  if (state.draft) { setLed(state.drafts.get(state.draft)?.error ? "idle" : "working"); return; }
   setLed(!s ? "idle" : !$("prompt-card").hidden ? "attention" : turnRunning(s) ? "working" : "idle");
 }
 
@@ -1331,7 +1358,7 @@ function composeMessage() {
   return [...files, text].filter(Boolean).join("\n\n");
 }
 
-const draftKey = () => `kara-draft-${state.current ?? "new"}`;
+const draftKey = () => `kara-draft-${state.current ?? state.draft ?? "new"}`;
 function loadDraft() {
   $("input").value = store.get(draftKey()) || "";
   autosize();
@@ -1388,32 +1415,204 @@ async function send() {
   // Claude Code's /usage opens a dialog in the terminal that the web never
   // sees: answer it here, from the same source, without bothering the session.
   if (/^\/usage\s*$/i.test(message)) { clearComposer(); autosize(); $("cmd-palette").hidden = true; showUsage(); return; }
-  $("send-btn").disabled = true;
-  try {
-    if (state.current == null) {
-      $("working").hidden = false;
-      $("working-text").textContent = state.telegram ? "Создаю чат и топик…" : "Создаю чат…";
-      const c = currentChoice();
-      const effort = c?.provider.id === "claude" && state.effort ? state.effort : undefined;
-      const res = await api("/api/sessions", { body: { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort, cwd: state.cwd || undefined, worktree: state.worktree || undefined } });
-      if (state.worktree) { state.worktree = false; renderCwd(); }
-      clearComposer();
-      state.pending.set(res.thread_id, { text: message, at: Date.now() });
-      startInflight(res.thread_id);
-      await refreshSessions();
-      location.hash = `#${res.thread_id}`;
-      return;
-    }
+  if (state.draft) {
+    // The chat is still being created: the message goes in right after.
+    queueInDraft(state.drafts.get(state.draft), message);
+  } else if (state.current == null) {
+    const c = currentChoice();
+    const effort = c?.provider.id === "claude" && state.effort ? state.effort : undefined;
+    const body = { text: message, web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort, cwd: state.cwd || undefined, worktree: state.worktree || undefined };
+    if (state.worktree) { state.worktree = false; renderCwd(); }
+    clearComposer();
+    startDraft(message, body);
+  } else {
     clearComposer();
     sendTo(state.current, message); // optimistic: the composer frees up at once
-    return;
-  } catch (e) {
-    toast(`❌ ${e.message}`);
-  } finally {
-    $("working-text").textContent = workVerb();
-    if (state.current == null) $("working").hidden = true;
-    autosize();
-    $("input").focus();
+  }
+  autosize();
+  $("input").focus();
+}
+
+// ═══ a chat being created ═══════════════════════════════════════════════════
+// A new chat takes seconds to exist (a Telegram topic, then the agent starts),
+// so the page moves into it at once: the message waits there with its clock,
+// and the chat takes over the same screen once it is up. Leaving the draft
+// never pulls you back — the chat just turns up in the list. Each create
+// carries a one-time key: a phone that backgrounds the page drops the request
+// while the server carries on, and asking again under the key returns the
+// same chat instead of a second one. Drafts outlive a reload for as long.
+const DRAFT_RETRY_MS = 5 * 60000;
+const DRAFTS_STORE = "kara-creating";
+
+function saveDrafts() {
+  const list = [...state.drafts.values()].filter((d) => !d.error && !d.tid).map(({ key, text, body, at, queue }) => ({ key, text, body, at, queue }));
+  store.set(DRAFTS_STORE, JSON.stringify(list));
+}
+
+function restoreDrafts() {
+  let list = [];
+  try { list = JSON.parse(store.get(DRAFTS_STORE) || "[]"); } catch (_) { /* unreadable: nothing to resume */ }
+  for (const d of Array.isArray(list) ? list : []) {
+    if (!d?.key || !d.body || Date.now() - d.at > DRAFT_RETRY_MS) continue;
+    const draft = { ...d, queue: d.queue || [], error: null };
+    state.drafts.set(d.key, draft);
+    createDraft(draft);
+  }
+  saveDrafts();
+}
+
+function draftName(d) {
+  const text = d.text.replace(/^I've uploaded .*$/gm, "").replace(/\s+/g, " ").trim();
+  return text.slice(0, 48) || "Новый чат";
+}
+
+function draftItem(d) {
+  const item = el("a", `s-item draft${d.key === state.draft ? " active" : ""}`);
+  item.href = `#${d.key}`;
+  item.innerHTML = `<span class="dot ${d.error ? "err" : "active"}"></span><span class="s-name">${esc(draftName(d))}</span><span class="s-note">${d.error ? "не создан" : "создаётся"}</span>`;
+  return item;
+}
+
+function startDraft(text, body) {
+  const key = `c-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const d = { key, text, body: { ...body, key }, at: Date.now(), queue: [], error: null, fresh: true };
+  state.drafts.set(key, d);
+  saveDrafts();
+  location.hash = `#${key}`;
+  createDraft(d);
+}
+
+function showDraft(key) {
+  const d = state.drafts.get(key);
+  if (!d) { history.replaceState(null, "", "#new"); showHome(); return; } // already a chat, or a stale link
+  enterChat();
+  clearTimeout(state.paneTimer);
+  state.current = null;
+  state.draft = key;
+  loadDraft();
+  for (const id of ["pane-btn", "sound-btn", "gone-card", "pane"]) $(id).hidden = true;
+  $("title-btn").hidden = false;
+  $("chat-name").textContent = draftName(d);
+  $("chat-badge").hidden = !d.body.web_only;
+  $("disclaimer").textContent = d.body.web_only ? "Этот чат только в вебе — в Telegram не дублируется." : "Этот чат дублируется в Telegram-топик.";
+  setTitle(`⏳ ${draftName(d)} — Кара`);
+  updateLed();
+  renderSessions();
+  resetThread("");
+  for (const m of [{ text: d.text, at: d.at }, ...d.queue]) $("thread").appendChild(pendingNode(m.text, m.at));
+  renderDraft(d);
+  toBottom();
+  if (d.fresh) { d.fresh = false; flyIn($("thread").querySelector(".u-msg")); }
+  if (!isMobile()) $("input").focus();
+}
+
+function renderDraft(d) {
+  if (state.draft !== d.key) return;
+  $("chat-state").innerHTML = `<span class="dot ${d.error ? "err" : "active"}"></span><span>${d.error ? "не создан" : "создаётся"}</span>`;
+  $("working").hidden = Boolean(d.error);
+  $("working-text").textContent = d.body.web_only ? "Создаю чат…" : "Создаю чат и топик…";
+  state.turnClock = { tid: d.key, start: d.at, out: 0 };
+  tickWork();
+  const first = $("thread").querySelector(".u-msg");
+  if (first) {
+    first.querySelectorAll(".retry").forEach((b) => b.remove());
+    first.classList.toggle("failed", Boolean(d.error));
+    first.querySelector(".tick").innerHTML = d.error ? "!" : TICK.clock;
+    if (d.error) {
+      first.querySelector(".u-status")?.remove();
+      const retry = el("button", "retry", `Чат не создан: ${esc(d.error)} · Повторить`);
+      retry.type = "button";
+      retry.onclick = () => { d.error = null; saveDrafts(); renderDraft(d); renderSessions(); createDraft(d); };
+      const drop = el("button", "retry", "Убрать и вернуть текст");
+      drop.type = "button";
+      drop.onclick = () => dropDraft(d);
+      first.append(retry, drop);
+    }
+  }
+  refreshMsgStatus();
+  syncSendBtn();
+  updateLed();
+}
+
+// A failed draft goes away; its text goes back into the new-chat composer.
+function dropDraft(d) {
+  state.drafts.delete(d.key);
+  saveDrafts();
+  store.set(`kara-draft-${d.key}`, "");
+  store.set("kara-draft-new", [d.text, ...d.queue.map((m) => m.text)].join("\n\n"));
+  location.hash = "#new";
+}
+
+function queueInDraft(d, text) {
+  clearComposer();
+  const m = { text, at: Date.now() };
+  d.queue.push(m);
+  saveDrafts();
+  const p = pendingNode(m.text, m.at);
+  $("thread").appendChild(p);
+  refreshMsgStatus();
+  toBottom();
+  flyIn(p);
+}
+
+// A beat before asking again, and not while the page sits in the background.
+async function draftPause() {
+  await new Promise((r) => setTimeout(r, 1500));
+  if (document.hidden) await new Promise((r) => document.addEventListener("visibilitychange", r, { once: true }));
+}
+
+async function createDraft(d) {
+  for (;;) {
+    try {
+      const res = await api("/api/sessions", { body: d.body });
+      if (res.thread_id == null) throw new TypeError("the answer was cut off");
+      return adoptDraft(d, res);
+    } catch (e) {
+      // fetch() itself failed (the page went to the background, the network
+      // blinked): the server is likely creating it still, so ask again.
+      if (e instanceof TypeError && Date.now() - d.at < DRAFT_RETRY_MS) { await draftPause(); continue; }
+      d.error = e.message;
+      saveDrafts();
+      renderSessions();
+      if (state.draft === d.key) renderDraft(d);
+      else toast(`❌ Чат не создан: ${e.message}`, { label: "Открыть", run: () => { location.hash = `#${d.key}`; } });
+      return;
+    }
+  }
+}
+
+// Someone went elsewhere while a chat was being made: say it's ready, don't pull.
+function chatReady(tid, fallbackName) {
+  const name = sessionById(tid)?.name || fallbackName || "Новый чат";
+  toast(`Чат «${name}» готов`, { label: "Открыть", run: () => { location.hash = `#${tid}`; } });
+}
+
+function goToNewChat(from, tid) {
+  if (location.hash === from) location.hash = `#${tid}`;
+  else chatReady(tid);
+}
+
+async function adoptDraft(d, res) {
+  const tid = res.thread_id;
+  d.tid = tid; // the list shows the chat now; the draft stays open until it takes over
+  saveDrafts();
+  state.pending.set(tid, { text: d.text, at: d.at });
+  try { await refreshSessions(); } catch (_) { renderSessions(); } // the event stream catches up
+  state.drafts.delete(d.key);
+  // Whatever was typed here meanwhile belongs to the chat now.
+  const typed = store.get(`kara-draft-${d.key}`);
+  store.set(`kara-draft-${d.key}`, "");
+  if (typed) store.set(`kara-draft-${tid}`, typed);
+  if (state.draft === d.key) {
+    startInflight(tid);
+    state.turnClock.start = d.at; // the clock keeps running from the click
+    await openSession(tid, { keep: true });
+  } else {
+    chatReady(tid, draftName(d));
+  }
+  for (const m of d.queue) {
+    if (state.current === tid) sendTo(tid, m.text);
+    else api(`/api/sessions/${tid}/send`, { body: { text: m.text } }).catch((e) => toast(`❌ ${e.message}`));
   }
 }
 
@@ -1844,6 +2043,7 @@ async function boot(me) {
   if (store.get("kara-collapsed") === "1" && !isMobile()) $("app").classList.add("collapsed");
   await refreshSessions();
   connect();
+  restoreDrafts();
   route();
   offerPasskey();
   reportPresence();
@@ -2273,7 +2473,7 @@ function turnClock(live, status) {
 function tickWork() {
   const meta = $("working-meta");
   const c = state.turnClock;
-  if (!c || c.tid !== state.current || $("working").hidden) { meta.hidden = true; return; }
+  if (!c || c.tid !== (state.current ?? state.draft) || $("working").hidden) { meta.hidden = true; return; }
   const sec = Math.max(0, Math.round((Date.now() - c.start) / 1000));
   meta.hidden = false;
   meta.textContent = clock(sec) + (c.out ? ` · ${tokRu(c.out)} ток.` : "");
@@ -2490,11 +2690,12 @@ $("resume-btn").onclick = async () => {
         dlg.close();
         $("working").hidden = false;
         $("working-text").textContent = "Поднимаю сессию…";
+        const from = location.hash;
         try {
           const res = await api("/api/sessions", { body: { text: "", web_only: !state.telegram, provider: "claude", resume_id: x.id, cwd: r.cwd, name: (x.summary || "").slice(0, 60) || undefined } });
           await refreshSessions();
-          location.hash = `#${res.thread_id}`;
-        } catch (e) { toast(`❌ ${e.message}`); } finally { if (state.current == null) $("working").hidden = true; }
+          goToNewChat(from, res.thread_id);
+        } catch (e) { toast(`❌ ${e.message}`); } finally { if (state.current == null && !state.draft) $("working").hidden = true; }
       };
       list.appendChild(b);
     }
@@ -2681,14 +2882,14 @@ function showHubCached() {
 
 async function loadHub() {
   clearTimeout(state.hubTimer);
-  if (state.current != null) return;
+  if (state.current != null || state.draft) return;
   state.hubTimer = setTimeout(loadHub, 60000);
   if (document.hidden && state.hubData) return;
   let data;
   try { data = await api("/api/hub"); } catch (_) { return; }
   state.hubData = data;
   store.set("kara-hub", data.enabled ? "1" : "0");
-  if (state.current == null) applyHub(data);
+  if (state.current == null && !state.draft) applyHub(data);
 }
 
 function applyHub(data) {
@@ -3373,14 +3574,15 @@ async function startPending(it, btn) {
   btn.disabled = true;
   btn.classList.add("busy");
   toast(state.telegram ? "Создаю чат и топик…" : "Создаю чат…");
+  const from = location.hash;
   try {
     const c = currentChoice();
     const effort = c?.provider.id === "claude" && state.effort ? state.effort : undefined;
     const res = await api(`/api/hub/pending/${it.id}/start`, { body: { web_only: !state.telegram, provider: c?.provider.id, model: c?.model?.id || undefined, effort } });
     state.pending.set(res.thread_id, { text: res.text, at: Date.now() });
-    startInflight(res.thread_id);
     await refreshSessions();
-    location.hash = `#${res.thread_id}`;
+    if (location.hash === from) startInflight(res.thread_id);
+    goToNewChat(from, res.thread_id);
   } catch (e) {
     toast(`❌ ${e.message}`);
     btn.disabled = false;
