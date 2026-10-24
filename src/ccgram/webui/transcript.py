@@ -246,6 +246,7 @@ def _result_item(
         "id": block.get("tool_use_id", ""),
         "is_error": bool(block.get("is_error")),
         "text": _clip(_result_text(block.get("content"))),
+        "ts": entry.get("timestamp"),  # when it finished (the call has its own): Kara Hub's turn timeline
     }
     if imgs:
         item["imgs"] = imgs
