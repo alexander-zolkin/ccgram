@@ -1,17 +1,17 @@
-"""Web UI — a browser front-end over the same sessions the Telegram bot drives.
+"""Kara Hub's Telegram module inside ccgram (the old web UI's remains).
 
-CCGRAM-HOTFIX:webui. Telegram stays the primary surface: every web session is
-a forum topic, input typed in the browser reaches the topic through the
-regular non-Telegram-origin relay, and sessions created here open a new topic.
+CCGRAM-HOTFIX:webui. The browser UI moved out to Kara Hub (its own service).
+What stays here is what Telegram and the hub still need: a small loopback API
+the hub drives Telegram topics through (``server``, token-only, see
+CCGRAM-HOTFIX:hub-api), the Telegram preferences set from the hub
+(``prefs``), web-only sessions whose topic is gone (``registry``), the
+notify-when-done pings and the topic probe (``extras``) and the auto-title
+loop that names topics from Claude Code's own title (``autotitle``).
 
-Sub-modules:
-- ``bus``: in-process pub/sub that ``message_routing`` publishes into
-- ``auth``: password login + HMAC-signed session cookie
-- ``service``: session list / history / send / create on top of ccgram state
-- ``server``: aiohttp routes, SSE stream and lifecycle helpers
+``transcript`` and ``agents`` are kept as the source kara-node vendors
+(``kara-node/vendor.sh``); ccgram itself uses only ``transcript.first_exchange``.
 """
 
-from .bus import bus
 from .server import start_webui, stop_webui
 
-__all__ = ["bus", "start_webui", "stop_webui"]
+__all__ = ["start_webui", "stop_webui"]

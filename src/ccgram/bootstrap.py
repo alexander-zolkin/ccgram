@@ -440,7 +440,7 @@ async def bootstrap_application(application: Application) -> None:
 
     await start_miniapp_if_enabled()
 
-    # CCGRAM-HOTFIX:webui — browser front-end over the same sessions.
+    # CCGRAM-HOTFIX:webui — the local API Kara Hub drives Telegram through.
     # Lazy: aiohttp app + handler graph only when the daemon actually boots.
     from .webui import start_webui
 

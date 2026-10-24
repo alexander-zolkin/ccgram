@@ -96,7 +96,7 @@ mutation through the session core (`session_protocol/telegram.py` adapter);
   entry-index cursor (`GrokProvider.read_transcript_file`).
 - `CCGRAM_AUTODELETE_DEAD_TOPICS` (upstream: delete a dead session's topic)
   defaults to **false** in the fork — hibernated topics must survive.
-- The web UI gets the session service through `start_webui(bot, bot_data)`.
+- The hub API (`webui/`) gets the session service through `start_webui(bot, bot_data)`.
 
 ---
 
@@ -113,6 +113,20 @@ break their seams, so they belong on the post-merge checklist:
   `providers/process_detection.py`. Commit `2bcea89`.
 - **Remembered model default** — `last_model.py` + the `seed_remembered_model`
   seam in `directory_browser.py`. Commit `b075a58`. (Tagged `model-picker`.)
+- **Kara Hub's Telegram module** — `webui/` (markers `webui`, `webui-extras`,
+  `webui-hooks`, `webui-effort`, `hub-api`, `tg-relay`). The browser UI moved
+  to Kara Hub (`~/kara-hub`, 23.10.2026) and its page and page-only API were
+  removed here (2026-10-24). What is left, on `CCGRAM_WEBUI_PORT` (loopback,
+  only the hub's `X-Kara-Hub-Token` from `<ccgram dir>/hub_token` opens it):
+  `POST /api/sessions` (new topic + session), `POST /api/sessions/{tid}/`
+  `send|rename|sound|probe|detach|keep|delete`, `GET/POST /api/settings`.
+  Kept with it for Telegram: the saved TG preferences restored at start
+  (`prefs.py` → `webui_prefs.json`: sound modes, mute, relay, notify mode),
+  web-only sessions whose topic was deleted (`registry.py` →
+  `webui_sessions.json`, read by the hub and the idle hibernator), the
+  "notify when done" ⏳ pings (`extras.py` + `hook_events._webui_hook`) and
+  the topic auto-title loop (`autotitle.py`). `transcript.py` / `agents.py`
+  stay as the source `kara-node/vendor.sh` copies.
 
 ## Known test failures (pre-existing, NOT merge regressions)
 

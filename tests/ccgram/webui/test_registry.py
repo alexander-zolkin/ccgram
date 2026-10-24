@@ -17,7 +17,6 @@ def _enable(monkeypatch, on=True):
     from ccgram.config import config
 
     monkeypatch.setattr(config, "webui_port", 8790 if on else 0, raising=False)
-    monkeypatch.setattr(config, "webui_password", "pw" if on else "", raising=False)
 
 
 def _view(cwd, sid="sid-1", tx="/tmp/t.jsonl"):
@@ -163,8 +162,7 @@ async def test_suspected_topic_uses_send_probe(monkeypatch):
     assert (-100, 42) not in tl._suspected_gone
 
 
-def test_new_web_id_is_negative_and_unique():
-    assert registry.new_web_id() == -1
+def test_update_and_negative_ids_from_the_old_page():
     registry.detach(
         -1,
         "@9",
@@ -185,25 +183,11 @@ def test_new_web_id_is_negative_and_unique():
         session_id="",
         transcript_path="",
     )
-    assert registry.new_web_id() == -2
+    assert sorted(registry.entries()) == [-1, 42]
     registry.update(-1, session_id="s1")
     assert registry.get(-1)["session_id"] == "s1"
-
-
-def test_match_default_resolves_suffix_and_alias():
-    from ccgram.model_catalog import ModelChoice
-    from ccgram.webui.service import _match_default
-
-    models = [
-        ModelChoice("claude-sonnet-5-5", "Claude Sonnet 5.5"),
-        ModelChoice("claude-opus-5-5", "Claude Opus 5.5"),
-    ]
-    assert _match_default(models, "claude-opus-5-5[1m]") == (
-        "claude-opus-5-5",
-        "Claude Opus 5.5",
-    )
-    assert _match_default(models, "opus[1m]") == ("claude-opus-5-5", "Claude Opus 5.5")
-    assert _match_default([], "grok-4.5") == ("grok-4.5", "grok-4.5")
+    registry.update(-5, session_id="nobody")  # unknown id: nothing happens
+    assert registry.get(-5) is None
 
 
 def test_codex_models_from_cache(tmp_path, monkeypatch):

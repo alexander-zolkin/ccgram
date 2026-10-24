@@ -1,6 +1,9 @@
-"""Small web-UI preferences shared by every browser (pins, topic sound modes).
+"""Telegram preferences set from Kara Hub (topic sound modes, mute, relay).
 
-Persisted to ``<CCGRAM_DIR>/webui_prefs.json``; stdlib-only leaf module.
+Persisted to ``<CCGRAM_DIR>/webui_prefs.json``; stdlib-only leaf module. The
+hub reads the ``sound`` map straight from the file. Keys this module no longer
+knows (the old web page's ``pinned``, ``web_muted``, ``web_off``) are kept as
+they are on every save.
 """
 
 from __future__ import annotations
@@ -83,7 +86,7 @@ def set_tg_relay(value: str) -> None:
 
 
 def new_chat_telegram() -> bool:
-    """Whether new web chats get a Telegram topic (shared by every device)."""
+    """Whether new hub chats get a Telegram topic (shared by every device)."""
     return bool(_load().get("new_chat_telegram", True))
 
 
@@ -101,39 +104,6 @@ def set_notify_mode(mode: str) -> None:
     _save()
 
 
-def web_muted() -> bool:
-    return bool(_load().get("web_muted", False))
-
-
-def set_web_muted(on: bool) -> None:
-    _load()["web_muted"] = bool(on)
-    _save()
-
-
-def web_off() -> list[int]:
-    raw = _load().get("web_off", [])
-    return [int(x) for x in raw if isinstance(x, int)]
-
-
-def set_web_off(ids: list[int]) -> None:
-    _load()["web_off"] = sorted(set(ids))
-    _save()
-
-
 def reset_for_testing() -> None:
     global _prefs
     _prefs = None
-
-
-def pinned() -> set[int]:
-    return {int(x) for x in _load().get("pinned", []) if isinstance(x, int)}
-
-
-def set_pinned(session_id: int, on: bool) -> None:
-    pins = pinned()
-    if on:
-        pins.add(session_id)
-    else:
-        pins.discard(session_id)
-    _load()["pinned"] = sorted(pins)
-    _save()

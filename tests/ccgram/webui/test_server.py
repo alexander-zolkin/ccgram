@@ -1,36 +1,31 @@
+"""The hub API (CCGRAM-HOTFIX:hub-api): Kara Hub's token, its routes only."""
+
 import asyncio
 import json
-from types import SimpleNamespace
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from ccgram.webui import service
-from ccgram.webui.auth import (
-    MAX_FAILURES,
-    LoginThrottle,
-    issue_cookie,
-    verify_cookie,
-)
-from ccgram.webui.bus import EventBus, bus, publish_new_message
+from ccgram import quiet_threads
+from ccgram.webui import extras, prefs, registry, server, service
 from ccgram.webui.server import build_app
 
-BOT = "1234:abcdef"
-PASSWORD = "s3cret"
-POST_HEADERS = {"X-CCGram": "1"}
+POST = {"X-CCGram": "1"}
 
-SESSIONS = [
-    {
-        "thread_id": 7,
-        "chat_id": -100,
-        "window_id": "@3",
-        "name": "kara 10-21 12-00",
-        "state": "idle",
-        "provider": "claude",
-        "cwd": "/tmp",
-        "last_activity": 1.0,
-    }
-]
+
+@pytest.fixture(autouse=True)
+def _isolated(tmp_path, monkeypatch):
+    monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
+    prefs.reset_for_testing()
+    registry.reset_for_testing()
+    quiet_threads.reset_for_testing()
+    extras.reset_for_testing()
+    server._creates.clear()  # create keys outlive a test otherwise
+    yield
+    prefs.reset_for_testing()
+    registry.reset_for_testing()
+    quiet_threads.reset_for_testing()
+    extras.reset_for_testing()
 
 
 @pytest.fixture
@@ -41,144 +36,155 @@ def calls(monkeypatch):
         log.append(("send", tid, text))
         return {"ok": True, "woke": False, "window_id": "@3"}
 
-    async def fake_history(tid, limit):
-        if tid != 7:
-            raise service.WebUIError("unknown session", 404)
-        return {"messages": [{"role": "user", "text": "hi"}], "total": 1}
-
     async def fake_create(
         bot, text, name, model, provider="claude", effort=None, cwd=None, resume_id=None
     ):
         log.append(("create", text, name) + ((effort,) if effort else ()))
         return {"thread_id": 8, "window_id": "@4", "name": name or "kara"}
 
-    async def fake_list():
-        return SESSIONS
+    async def fake_rename(bot, tid, name):
+        log.append(("rename", tid, name))
+        return {"ok": True, "name": name}
 
-    monkeypatch.setattr(service, "list_sessions", fake_list)
+    async def fake_detach(bot, tid):
+        log.append(("detach", tid))
+        return {"ok": True}
+
+    async def fake_delete(bot, tid):
+        log.append(("delete", tid))
+        return {"ok": True}
+
     monkeypatch.setattr(service, "send_text", fake_send)
-    monkeypatch.setattr(service, "history", fake_history)
     monkeypatch.setattr(service, "create_session", fake_create)
+    monkeypatch.setattr(service, "rename", fake_rename)
+    monkeypatch.setattr(service, "remove_from_telegram", fake_detach)
+    monkeypatch.setattr(service, "delete_session", fake_delete)
     return log
 
 
 @pytest.fixture
 async def client(calls):
-    app = build_app(bot=object(), bot_token=BOT, password=PASSWORD)
+    app = build_app(bot=object())
     async with TestClient(TestServer(app)) as c:
         yield c
 
 
-async def _login(client: TestClient) -> None:
+@pytest.fixture
+def hub():
+    """Headers the hub's adapter sends (kara_hub/adapter.py: old_web)."""
+    return {**POST, server.HUB_TOKEN_HEADER: server._hub_token()}
+
+
+def test_hub_token_is_made_once_0600(tmp_path):
+    token = server._hub_token()
+    assert token and token == server._hub_token()
+    path = tmp_path / "hub_token"
+    assert path.read_text().strip() == token
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+async def test_token_required_and_scoped(client, hub, calls):
+    resp = await client.post("/api/sessions/7/send", json={"text": "hi"}, headers=hub)
+    assert resp.status == 200 and ("send", 7, "hi") in calls
+    wrong = {**hub, server.HUB_TOKEN_HEADER: hub[server.HUB_TOKEN_HEADER] + "x"}
+    assert (
+        await client.post("/api/sessions/7/send", json={}, headers=wrong)
+    ).status == 401
+    assert (
+        await client.post("/api/sessions/7/send", json={}, headers=POST)
+    ).status == 401
+    # No page and nothing else: the old web's routes are gone, even with the token.
+    for path in (
+        "/",
+        "/api/me",
+        "/api/sessions",
+        "/api/sessions/7/entries",
+        "/api/events",
+    ):
+        assert (await client.get(path, headers=hub)).status == 401, path
+    for path in ("/api/login", "/api/sessions/7/key", "/api/push/subscribe"):
+        assert (await client.post(path, json={}, headers=hub)).status == 401, path
+
+
+async def test_post_requires_csrf_header(client, hub):
+    no_csrf = {server.HUB_TOKEN_HEADER: hub[server.HUB_TOKEN_HEADER]}
     resp = await client.post(
-        "/api/login", json={"password": PASSWORD}, headers=POST_HEADERS
+        "/api/sessions/7/send", json={"text": "x"}, headers=no_csrf
     )
-    assert resp.status == 200
-
-
-# ── auth primitives ──────────────────────────────────────────────────────────
-
-
-def test_cookie_roundtrip_and_tamper():
-    c = issue_cookie(BOT, PASSWORD, now=1000)
-    assert verify_cookie(c, BOT, PASSWORD, now=1001)
-    assert not verify_cookie(c, BOT, "other-password", now=1001)
-    assert not verify_cookie(c + "0", BOT, PASSWORD, now=1001)
-    assert not verify_cookie("9999999999.deadbeef", BOT, PASSWORD, now=1001)
-    assert not verify_cookie(None, BOT, PASSWORD)
-
-
-def test_cookie_expires():
-    c = issue_cookie(BOT, PASSWORD, now=1000)
-    assert not verify_cookie(c, BOT, PASSWORD, now=1000 + 31 * 24 * 3600)
-
-
-def test_throttle_blocks_after_max_failures():
-    t = LoginThrottle()
-    for _ in range(MAX_FAILURES):
-        assert not t.blocked("1.2.3.4", now=100)
-        t.record_failure("1.2.3.4", now=100)
-    assert t.blocked("1.2.3.4", now=100)
-    assert not t.blocked("5.6.7.8", now=100)
-    assert not t.blocked("1.2.3.4", now=100 + 16 * 60)
-
-
-# ── HTTP surface ─────────────────────────────────────────────────────────────
-
-
-async def test_index_is_public_and_has_security_headers(client):
-    resp = await client.get("/")
-    assert resp.status == 200
-    assert "frame-ancestors 'none'" in resp.headers["Content-Security-Policy"]
-
-
-async def test_api_requires_login(client):
-    for path in ("/api/me", "/api/sessions", "/api/sessions/7/messages"):
-        resp = await client.get(path)
-        assert resp.status == 401, path
-
-
-async def test_post_requires_csrf_header(client):
-    resp = await client.post("/api/login", json={"password": PASSWORD})
     assert resp.status == 403
 
 
-async def test_wrong_password_then_lockout(client):
-    for _ in range(MAX_FAILURES):
-        resp = await client.post(
-            "/api/login", json={"password": "nope"}, headers=POST_HEADERS
-        )
-        assert resp.status == 401
+async def test_invalid_json_and_bad_id(client, hub):
     resp = await client.post(
-        "/api/login", json={"password": PASSWORD}, headers=POST_HEADERS
+        "/api/sessions/7/send",
+        data="not json",
+        headers={**hub, "Content-Type": "application/json"},
     )
-    assert resp.status == 429
-
-
-async def test_login_sets_httponly_strict_cookie(client):
-    resp = await client.post(
-        "/api/login", json={"password": PASSWORD}, headers=POST_HEADERS
-    )
-    cookie = resp.headers["Set-Cookie"]
-    assert "HttpOnly" in cookie
-    assert "SameSite=Strict" in cookie
-
-
-async def test_sessions_and_history_after_login(client):
-    await _login(client)
-    resp = await client.get("/api/sessions")
-    assert (await resp.json())["sessions"] == SESSIONS
-    resp = await client.get("/api/sessions/7/messages")
-    assert (await resp.json())["total"] == 1
-    resp = await client.get("/api/sessions/99/messages")
-    assert resp.status == 404
-    resp = await client.get("/api/sessions/abc/messages")
     assert resp.status == 400
+    resp = await client.post("/api/sessions/abc/send", json={"text": "x"}, headers=hub)
+    assert resp.status == 401  # not a hub route at all
 
 
-async def test_send_and_create(client, calls):
-    await _login(client)
+async def test_every_route_the_hub_adapter_calls(client, hub, calls, monkeypatch):
+    """The contract with kara_hub/adapter.py: each of its calls answers 200."""
+
+    async def fake_probe(bot, tid):
+        return {"exists": True}
+
+    async def fake_keep(tid):
+        return {"ok": True, "tid": tid}
+
+    async def fake_sound(tid, mode):
+        return {"ok": True, "sound": mode}
+
+    monkeypatch.setattr(extras, "probe_topic", fake_probe)
+    monkeypatch.setattr(service, "keep_web_only", fake_keep)
+    monkeypatch.setattr(service, "set_sound", fake_sound)
+    for path, body in (
+        ("rename", {"name": "Новое"}),
+        ("detach", {}),
+        ("keep", {}),
+        ("delete", {}),
+        ("sound", {"mode": "off"}),
+        ("send", {"text": "wake up"}),
+        ("probe", {}),
+    ):
+        resp = await client.post(f"/api/sessions/7/{path}", json=body, headers=hub)
+        assert resp.status == 200, path
     resp = await client.post(
-        "/api/sessions/7/send", json={"text": "hello"}, headers=POST_HEADERS
+        "/api/sessions",
+        json={"text": "go", "cwd": None, "web_only": False, "key": "k-0123456789"},
+        headers=hub,
     )
-    assert resp.status == 200
-    resp = await client.post(
-        "/api/sessions", json={"text": "go", "name": "demo"}, headers=POST_HEADERS
-    )
-    assert (await resp.json())["thread_id"] == 8
-    assert calls == [("send", 7, "hello"), ("create", "go", "demo")]
+    assert (await resp.json())["window_id"] == "@4"
+    assert (await client.get("/api/settings", headers=hub)).status == 200
+    resp = await client.post("/api/settings", json={"tg_relay": "final"}, headers=hub)
+    assert (await resp.json())["tg_relay"] == "final"
+    assert ("rename", 7, "Новое") in calls and ("detach", 7) in calls
+    assert ("delete", 7) in calls and ("send", 7, "wake up") in calls
+
+
+async def test_create_with_effort_and_no_web_only(client, hub, calls):
     for effort, want in (
         ("low", ("create", "x", None, "low")),
         ("bogus", ("create", "x", None)),
     ):
         await client.post(
-            "/api/sessions", json={"text": "x", "effort": effort}, headers=POST_HEADERS
+            "/api/sessions", json={"text": "x", "effort": effort}, headers=hub
         )
         assert calls[-1] == want
+    # Chats without a topic and other machines are made by the hub itself.
+    resp = await client.post(
+        "/api/sessions", json={"text": "x", "web_only": True}, headers=hub
+    )
+    assert resp.status == 400
+    resp = await client.post(
+        "/api/sessions", json={"text": "x", "device": "pc"}, headers=hub
+    )
+    assert resp.status == 400
 
 
-async def test_create_key_gives_one_session(client, monkeypatch):
-    await _login(client)
+async def test_create_key_gives_one_session(client, hub, monkeypatch):
     made: list[int] = []
     gate = asyncio.Event()
 
@@ -192,228 +198,42 @@ async def test_create_key_gives_one_session(client, monkeypatch):
 
     monkeypatch.setattr(service, "create_session", slow_create)
     body = {"text": "go", "key": "k-0123456789"}
-    # A phone dropped the first request; the page asks again while it runs.
-    first = asyncio.ensure_future(
-        client.post("/api/sessions", json=body, headers=POST_HEADERS)
-    )
+    # The hub's request dropped; it asks again while the first one runs.
+    first = asyncio.ensure_future(client.post("/api/sessions", json=body, headers=hub))
     await asyncio.sleep(0.05)
-    second = asyncio.ensure_future(
-        client.post("/api/sessions", json=body, headers=POST_HEADERS)
-    )
+    second = asyncio.ensure_future(client.post("/api/sessions", json=body, headers=hub))
     await asyncio.sleep(0.05)
     gate.set()
     for resp in (await first, await second):
         assert (await resp.json())["thread_id"] == 8
-    resp = await client.post("/api/sessions", json=body, headers=POST_HEADERS)
+    resp = await client.post("/api/sessions", json=body, headers=hub)
     assert (await resp.json())["thread_id"] == 8
     assert made == [8]
     resp = await client.post(
-        "/api/sessions", json={**body, "key": "k-another-one"}, headers=POST_HEADERS
+        "/api/sessions", json={**body, "key": "k-another-one"}, headers=hub
     )
     assert (await resp.json())["thread_id"] == 9
     # A failed create may be retried under the same key.
     fail = {"text": "fail", "key": "k-failing-key"}
-    resp = await client.post("/api/sessions", json=fail, headers=POST_HEADERS)
+    resp = await client.post("/api/sessions", json=fail, headers=hub)
     assert resp.status == 502
-    resp = await client.post("/api/sessions", json=fail, headers=POST_HEADERS)
+    resp = await client.post("/api/sessions", json=fail, headers=hub)
     assert resp.status == 502
     assert made == [8, 9, 10, 11]
 
 
-async def test_invalid_json_is_400(client):
-    await _login(client)
-    resp = await client.post(
-        "/api/sessions/7/send",
-        data="not json",
-        headers={**POST_HEADERS, "Content-Type": "application/json"},
-    )
-    assert resp.status == 400
-
-
-async def test_events_stream_sessions_then_messages(client):
-    await _login(client)
-    resp = await client.get("/api/events")
-    assert resp.status == 200
-    first = await asyncio.wait_for(resp.content.readline(), 2)
-    assert json.loads(first.decode()[len("data: ") :])["type"] == "sessions"
-    await resp.content.readline()  # blank separator
-    msg = SimpleNamespace(
-        role="assistant",
-        text="done",
-        content_type="text",
-        tool_name=None,
-        tool_use_id=None,
-        is_complete=True,
-    )
-    publish_new_message(msg, [(1, "@3", 7, -100)])
-    line = await asyncio.wait_for(resp.content.readline(), 2)
-    event = json.loads(line.decode()[len("data: ") :])
-    assert event["type"] == "message"
-    assert event["thread_id"] == 7
-    assert event["text"] == "done"
-    resp.close()
-
-
-# ── bus ──────────────────────────────────────────────────────────────────────
-
-
-def test_bus_overflow_turns_into_resync():
-    b = EventBus()
-    q = b.subscribe()
-    for i in range(600):
-        b.publish({"type": "message", "i": i})
-    items = []
-    while not q.empty():
-        items.append(q.get_nowait())
-    assert {"type": "resync"} in items
-    assert len(items) <= 500
-
-
-def test_publish_dedupes_topics_and_skips_without_subscribers():
-    msg = SimpleNamespace(
-        role="user",
-        text="x",
-        content_type="text",
-        tool_name=None,
-        tool_use_id=None,
-        is_complete=True,
-    )
-    # no subscribers: no-op, no error
-    publish_new_message(msg, [(1, "@3", 7, -100)])
-    q = bus.subscribe()
-    try:
-        publish_new_message(msg, [(1, "@3", 7, -100), (2, "@3", 7, -100)])
-        assert q.qsize() == 1
-    finally:
-        bus.unsubscribe(q)
-
-
-def test_key_whitelist():
-    assert "Enter" in service.ALLOWED_KEYS
-    assert "1" in service.ALLOWED_KEYS
-    assert "rm -rf" not in service.ALLOWED_KEYS
-
-
-async def test_entries_rename_upload_routes(client, monkeypatch):
-    seen = {}
-
-    async def fake_entries(tid, *, limit, before, after):
-        seen["entries"] = (tid, limit, before, after)
-        return {"items": [], "start": 0, "end": 10, "structured": True}
-
-    async def fake_rename(bot, tid, name):
-        seen["rename"] = (tid, name)
-        return {"ok": True, "name": name}
-
-    def fake_save(tid, filename, data):
-        seen["upload"] = (tid, filename, data)
-        return {"path": ".ccgram-uploads/x", "name": filename, "image": False}
-
-    monkeypatch.setattr(service, "entries", fake_entries)
-    monkeypatch.setattr(service, "rename", fake_rename)
-    monkeypatch.setattr(service, "save_upload", fake_save)
-    await _login(client)
-    resp = await client.get("/api/sessions/7/entries?limit=20&after=5")
-    assert (await resp.json())["end"] == 10
-    assert seen["entries"] == (7, 20, None, 5)
-    resp = await client.get("/api/sessions/7/entries?before=abc")
-    assert resp.status == 400
-    resp = await client.post(
-        "/api/sessions/7/rename", json={"name": "Новое"}, headers=POST_HEADERS
-    )
-    assert seen["rename"] == (7, "Новое")
-    import aiohttp
-
-    form = aiohttp.FormData()
-    form.add_field("file", b"hello", filename="a.txt")
-    resp = await client.post("/api/sessions/7/upload", data=form, headers=POST_HEADERS)
-    assert resp.status == 200
-    assert seen["upload"] == (7, "a.txt", b"hello")
-
-
-def test_save_upload_sanitizes_and_stays_inside(tmp_path, monkeypatch):
-    b = service.Binding(1, -100, 7, "@3")
-    monkeypatch.setattr(service, "find_binding", lambda tid: b)
-    monkeypatch.setattr(service, "_cwd_for", lambda binding: str(tmp_path))
-    res = service.save_upload(7, "../../etc/pass wd?.png", b"data")
-    saved = tmp_path / res["path"]
-    assert saved.read_bytes() == b"data"
-    assert saved.parent == tmp_path / ".ccgram-uploads"
-    assert res["image"] is True
-    import pytest as _pytest
-
-    with _pytest.raises(service.WebUIError):
-        service.save_upload(7, "big.bin", b"x" * (service.MAX_UPLOAD + 1))
-
-
-async def test_session_menu_routes(client, monkeypatch):
-    seen = []
-
-    async def rec(name, *args):
-        seen.append((name, *args))
-        return {"ok": True}
-
-    monkeypatch.setattr(service, "set_pin", lambda tid, on: rec("pin", tid, on))
-    monkeypatch.setattr(
-        service, "remove_from_telegram", lambda bot, tid: rec("detach", tid)
-    )
-    monkeypatch.setattr(service, "delete_session", lambda bot, tid: rec("delete", tid))
-
-    async def models():
-        return {"models": [{"id": "m1", "name": "M1"}], "default": "m1"}
-
-    monkeypatch.setattr(service, "list_models", models)
-    monkeypatch.setattr(
-        service, "save_upload", lambda tid, fn, data: {"path": f"x/{fn}", "tid": tid}
-    )
-    await _login(client)
-    for path, body in (("pin", {"pinned": True}), ("detach", {}), ("delete", {})):
-        resp = await client.post(
-            f"/api/sessions/7/{path}", json=body, headers=POST_HEADERS
-        )
-        assert resp.status == 200, path
-    assert seen == [("pin", 7, True), ("detach", 7), ("delete", 7)]
-    assert (await (await client.get("/api/models")).json())["default"] == "m1"
-    import aiohttp
-
-    form = aiohttp.FormData()
-    form.add_field("file", b"x", filename="n.txt")
-    resp = await client.post("/api/uploads", data=form, headers=POST_HEADERS)
-    assert (await resp.json())["tid"] is None
-
-
-def test_valid_model():
-    assert service.valid_model("claude-opus-5-5") == "claude-opus-5-5"
-    assert service.valid_model("claude-opus-5-5[1m]") == "claude-opus-5-5[1m]"
-    assert service.valid_model("x; rm -rf /") is None
-    assert service.valid_model(None) is None
-
-
-async def test_keep_route(client, monkeypatch):
-    async def keep(tid):
-        return {"ok": True, "tid": tid}
-
-    monkeypatch.setattr(service, "keep_web_only", keep)
-    await _login(client)
-    resp = await client.post("/api/sessions/42/keep", json={}, headers=POST_HEADERS)
-    assert (await resp.json())["tid"] == 42
-
-
-async def test_settings_roundtrip(client, tmp_path, monkeypatch):
-    from ccgram import quiet_threads
-    from ccgram.webui import prefs
-
-    monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
-    prefs.reset_for_testing()
-    await _login(client)
-    resp = await client.get("/api/settings")
-    got = await resp.json()
-    assert got["tg_muted"] is False and got["new_chat_telegram"] is True
-    assert got["notify_mode"] == "done"  # only a turn's last reply rings
+async def test_settings_roundtrip(client, hub):
+    got = await (await client.get("/api/settings", headers=hub)).json()
+    assert got == {
+        "tg_muted": False,
+        "tg_relay": "all",
+        "new_chat_telegram": True,
+        "notify_mode": "done",  # only a turn's last reply rings
+    }
     resp = await client.post(
         "/api/settings",
         json={"new_chat_telegram": False, "tg_muted": True, "notify_mode": "each"},
-        headers=POST_HEADERS,
+        headers=hub,
     )
     got = await resp.json()
     assert got["tg_muted"] is True and got["new_chat_telegram"] is False
@@ -421,27 +241,93 @@ async def test_settings_roundtrip(client, tmp_path, monkeypatch):
     prefs.reset_for_testing()
     assert prefs.new_chat_telegram() is False and prefs.tg_muted() is True
     assert prefs.notify_mode() == "each"
-    from ccgram.webui import extras
 
-    extras.reset_for_testing()
-    quiet_threads.reset_for_testing()
+
+@pytest.fixture
+async def real_client():
+    """The app over the real service functions (no ``calls`` fakes)."""
+    async with TestClient(TestServer(build_app(bot=object()))) as c:
+        yield c
+
+
+async def test_web_only_session_through_real_service(
+    real_client, hub, tmp_path, monkeypatch
+):
+    """Rename / sound / probe / keep / delete of a web-only session, unfaked."""
+    client = real_client
+
+    async def asleep(_wid):
+        return False
+
+    monkeypatch.setattr(service, "_window_alive", asleep)  # never touch tmux
+    monkeypatch.setattr(service, "_bindings", lambda: [])
+    registry.detach(
+        42,
+        "@9",
+        name="kara 10-24 12-00",
+        cwd=str(tmp_path),
+        provider="claude",
+        approval_mode="normal",
+        session_id="s-42",
+        transcript_path="",
+    )
+    resp = await client.post(
+        "/api/sessions/42/rename", json={"name": "Итог"}, headers=hub
+    )
+    assert (await resp.json())["name"] == "Итог"
+    resp = await client.post(
+        "/api/sessions/42/sound", json={"mode": "off"}, headers=hub
+    )
+    assert (await resp.json())["sound"] == "off"
+    # The hub reads the sound map straight from the file.
+    saved = json.loads((tmp_path / "webui_prefs.json").read_text())
+    assert saved["sound"] == {"42": "off"}
+    resp = await client.post("/api/sessions/42/probe", json={}, headers=hub)
+    assert (await resp.json()) == {"exists": None}
+    resp = await client.post("/api/sessions/42/keep", json={}, headers=hub)
+    assert resp.status == 200
+    entry = json.loads((tmp_path / "webui_sessions.json").read_text())["42"]
+    assert entry["origin"] == "kept" and entry["name"] == "Итог"
+    resp = await client.post("/api/sessions/42/delete", json={}, headers=hub)
+    assert resp.status == 200
+    assert json.loads((tmp_path / "webui_sessions.json").read_text()) == {}
+    resp = await client.post("/api/sessions/42/keep", json={}, headers=hub)
+    assert resp.status == 404
+
+
+async def test_settings_keep_unknown_pref_keys(client, hub, tmp_path):
+    """Keys only the old page used stay in webui_prefs.json untouched."""
+    (tmp_path / "webui_prefs.json").write_text(
+        json.dumps({"pinned": [7], "web_off": [3], "sound": {"7": "on"}})
+    )
     prefs.reset_for_testing()
+    await client.post("/api/settings", json={"tg_muted": True}, headers=hub)
+    saved = json.loads((tmp_path / "webui_prefs.json").read_text())
+    assert saved == {
+        "pinned": [7],
+        "web_off": [3],
+        "sound": {"7": "on"},
+        "tg_muted": True,
+    }
 
 
-# ── CCGRAM-HOTFIX:hub-api: Kara Hub's token, its routes only ─────────────────
+async def test_start_restores_telegram_prefs(tmp_path, monkeypatch):
+    from ccgram.config import config
 
-
-async def test_hub_token_opens_only_the_hub_routes(client, calls):
-    from ccgram.webui import server
-
-    token = server._hub_token()
-    assert token and token == server._hub_token(), "made once, then read"
-    h = {**POST_HEADERS, server.HUB_TOKEN_HEADER: token}
-    resp = await client.post("/api/sessions/7/send", json={"text": "hi"}, headers=h)
-    assert resp.status == 200 and ("send", 7, "hi") in calls
-    wrong = {**POST_HEADERS, server.HUB_TOKEN_HEADER: token + "x"}
-    assert (await client.post("/api/sessions/7/send", json={"text": "hi"}, headers=wrong)).status == 401
-    assert (await client.post("/api/sessions/7/send", json={"text": "hi"}, headers=POST_HEADERS)).status == 401
-    # Everything else of the old web stays closed to the hub's token.
-    assert (await client.get("/api/sessions", headers=h)).status == 401
-    assert (await client.get("/api/sessions/7/history", headers=h)).status == 401
+    (tmp_path / "webui_prefs.json").write_text(
+        json.dumps(
+            {
+                "sound": {"7": "off"},
+                "tg_muted": True,
+                "tg_relay": "final",
+                "notify_mode": "each",
+            }
+        )
+    )
+    prefs.reset_for_testing()
+    monkeypatch.setattr(config, "webui_port", 0)
+    await server.start_webui(object(), {})  # off: nothing restored, nothing bound
+    assert quiet_threads.mode(7) == "auto" and not quiet_threads.all_muted()
+    server.restore_telegram_prefs()
+    assert quiet_threads.mode(7) == "off" and quiet_threads.all_muted()
+    assert quiet_threads.relay() == "final" and extras.notify_mode() == "each"

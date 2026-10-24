@@ -26,7 +26,6 @@ from ..interactive import (
 )
 from ..response_builder import build_response_parts
 from ..telegram_origin import consume_telegram_injection
-from ...webui.bus import publish_new_message, publish_web_only_message
 from .message_queue import enqueue_content_message, get_or_create_queue
 
 logger = structlog.get_logger()
@@ -215,9 +214,7 @@ async def handle_new_message(msg: NewMessage, client: TelegramClient) -> None:  
     active_users = session_query.find_users_for_session(msg.session_id)
 
     if not active_users:
-        # CCGRAM-HOTFIX:webui — topic gone, session lives on in the browser.
-        if not publish_web_only_message(msg):
-            _handle_unroutable_message(msg)
+        _handle_unroutable_message(msg)
         return
 
     for user_id, window_id, thread_id, chat_id in active_users:
@@ -242,10 +239,6 @@ async def handle_new_message(msg: NewMessage, client: TelegramClient) -> None:  
                     msg.content_type,
                 )
                 continue
-
-        # CCGRAM-HOTFIX:webui — mirror every relayable message to the browser,
-        # including Telegram-typed prompts the topic itself suppresses below.
-        publish_new_message(msg, [(user_id, window_id, thread_id, chat_id)])
 
         if (
             msg.is_complete

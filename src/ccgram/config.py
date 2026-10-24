@@ -342,12 +342,11 @@ class Config:
         self._init_webui()
 
     def _init_webui(self) -> None:
-        # CCGRAM-HOTFIX:webui — standalone browser UI over the same sessions.
-        # Disabled unless both a port and a password are set; binds loopback by
-        # default and expects a reverse proxy (Caddy) in front of it.
+        # CCGRAM-HOTFIX:webui — the local API Kara Hub drives Telegram topics
+        # through (the browser UI itself moved to the hub). Off unless a port
+        # is set; binds loopback by default; only the hub's token opens it.
         self.webui_port: int = _parse_int_env("CCGRAM_WEBUI_PORT", 0)
         self.webui_host: str = os.getenv("CCGRAM_WEBUI_HOST", "127.0.0.1")
-        self.webui_password: str = os.getenv("CCGRAM_WEBUI_PASSWORD", "")
         self.webui_show_private: bool = os.getenv(
             "CCGRAM_WEBUI_SHOW_PRIVATE", ""
         ).lower() in ("1", "true", "yes")

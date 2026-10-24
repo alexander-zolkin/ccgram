@@ -1,13 +1,16 @@
-"""Web-only sessions: topics deleted (or closed) in Telegram that live on in the browser.
+"""Web-only sessions: topics deleted (or closed) in Telegram that live on in the hub.
 
-When the web UI is enabled, losing a topic no longer kills its session.
-The session is "detached" instead: its window keeps running, and it is
-recorded here under its old thread id, which stays its web id. The topic
-plumbing consults :func:`is_web_only` so it neither re-creates a topic for
-the window (orphan adoption) nor reaps it (unbound TTL).
+When the hub API is enabled (``CCGRAM_WEBUI_PORT``), losing a topic no longer
+kills its session. The session is "detached" instead: its window keeps
+running, and it is recorded here under its old thread id, which stays its web
+id. The topic plumbing consults :func:`is_web_only` so it neither re-creates a
+topic for the window (orphan adoption) nor reaps it (unbound TTL).
 
 Persisted to ``<CCGRAM_DIR>/webui_sessions.json`` so a daemon restart keeps
-them. Leaf module: stdlib + config only, safe to import from anywhere.
+them; Kara Hub maps these ids to session ids from that file and the idle
+hibernator reads it too. Negative ids are sessions the old web page started
+without a topic. Leaf module: stdlib + config only, safe to import from
+anywhere.
 """
 
 from __future__ import annotations
@@ -63,7 +66,7 @@ def enabled() -> bool:
     # Lazy: config reads env at import; keep this leaf importable early.
     from ..config import config
 
-    return bool(config.webui_port and config.webui_password)
+    return bool(config.webui_port)
 
 
 def is_web_only(window_id: str) -> bool:
@@ -97,8 +100,8 @@ def detach(
     """Record a web-only session.
 
     ``origin`` says how it became web-only: ``telegram`` (its topic was
-    deleted or closed there — the web UI asks whether to delete it too),
-    ``web`` (removed from Telegram or born web-only in the browser) or
+    deleted or closed there — the hub asks whether to delete it too),
+    ``web`` (removed from Telegram, or born web-only in the old web page) or
     ``kept`` (a ``telegram`` one the person chose to keep).
     """
     _load()[thread_id] = {
@@ -116,11 +119,6 @@ def detach(
     logger.info(
         "webui: topic %d detached, window %s kept web-only", thread_id, window_id
     )
-
-
-def new_web_id() -> int:
-    """Id for a session born web-only: negative, so it never meets a thread id."""
-    return min([0, *_load().keys()]) - 1
 
 
 def update(web_id: int, /, **fields: Any) -> None:
@@ -162,7 +160,7 @@ def detach_from_topic(
 
     Called by the topic-deletion / topic-close paths BEFORE they kill the
     window. Returns True when the session was kept (the caller must then not
-    kill the window), False when the web UI is off or the session is private.
+    kill the window), False when the hub API is off or the session is private.
     Never raises.
     """
     try:

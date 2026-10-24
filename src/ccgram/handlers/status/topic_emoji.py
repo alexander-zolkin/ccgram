@@ -231,20 +231,6 @@ def get_stored_topic_name(chat_id: int, thread_id: int) -> str | None:
     return _topic_names.get((chat_id, thread_id))
 
 
-def get_topic_state(chat_id: int, thread_id: int) -> str | None:
-    """CCGRAM-HOTFIX:webui — freshest known lifecycle state for a topic.
-
-    The pending (still debouncing) transition wins over the applied one, so
-    the web UI shows "active" as soon as the poller sees it, not 5-30s later.
-    """
-    key = (chat_id, thread_id)
-    pending = _pending_transitions.get(key)
-    if pending is not None:
-        return pending[0]
-    applied = _topic_states.get(key)
-    return applied[0] if applied else None
-
-
 # Flood-control cooldown (upstream #199): after a RetryAfter on a topic
 # rename, renames for that chat pause entirely for this long. Without it,
 # the unapplied state re-arms the debounce every cycle and re-attempts the

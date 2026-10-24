@@ -48,7 +48,8 @@ _webui_tasks: set[asyncio.Task] = set()
 
 
 def _webui_hook(kind: str, event: HookEvent, client: TelegramClient) -> None:
-    """Hand a Stop / Notification hook to the web UI (no-op when it's off)."""
+    """Hand a Stop / Notification hook to the notify-when-done pings (no-op
+    when the hub API is off)."""
     try:
         # Lazy: the web UI is an optional surface.
         from ..config import config
@@ -122,7 +123,7 @@ def _resolve_user_chats_for_window_key(
 
 async def _handle_notification(event: HookEvent, client: TelegramClient) -> None:
     """Handle a Notification event — render interactive UI."""
-    # CCGRAM-HOTFIX:webui-hooks — permission / plan prompts ring + push.
+    # CCGRAM-HOTFIX:webui-hooks — permission / plan prompts ring ("⏳" ping).
     _webui_hook("notification", event, client)
     users = _resolve_user_chats_for_window_key(event.window_key)
     if not users:
@@ -237,8 +238,8 @@ async def _handle_stop(event: HookEvent, client: TelegramClient) -> None:
     topics, so Stop only updates the status bubble.
     """
 
-    # CCGRAM-HOTFIX:webui-hooks — "notify when done" ping + push; runs before
-    # the binding check so web-only chats (no topic) get their push too.
+    # CCGRAM-HOTFIX:webui-hooks — "notify when done": the turn's "⏳" ping is
+    # deleted once the agent stops.
     _webui_hook("stop", event, client)
 
     users = _resolve_users_for_window_key(event.window_key)
