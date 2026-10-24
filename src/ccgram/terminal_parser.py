@@ -664,6 +664,12 @@ def _find_status_line_index(lines: list[str], scan_start: int) -> int | None:
             # "⎿" opens a hint under the spinner, never the spinner itself.
             if candidate[0] == "\u23bf":
                 break
+            # CCGRAM-HOTFIX:reply-bullet-not-spinner — "●" (older "⏺") opens a
+            # reply or a notice ("● Compacted while idle, before the prompt
+            # cache expired · …"), never the spinner; a one-line one right above
+            # the input box kept an idle chat "working" and the web UI animating.
+            if candidate[0] in ("\u25cf", "\u23fa"):
+                break
             if is_likely_spinner(candidate[0]):
                 return j + 1
             break

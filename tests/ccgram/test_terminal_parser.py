@@ -177,6 +177,24 @@ class TestParseStatusLine:
         pane = f"{above}  ⎿  42 passed\n     in 3.1s\n{_SEPARATOR}\n❯ \n{_SEPARATOR}\n"
         assert parse_status_line(pane) is None
 
+
+    @pytest.mark.parametrize(
+        "last",
+        [
+            pytest.param(
+                '● Compacted while idle, before the prompt cache expired ·\xa0turn off with "idleCompaction": false in settings.json',
+                id="idle_compaction_notice",
+            ),
+            pytest.param("● Готово.", id="one_line_reply"),
+            pytest.param("⏺ Done.", id="old_reply_bullet"),
+        ],
+    )
+    def test_reply_bullet_above_the_box_is_not_status(self, last: str):
+        # A one-line reply or notice right above the input box is no spinner:
+        # read as one, an idle chat stayed "working" (⏳, LED, live row).
+        pane = f"✻ Churned for 48s · done 6:08 PM\n  ⎿  Read x.sh (167 lines)\n\n{last}\n\n{_SEPARATOR}\n❯ \n{_SEPARATOR}\n"
+        assert parse_status_line(pane) is None
+
     def test_adaptive_scan_finds_distant_separator(self):
         pane = f"✻ Doing work\n{_SEPARATOR}\n" + "trailing\n" * 16
         assert parse_status_line(pane) == "Doing work"
