@@ -399,7 +399,7 @@ async def _mark_retained_topic_dead(
 
     CCGRAM-HOTFIX:quiet-dead-banner — on this host a window death is routine
     (the idle hibernator kills idle windows; ``autoresume`` wakes them on the
-    next message), so the topic only gets the 💀 emoji. The unsolicited
+    next message), so the topic only gets the 💤 emoji (dead-emoji-sleep). The unsolicited
     "Session … ended." banner comes back only with ``CCGRAM_DEAD_BANNER=1``.
     A topic deleted while its window died is caught by the periodic
     ``probe_topic_existence``.

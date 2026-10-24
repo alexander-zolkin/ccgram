@@ -46,13 +46,17 @@ _TOPIC_NAME_LIMIT = 128
 EMOJI_GREEN_CIRCLE = "\U0001f7e2"
 EMOJI_YELLOW_CIRCLE = "\U0001f7e1"
 EMOJI_DONE = "\u2705"  # Check mark (agent exited normally)
-EMOJI_DEAD = "\U0001f4a5"  # Collision / crash
+# CCGRAM-HOTFIX:dead-emoji-sleep — a dead window here is a session asleep (the
+# idle hibernator, a reboot; the next message wakes it), not a crash: 💤, as
+# Kara Hub says «спит». 💥 stays in the legacy list so old names get stripped.
+EMOJI_DEAD = "\U0001f4a4"  # Sleeping
 EMOJI_YOLO = "\U0001f3b2"  # Dice (risk/gamble — auto-approve mode)
 EMOJI_RC = "\U0001f4e1"  # Satellite dish (Remote Control active)
 _EMOJI_DEAD_OLD = (
     "\u26ab",
     "\u274c",
-)  # Legacy dead emoji (black circle pre-2026-02, cross mark pre-2026-03)
+    "\U0001f4a5",
+)  # Legacy dead emoji (black circle pre-2026-02, cross mark pre-2026-03, collision pre-2026-10-24)
 
 # Backward-compatible aliases — original (system-mode) defaults.
 EMOJI_ACTIVE = EMOJI_GREEN_CIRCLE

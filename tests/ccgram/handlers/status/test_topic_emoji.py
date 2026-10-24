@@ -59,6 +59,7 @@ class TestStripEmojiPrefix:
             (f"{EMOJI_IDLE} myproject", "myproject"),
             (f"{EMOJI_DONE} myproject", "myproject"),
             (f"{EMOJI_DEAD} myproject", "myproject"),
+            ("\U0001f4a5 myproject", "myproject"),  # the dead emoji before 💤 (dead-emoji-sleep)
             (f"{EMOJI_GREEN_CIRCLE} myproject", "myproject"),
             (f"{EMOJI_YELLOW_CIRCLE} myproject", "myproject"),
             (f"{EMOJI_YOLO} myproject", "myproject"),
