@@ -8,6 +8,15 @@ pipx upgrade ccgram                   # pipx
 brew upgrade ccgram                   # Homebrew
 ```
 
+Restart the running bot after upgrading, and check `ccgram --version`. If the bot runs from a development checkout, also upgrade the global executable used by agent hooks. A hook that invokes bare `ccgram` uses the agent's `PATH`, independently of the bot's installation; see [protocol compatibility](#protocol-version-pinning).
+
+### Upgrading from 4.10 to 4.11
+
+- Remove `--autoclose-done`, `--autoclose-dead`, `AUTOCLOSE_DONE_MINUTES`, and `AUTOCLOSE_DEAD_MINUTES` from launch commands and configuration. Confirmed terminal-session closure now triggers topic and history deletion without a grace timer.
+- Keep **Delete Messages** enabled for the bot administrator. **Manage Topics** alone only permits closing a topic, which leaves it visible.
+- Run `/sync` to retry cleanup of locally known old topics. Topics whose IDs are no longer recorded cannot be discovered through the Bot API.
+- Use `--unbound-window-ttl` / `UNBOUND_WINDOW_TTL_MINUTES` only for inactive terminal windows without a topic binding; it does not delay topic deletion.
+
 ## CLI Reference
 
 ```text
@@ -45,7 +54,7 @@ You need a Telegram bot token to run CCGram. Create one via [@BotFather](https:/
    - Disable **Group Privacy** so the bot can read all group-topic messages.
 4. **Choose a topic setup:**
    - **Private chat:** Open the bot chat. Topic 1 is the General/control topic.
-   - **Group:** Create or open a Topics-enabled group. Add the bot and promote it to Administrator with Create Topics, Pin Messages, and Read Messages permissions.
+   - **Group:** Create or open a Topics-enabled group. Add the bot and promote it to Administrator with Manage Topics, Delete Messages, and Pin Messages permissions. Delete Messages is required to remove a topic and its history; Manage Topics alone is insufficient.
 5. **Get your user ID:** Open [@userinfobot](https://t.me/userinfobot). Save the numeric ID for `ALLOWED_USERS`.
 6. **For a group, get its ID:** Open [@RawDataBot](https://t.me/RawDataBot) in the group. Save the Peer ID for `CCGRAM_GROUP_ID`. Both forms with and without the `-100` prefix work.
 7. **Create `~/.ccgram/.env`:**
@@ -79,10 +88,12 @@ A session can change after the fresh guard and before Herdr receives an action. 
 ### Shared tabs and topic names
 
 Herdr exposes one Telegram topic for each agent session, not one topic for each
-tab. Every generated name is `<workspace> ▸ <tab> ▸ <pane>`, including a tab
-that currently has one agent. The pane suffix distinguishes siblings without
-flapping when siblings join or leave, but it remains display state rather than
-identity and can change when Herdr remints pane locators.
+tab. Every generated name is `<Provider> ▸ <workspace> ▸ <tab> ▸ <pane>`,
+including a tab that currently has one agent. If Herdr has not published labels
+yet, the temporary display name is `<Provider> ▸ Herdr ▸ <target-suffix>`. The
+provider prefix makes agent topics searchable; the pane suffix distinguishes
+siblings without flapping when siblings join or leave. Both remain display
+state rather than identity and can change when Herdr updates its live labels.
 
 Telegram topic rename is disabled for shared tabs because Herdr's tab rename
 would rename every sibling. Rename the Herdr tab directly only when its tab has
@@ -188,55 +199,59 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 
 <!-- markdownlint-disable MD060 -->
 
-| Variable / Flag                                      | Default                        | Description                                                                                          |
-| ---------------------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `TELEGRAM_BOT_TOKEN`                                 | _(required)_                   | Bot token from @BotFather (env only)                                                                 |
-| `ALLOWED_USERS` / `--allowed-users`                  | _(required)_                   | Comma-separated Telegram user IDs                                                                    |
-| `CCGRAM_DIR` / `--config-dir`                        | `~/.ccgram`                    | Config and state directory                                                                           |
-| `CLAUDE_CONFIG_DIR` / `--claude-config-dir`          | `~/.claude`                    | Override Claude config directory (for wrappers like ce, cc-mirror)                                   |
-| `TMUX_SESSION_NAME` / `--tmux-session`               | `ccgram`                       | tmux session name                                                                                    |
-| `CCGRAM_MULTIPLEXER`                                 | `tmux`                         | Terminal multiplexer backend: `tmux` (default), `herdr` or `agterm`                                  |
-| `CCGRAM_AGTERM_WORKSPACES`                           | `ccgram`                       | agterm only: workspaces ccgram may adopt sessions from (comma-separated; `*` for all)                |
-| `CCGRAM_PROVIDER` / `--provider`                     | `claude`                       | Default agent provider (`claude`, `codex`, `gemini`, `pi`, `shell`)                                  |
-| `CCGRAM_<NAME>_COMMAND`                              | _(from provider)_              | Per-provider launch command (env only, see below)                                                    |
-| `CCGRAM_GROUP_ID` / `--group-id`                     | _(all groups)_                 | Restrict to one Telegram group                                                                       |
-| `CCGRAM_INSTANCE_NAME` / `--instance-name`           | hostname                       | Display label for this instance                                                                      |
-| `CCGRAM_LOG_LEVEL` / `--log-level`                   | `INFO`                         | Logging level (DEBUG, INFO, WARNING, ERROR)                                                          |
-| `MONITOR_POLL_INTERVAL` / `--monitor-interval`       | `2.0`                          | Seconds between transcript polls                                                                     |
-| `AUTOCLOSE_DONE_MINUTES` / `--autoclose-done`        | `30`                           | Auto-close done topics after N minutes (0=off)                                                       |
-| `AUTOCLOSE_DEAD_MINUTES` / `--autoclose-dead`        | `10`                           | Auto-close dead sessions after N minutes (0=off)                                                     |
-| `CCGRAM_WHISPER_PROVIDER` / `--whisper-provider`     | _(empty)_                      | Whisper provider: `openai`, `groq`, or empty to disable                                              |
-| `CCGRAM_WHISPER_API_KEY`                             | _(empty)_                      | API key (env only); falls back to OPENAI_API_KEY/GROQ_API_KEY                                        |
-| `CCGRAM_WHISPER_BASE_URL` / `--whisper-base-url`     | _(provider default)_           | Custom OpenAI-compatible endpoint URL                                                                |
-| `CCGRAM_WHISPER_MODEL` / `--whisper-model`           | _(provider default)_           | Model override (e.g., `whisper-large-v3-turbo`)                                                      |
-| `CCGRAM_WHISPER_LANGUAGE` / `--whisper-language`     | _(auto-detect)_                | Force language code (e.g., `en`, `zh`)                                                               |
-| `CCGRAM_LLM_PROVIDER`                                | _(empty = disabled)_           | LLM provider for shell command generation                                                            |
-| `CCGRAM_LLM_API_KEY`                                 | _(empty)_                      | API key for LLM provider (env only)                                                                  |
-| `CCGRAM_LLM_BASE_URL`                                | _(from provider)_              | Custom LLM API endpoint                                                                              |
-| `CCGRAM_LLM_MODEL`                                   | _(from provider)_              | LLM model override                                                                                   |
-| `CCGRAM_LLM_TEMPERATURE`                             | `0.1`                          | LLM sampling temperature (0 = deterministic)                                                         |
-| `CCGRAM_LIVE_VIEW_INTERVAL` / `--live-view-interval` | `5`                            | Live view refresh interval in seconds (min 1)                                                        |
-| `CCGRAM_LIVE_VIEW_TIMEOUT` / `--live-view-timeout`   | `300`                          | Live view auto-stop timeout in seconds (min 1)                                                       |
-| `CCGRAM_STATUS_MODE` / `--status-mode`               | `system`                       | Topic emoji color scheme: `system` (green=working) or `user` (green=ready)                           |
-| `CCGRAM_HIDE_TOOL_CALLS` / `--hide-tool-calls`       | `false`                        | Set `true` to globally hide `tool_use`/`tool_result` messages (per-window override via `/toolcalls`) |
-| `CCGRAM_HIDE_THINKING` / `--hide-thinking`           | `false`                        | Set `true` to globally hide thinking messages                                                        |
-| `CCGRAM_HIDE_STATUS`                                 | `false`                        | Set `true` to suppress transient status bubbles; replies and controls remain available              |
-| `CCGRAM_VOICE_AUTOSEND`                              | `false`                        | Set `true` to send voice transcriptions without confirmation; transcription is still shown           |
-| `CCGRAM_PROMPT_MODE` / `--prompt-mode`               | `wrap`                         | Shell prompt marker: `wrap` (append `⌘N⌘`) or `replace` (legacy `{prefix}:N❯`)                       |
-| `CCGRAM_PROMPT_MARKER`                               | `ccgram`                       | Marker prefix used only by `replace` mode                                                            |
-| `CCGRAM_PANE_LIFECYCLE_NOTIFY`                       | `false`                        | Default for per-window pane create/close notifications (toggle via `/panes`)                         |
-| `CCGRAM_SHOW_HIDDEN_DIRS` / `--show-hidden-dirs`     | `false`                        | Show dot-directories in the directory browser                                                        |
-| `CCGRAM_SEND_SEARCH_DEPTH`                           | `5`                            | Max directory depth for `/send` file search                                                          |
-| `CCGRAM_SEND_MAX_RESULTS`                            | `50`                           | Max file results returned by `/send` search                                                          |
-| `CCGRAM_TOOLBAR_CONFIG`                              | `~/.ccgram/toolbar.toml`       | Path to custom toolbar TOML; falls back to built-in defaults if missing                              |
-| `CCGRAM_STATUS_POLL_INTERVAL`                        | `1.0`                          | Status polling interval in seconds (min 0.5)                                                         |
-| `CCGRAM_MINIAPP_BASE_URL`                            | _(disabled)_                   | Externally reachable HTTPS URL for the Mini App dashboard                                            |
-| `CCGRAM_MINIAPP_HOST`                                | `127.0.0.1`                    | Local bind host for the Mini App aiohttp server                                                      |
-| `CCGRAM_MINIAPP_PORT`                                | `8765`                         | Local bind port for the Mini App aiohttp server                                                      |
-| `CCGRAM_TTS_PROVIDER`                                | _(disabled)_                   | TTS backend for voice replies: `edge` (free) or `openai`                                             |
-| `CCGRAM_TTS_VOICE`                                   | `en-US-EmmaMultilingualNeural` | Voice name                                                                                           |
-| `CCGRAM_TTS_MODEL`                                   | `gpt-4o-mini-tts`              | OpenAI TTS model (only used when `CCGRAM_TTS_PROVIDER=openai`)                                       |
-| `CCGRAM_TTS_API_KEY`                                 | _(empty)_                      | API key for OpenAI TTS; falls back to `OPENAI_API_KEY`                                               |
+| Variable / Flag                                       | Default                        | Description                                                                                          |
+| ----------------------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN`                                  | _(required)_                   | Bot token from @BotFather (env only)                                                                 |
+| `ALLOWED_USERS` / `--allowed-users`                   | _(required)_                   | Comma-separated Telegram user IDs                                                                    |
+| `CCGRAM_DIR` / `--config-dir`                         | `~/.ccgram`                    | Config and state directory                                                                           |
+| `CLAUDE_CONFIG_DIR` / `--claude-config-dir`           | `~/.claude`                    | Override Claude config directory (for wrappers like ce, cc-mirror)                                   |
+| `TMUX_SESSION_NAME` / `--tmux-session`                | `ccgram`                       | tmux session name                                                                                    |
+| `CCGRAM_MULTIPLEXER`                                  | `tmux`                         | Terminal multiplexer backend: `tmux` (default), `herdr` or `agterm`                                  |
+| `CCGRAM_AGTERM_WORKSPACES`                            | `ccgram`                       | agterm only: workspaces ccgram may adopt sessions from (comma-separated; `*` for all)                |
+| `CCGRAM_PROVIDER` / `--provider`                      | `claude`                       | Default agent provider (`claude`, `codex`, `gemini`, `pi`, `shell`)                                  |
+| `CCGRAM_<NAME>_COMMAND`                               | _(from provider)_              | Per-provider launch command (env only, see below)                                                    |
+| `CCGRAM_GROUP_ID` / `--group-id`                      | _(all groups)_                 | Restrict to one Telegram group                                                                       |
+| `CCGRAM_INSTANCE_NAME` / `--instance-name`            | hostname                       | Display label for this instance                                                                      |
+| `CCGRAM_LOG_LEVEL` / `--log-level`                    | `INFO`                         | Logging level (DEBUG, INFO, WARNING, ERROR)                                                          |
+| `MONITOR_POLL_INTERVAL` / `--monitor-interval`        | `2.0`                          | Seconds between transcript polls                                                                     |
+| `UNBOUND_WINDOW_TTL_MINUTES` / `--unbound-window-ttl` | `30`                           | Remove inactive unbound terminal windows after N minutes (0=off)                                     |
+| `CCGRAM_WHISPER_PROVIDER` / `--whisper-provider`      | _(empty)_                      | Whisper provider: `openai`, `groq`, or empty to disable                                              |
+| `CCGRAM_WHISPER_API_KEY`                              | _(empty)_                      | API key (env only); falls back to OPENAI_API_KEY/GROQ_API_KEY                                        |
+| `CCGRAM_WHISPER_BASE_URL` / `--whisper-base-url`      | _(provider default)_           | Custom OpenAI-compatible endpoint URL                                                                |
+| `CCGRAM_WHISPER_MODEL` / `--whisper-model`            | _(provider default)_           | Model override (e.g., `whisper-large-v3-turbo`)                                                      |
+| `CCGRAM_WHISPER_LANGUAGE` / `--whisper-language`      | _(auto-detect)_                | Force language code (e.g., `en`, `zh`)                                                               |
+| `CCGRAM_WHISPER_TIMEOUT`                             | `60`                          | Seconds before the transcription POST gives up; raise it for local backends with slow model loads     |
+| `CCGRAM_LLM_PROVIDER`                                 | _(empty = disabled)_           | LLM provider for shell command generation                                                            |
+| `CCGRAM_LLM_API_KEY`                                  | _(empty)_                      | API key for LLM provider (env only)                                                                  |
+| `CCGRAM_LLM_BASE_URL`                                 | _(from provider)_              | Custom LLM API endpoint                                                                              |
+| `CCGRAM_LLM_MODEL`                                    | _(from provider)_              | LLM model override                                                                                   |
+| `CCGRAM_LLM_TEMPERATURE`                              | `0.1`                          | LLM sampling temperature (0 = deterministic)                                                         |
+| `CCGRAM_LIVE_VIEW_INTERVAL` / `--live-view-interval`  | `5`                            | Live view refresh interval in seconds (min 1)                                                        |
+| `CCGRAM_LIVE_VIEW_TIMEOUT` / `--live-view-timeout`    | `300`                          | Live view auto-stop timeout in seconds (min 1)                                                       |
+| `CCGRAM_STATUS_MODE` / `--status-mode`                | `system`                       | Topic emoji color scheme: `system` (green=working) or `user` (green=ready)                           |
+| `CCGRAM_HIDE_TOOL_CALLS` / `--hide-tool-calls`        | `false`                        | Set `true` to globally hide `tool_use`/`tool_result` messages (per-window override via `/toolcalls`) |
+| `CCGRAM_HIDE_THINKING` / `--hide-thinking`            | `false`                        | Set `true` to globally hide thinking messages                                                        |
+| `CCGRAM_HIDE_STATUS`                                  | `false`                        | Set `true` to suppress transient status bubbles; replies and controls remain available               |
+| `CCGRAM_VOICE_AUTOSEND`                               | `false`                        | Set `true` to send voice transcriptions without confirmation; transcription is still shown           |
+| `CCGRAM_PROMPT_MODE` / `--prompt-mode`                | `wrap`                         | Shell prompt marker: `wrap` (append `⌘N⌘`) or `replace` (legacy `{prefix}:N❯`)                       |
+| `CCGRAM_PROMPT_MARKER`                                | `ccgram`                       | Marker prefix used only by `replace` mode                                                            |
+| `CCGRAM_PANE_LIFECYCLE_NOTIFY`                        | `false`                        | Default for per-window pane create/close notifications (toggle via `/panes`)                         |
+| `CCGRAM_AUTODELETE_DEAD_TOPICS`                       | `true`                         | Set `false` to keep a dead session's topic and binding instead of deleting it                        |
+| `CCGRAM_SHOW_HIDDEN_DIRS` / `--show-hidden-dirs`      | `false`                        | Show dot-directories in the directory browser                                                        |
+| `CCGRAM_SEND_SEARCH_DEPTH`                            | `5`                            | Max directory depth for `/send` file search                                                          |
+| `CCGRAM_SEND_MAX_RESULTS`                             | `50`                           | Max file results returned by `/send` search                                                          |
+| `CCGRAM_TOOLBAR_CONFIG`                               | `~/.ccgram/toolbar.toml`       | Path to custom toolbar TOML; falls back to built-in defaults if missing                              |
+| `CCGRAM_STATUS_POLL_INTERVAL`                         | `1.0`                          | Status polling interval in seconds (min 0.5)                                                         |
+| `CCGRAM_YOLO_CONFIRMATION_TIMEOUT`                    | `30.0`                         | Seconds to wait for the YOLO confirmation prompt (min 1.0)                                           |
+| `CCGRAM_SKIP_BARRIER_DEADLINE_S`                      | `600`                          | Seconds a pending backlog-skip barrier waits for its notice before force-completion (min 60)         |
+| `CCGRAM_DELIVERY_WATCH_GAP_KB`                        | `256`                          | KB of undelivered transcript output before the delivery-wedge watch alerts; `0` disables it          |
+| `CCGRAM_MINIAPP_BASE_URL`                             | _(disabled)_                   | Externally reachable HTTPS URL for the Mini App dashboard                                            |
+| `CCGRAM_MINIAPP_HOST`                                 | `127.0.0.1`                    | Local bind host for the Mini App aiohttp server                                                      |
+| `CCGRAM_MINIAPP_PORT`                                 | `8765`                         | Local bind port for the Mini App aiohttp server                                                      |
+| `CCGRAM_TTS_PROVIDER`                                 | _(disabled)_                   | TTS backend for voice replies: `edge` (free) or `openai`                                             |
+| `CCGRAM_TTS_VOICE`                                    | `en-US-EmmaMultilingualNeural` | Voice name                                                                                           |
+| `CCGRAM_TTS_MODEL`                                    | `gpt-4o-mini-tts`              | OpenAI TTS model (only used when `CCGRAM_TTS_PROVIDER=openai`)                                       |
+| `CCGRAM_TTS_API_KEY`                                  | _(empty)_                      | API key for OpenAI TTS; falls back to `OPENAI_API_KEY`                                               |
 
 <!-- markdownlint-enable MD060 -->
 
@@ -278,13 +293,13 @@ Each item is rendered to Telegram entities before the items are combined. Format
 
 ### Queue progress and severe backlogs
 
-The editable topic status bubble reports:
+The editable topic status bubble shows queue telemetry only for a severe backlog:
 
 - **pending** — queued and in-flight transcript content items for that topic/window;
 - **age** — how long the oldest of those items has waited; and
 - **delivery lag** — the elapsed time for the latest completed content delivery (`—` until one completes).
 
-These are in-memory progress metrics, so they reset when CCGram restarts. The status line is refreshed with status updates and its displayed text is throttled for up to 15 seconds. A backlog is severe when it has **100 or more pending items** **or** its oldest item is **5 minutes (300 seconds) or older**. Only then does the status keyboard include **⏭ Jump to live**.
+These are in-memory progress metrics, so they reset when CCGram restarts. Healthy queue telemetry stays in structured service logs instead of the Telegram topic. A backlog is severe when it has **100 or more pending items** **or** its oldest item is **5 minutes (300 seconds) or older**. Only then does the status bubble show the queue line and its keyboard include **⏭ Jump to live**; the displayed severe-backlog text is throttled for up to 15 seconds.
 
 ### Confirmed jump semantics
 
@@ -326,6 +341,7 @@ Optional overrides:
 ```ini
 CCGRAM_WHISPER_MODEL=whisper-large-v3-turbo   # default depends on provider
 CCGRAM_WHISPER_LANGUAGE=en                     # omit for auto-detect
+CCGRAM_WHISPER_TIMEOUT=240                     # local backends can take minutes on a cold model load
 ```
 
 ### How It Works
@@ -376,7 +392,7 @@ ccgram talks to the terminal multiplexer through a backend-neutral seam. tmux is
 2. **Select the backend:** set `CCGRAM_MULTIPLEXER=herdr` (env var or `.env`). The default is `tmux`.
 3. **Socket path (optional):** ccgram reads `$HERDR_SOCKET_PATH` to find the server. Leave it unset to use herdr's default socket; set it to target a specific server.
 4. **Install integrations and the ccgram hook:** for Pi, run `herdr integration install pi`, then start new Pi agents or restart existing ones so they load the integration and publish `agent_session`. Install the ccgram hook as usual with `ccgram hook --install`. The same Claude Code hook works on both backends — it resolves which window fired from `$HERDR_PANE_ID` (tmux uses `$TMUX_PANE`), so no herdr-specific hook step is required.
-5. **Verify:** `ccgram doctor`. When `CCGRAM_MULTIPLEXER=herdr`, doctor checks the `herdr` binary, socket reachability, the pinned protocol version, and that ccgram's and herdr's own Claude hooks coexist in `settings.json` (instead of the tmux checks).
+5. **Verify:** `ccgram doctor`. When `CCGRAM_MULTIPLEXER=herdr`, doctor checks the `herdr` binary, socket reachability, reported protocol version, and that ccgram's and herdr's own Claude hooks coexist in `settings.json` (instead of the tmux checks).
 
 ```bash
 # .env or shell environment
@@ -386,7 +402,11 @@ CCGRAM_MULTIPLEXER=herdr
 
 ### Protocol version pinning
 
-ccgram accepts herdr socket protocols 14–20 without warnings. On the first call it reads `herdr status`; an older, newer, missing, or otherwise unknown protocol emits a warning and ccgram continues in best-effort mode, so CLI-backed operations can still work after a herdr upgrade or downgrade. A stopped server, failed status command, or malformed status response still prevents startup. Run the live herdr contract suite before relying on an untested protocol.
+CCGram accepts Herdr protocols 14–22 without warnings. Regular operations and provider-hook identity reads use the public newline-delimited JSON socket API, independently of the CLI's private wire protocol. This avoids `protocol_mismatch` failures after a package-manager update leaves an older server running. `HERDR_SOCKET_PATH` selects the endpoint directly; when unset, the CLI's read-only status command discovers the socket.
+
+Readiness is checked with public `ping`. Unknown future protocol numbers warn but do not prevent compatible operations, and extra response fields are ignored. Missing identities, malformed responses, unavailable methods, and transport errors remain failures, never evidence that a session ended. Requests have bounded timeouts and frame sizes; mutation requests are not automatically replayed after a failure. A stopped or unreachable server still prevents startup. The Herdr CLI itself may still require a matching server for commands issued outside CCGram.
+
+Hooks that invoke a bare `ccgram` use the executable on the agent's `PATH`, even when the bot runs from a development checkout. Upgrade that installation too (`uv tool upgrade ccgram` for a uv tool install). An old hook executable can create no session mapping while the newer bot still shows terminal status, leaving a topic without transcript messages. To bind Codex hooks to the checkout's interpreter instead, run `uv run ccgram hook --install --provider codex` from the checkout.
 
 ### Differences from tmux
 
@@ -394,14 +414,14 @@ herdr advertises its own capabilities through the seam; the behavioral consequen
 
 <!-- markdownlint-disable MD060 -->
 
-| Aspect                    | tmux                            | herdr                                                                      |
-| ------------------------- | ------------------------------- | -------------------------------------------------------------------------- |
-| Topic = agent session     | every window is eligible        | each reported agent session surfaces as one topic; a bare shell does not   |
-| Foreground detection      | `ps -t <tty>`                   | `pane process-info` (no tty)                                               |
-| Scrollback capture        | unbounded                       | clamped to **1000 lines**; longer output is flagged as truncated           |
-| Agent status              | inferred from terminal scraping | native (herdr reports agent status directly)                               |
+| Aspect                    | tmux                            | herdr                                                                                                 |
+| ------------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Topic = agent session     | every window is eligible        | each reported agent session surfaces as one topic; a bare shell does not                              |
+| Foreground detection      | `ps -t <tty>`                   | `pane process-info` (no tty)                                                                          |
+| Scrollback capture        | unbounded                       | clamped to **1000 lines**; longer output is flagged as truncated                                      |
+| Agent status              | inferred from terminal scraping | native (herdr reports agent status directly)                                                          |
 | Window IDs across restart | stable                          | guarded session target is revalidated from fresh `agent.list`; ccgram never re-resolves a tab/pane ID |
-| Topic labels              | window name                     | `<workspace> ▸ <tab> ▸ <pane>` for every reported agent session             |
+| Topic labels              | window name                     | `<Provider> ▸ <workspace> ▸ <tab> ▸ <pane>` for every reported agent session                          |
 
 <!-- markdownlint-enable MD060 -->
 
@@ -413,67 +433,72 @@ Creating sessions from the terminal on herdr is covered in [Creating Sessions fr
 
 ## Sync and Retired Topic Cleanup
 
-`/sync` audits CCGram's local bindings and offers **Fix** for repairable items. Its retired-topic cleanup is intentionally narrow: it considers only a bounded local registry (up to 100 entries) of exact chat/topic bindings that CCGram previously owned and marked eligible for cleanup. It does **not** discover, list, or act on arbitrary forum topics. The Bot API does not let bots enumerate unknown topics, so a topic that was never recorded by CCGram cannot become a `/sync` cleanup candidate.
+`/sync` immediately deletes locally known topics whose terminal sessions are confirmed gone, retries pending deletions, and includes locally recorded topics that earlier versions closed without deleting. No extra **Fix** click is needed for this cleanup. It then reports the result and offers **Fix** for other repairable items. Each cleanup batch attempts up to 100 retired topics. Pending deletion records survive restarts and are never dropped by the separate 100-entry retained-history limit.
 
-When you choose **Fix**, CCGram rechecks each known retired topic immediately before the Bot API call. A topic that is active or was rebound in the meantime is reported as **Protected active or rebound** and receives no delete or close request. A new binding for the same chat/topic also removes the old retired record.
+`/sync` does not scan active Telegram topics or send temporary probe messages. Its audit uses local bindings and authoritative terminal presence, so a successful audit does not prove that every bound topic still exists in Telegram. Deleted-topic detection remains in normal bot operations and lifecycle checks. **Fix** can still repair topic titles and adopt known unbound windows.
 
-For an eligible, still-retired topic, `/sync` tries `deleteForumTopic` first. Deletion is irreversible and removes the topic history. If deletion is unavailable or fails, `/sync` tries `closeForumTopic`; closing hides/closes the topic but retains its history. A successful delete, successful close, or an already-gone topic is removed from the local registry. Failed delete-and-close attempts stay in the registry for a later `/sync` attempt, and the report distinguishes Deleted, Closed, Already gone, Could not remove, and Protected active or rebound outcomes.
+Before each removal, CCGram rechecks the exact chat/topic binding. A topic that is active or was rebound in the meantime is protected from deletion. A new binding for the same chat/topic also removes the old retired record. If the multiplexer cannot provide an authoritative listing, `/sync` performs no cleanup.
 
-The bot must be a group administrator with Telegram's **Manage Topics** (`can_manage_topics`) permission for topic cleanup. Configure forum topics and the admin permissions in [BotFather Setup](#botfather-setup); if Telegram denies either operation, `/sync` leaves the local record in place and reports the failure. Review candidates before pressing Fix because a successful delete cannot be undone.
+`CCGRAM_AUTODELETE_DEAD_TOPICS=false` only gates the automatic per-tick dead-session deletion. A topic kept that way is still a binding pointing at a confirmed-dead window, so it surfaces as a `ghost_binding` audit issue; `/sync` (run directly or via its **Fix** button) closes and deletes it like any other ghost topic, regardless of the knob.
 
-## Auto-Close Behavior
+Session creation owns an exact topic record, saved before the first remote request. That ownership protects the topic during slow startup and replacement. It does not expire while the creation task is running.
 
-CCGram automatically closes Telegram topics when sessions end, reducing clutter:
+Startup, periodic cleanup, and `/sync` recover abandoned creation records from current session presence. Recovery verifies the recorded Telegram topic by editing its title to the resolved session name before restoring its binding. It checks only abandoned creation records, never scans all active topics, and sends no temporary probe messages. Missing edit permission or transport errors leave the creation record unresolved.
 
-- **Done topics** (`--autoclose-done`, default: 30 min) — When Claude finishes a task and the session completes normally, the topic auto-closes after 30 minutes.
-- **Dead sessions** (`--autoclose-dead`, default: 10 min) — When a Claude process crashes or the tmux window is killed externally, the topic auto-closes after 10 minutes.
+If the title changes, Telegram posts a rename service message. The rename can remove status, provider, and YOLO badges. A later status refresh may restore these badges and produce another rename notice.
 
-Set to `0` to disable:
+If the recorded topic was deleted while its target remains alive, recovery creates a fresh topic without replacing another current binding for the target. Failed recreation attempts with a known outcome remain queued across restarts and respect Telegram rate limits.
+
+A confirmed absent target can have its known topic cleaned up. An unknown target or an uncertain creation result without a new topic ID remains protected and appears as creation awaiting confirmation; CCGram does not guess whether the remote creation succeeded or repeat an ambiguous request. Targets belonging to a different backend are unverified, never treated as absent by the selected backend.
+
+For a retired topic, cleanup calls `deleteForumTopic`. Deletion is irreversible and removes the topic history. If deletion fails, cleanup may close the topic as a fallback, but **closing leaves the topic visible and deletion pending**. Only successful deletion or a definitive already-gone response completes cleanup. Background cleanup retries up to 20 pending topics each minute; failures wait at least one minute and respect longer Telegram rate-limit delays. Ghost bindings are retired into pending cleanup before deletion, so failed requests remain recoverable.
+
+The bot must be a group administrator with **Delete Messages** (`can_delete_messages`) to delete topics, and **Manage Topics** (`can_manage_topics`) to close them. See [BotFather Setup](#botfather-setup) and Telegram's [deleteForumTopic documentation](https://core.telegram.org/bots/api#deleteforumtopic). The report distinguishes deleted, already gone, closed with deletion pending, deferred, and protected outcomes. General/control topics are protected.
+
+The Bot API cannot enumerate arbitrary topics. If an old topic's ID was already discarded from local state, `/sync` cannot discover it. Legacy bindings without a recorded chat ID are also left untouched: the same thread number in another incoming chat is not proof of ownership. Restore a known mapping or explicitly rebind before cleanup. Recovery of unknown topics requires an explicit list of topic IDs or a separate user-authorized Telegram client: MTProto's [messages.getForumTopics](https://core.telegram.org/method/messages.getForumTopics) can enumerate topics but is user-only. CCGram never guesses ownership from names or closed icons.
+
+## Session Closure and Topic Deletion
+
+CCGram distinguishes an idle agent from a closed terminal session:
+
+- **Done agents with a live terminal** — The topic stays open and bound to its session. Finishing a task alone does not trigger deletion.
+- **New terminal sessions** — CCGram creates a fresh topic instead of automatically reusing one from a previous session with the same name.
+- **Closed terminal sessions** — CCGram rechecks that the terminal session is gone, then immediately attempts to delete its topic and history. There is no grace timer or recovery banner. This applies to tmux windows, Herdr session targets, and agterm sessions. An unavailable backend or a live session prevents deletion.
+- **Sessions killed from the dashboard** — CCGram attempts topic deletion after the session is killed, with failed requests retained for retry.
+
+Inactive terminal windows without a topic binding have a separate 30-minute cleanup timer. Disable that window cleanup with:
 
 ```bash
-ccgram --autoclose-done 0 --autoclose-dead 0
+ccgram --unbound-window-ttl 0
 ```
 
 ## Multi-Instance Setup
 
-Run multiple ccgram instances on the same machine, each owning a different Telegram group. All instances can share a single bot token. Because Telegram rate limits are token-wide, divide the expected aggregate traffic across instances; these processes do not share a rate-limit coordinator.
+Run one ccgram process per multiplexer backend for each OS user. The shared session
+core acquires a backend-wide process lock even when the mobile API is disabled.
+Separate `CCGRAM_DIR` or `TMUX_SESSION_NAME` values do not permit a second process
+with that backend. Separate tmux sessions can share linked windows, so a lock for
+each session would not prevent two cores from controlling the same target.
 
-### Example: work + personal instances
+### Work and personal groups in one process
 
-Instance 1 (`~/.ccgram-work/.env`):
-
-```ini
-TELEGRAM_BOT_TOKEN=same_token_for_both
-ALLOWED_USERS=123456789
-CCGRAM_GROUP_ID=-1001111111111
-CCGRAM_INSTANCE_NAME=work
-CCGRAM_DIR=~/.ccgram-work
-TMUX_SESSION_NAME=ccgram-work
-```
-
-Instance 2 (`~/.ccgram-personal/.env`):
+Leave `CCGRAM_GROUP_ID` unset to handle multiple Telegram groups with one core:
 
 ```ini
-TELEGRAM_BOT_TOKEN=same_token_for_both
+TELEGRAM_BOT_TOKEN=your_bot_token
 ALLOWED_USERS=123456789
-CCGRAM_GROUP_ID=-1002222222222
-CCGRAM_INSTANCE_NAME=personal
-CCGRAM_DIR=~/.ccgram-personal
-TMUX_SESSION_NAME=ccgram-personal
+CCGRAM_INSTANCE_NAME=work-and-personal
+TMUX_SESSION_NAME=ccgram
 ```
 
-Run both:
+Add the bot to each group, enable Topics, and grant the required topic permissions.
+Both groups use the same configuration, session discovery, allowed users, and state.
+They do not provide separate control or security boundaries. Use separate machines
+or OS users when those settings and terminal targets must be isolated.
 
-```bash
-CCGRAM_DIR=~/.ccgram-work ccgram &
-CCGRAM_DIR=~/.ccgram-personal ccgram &
-```
-
-Each instance uses a separate tmux session, config directory, and state. When `CCGRAM_GROUP_ID` is set, an instance silently ignores updates from other groups.
-
-Without `CCGRAM_GROUP_ID`, a single instance processes all groups (the default).
-
-> To find your group's chat ID, add [@RawDataBot](https://t.me/RawDataBot) to the group — it replies with the chat ID (a negative number like `-1001234567890`).
+Set `CCGRAM_GROUP_ID` to one group ID to restrict the process to that group. It then
+ignores updates from other groups. To find the ID, add
+[@RawDataBot](https://t.me/RawDataBot) to the group; it replies with the negative chat ID.
 
 ## Creating Sessions from the Terminal
 
@@ -518,18 +543,18 @@ The buttons shown adapt to each provider's capabilities. Claude and Antigravity 
 
 ## Manual Provider Override (`/agent`)
 
-`/agent` (alias `/provider`) fixes a mis-tagged window. Auto-detection (`detect_provider_from_command` + JS-runtime foreground-process fallback via the multiplexer seam) returns empty for custom wrappers like `ralphex`, so the window can keep its prior provider tag — SessionMonitor then polls a stale transcript, `/last` returns old text, and tool calls/replies stop showing up.
+`/agent` (alias `/provider`) shows the topic name, provider, and Auto/Manual mode. A manual choice is accepted only when the recognized live foreground process matches that provider; unknown or mismatched processes leave routing unchanged. `/agent` does not start, stop, or redirect a process in the terminal.
 
 Forms:
 
 ```text
-/agent              # show picker (current marked ✓, with (manual override) badge if set)
-/agent shell        # switch to shell
-/agent claude       # switch to Claude (also: codex, gemini, pi)
+/agent              # show picker (current marked ✓, with Auto/Manual mode)
+/agent shell        # select Terminal only when a shell is running in the pane
+/agent claude       # select Claude only when Claude is running (also: codex, gemini, pi)
 /agent auto         # clear manual override and re-run auto-detection
 ```
 
-On switch, the bot clears `WindowState.transcript_path`, drops the previous `session_map.json` entry (so SessionMonitor stops reading the wrong transcript), and for shell triggers prompt-marker setup via `shell_prompt_orchestrator.ensure_setup`. The next `SessionStart` hook from the new provider repopulates `session_map`.
+A manual selection first checks that the live foreground matches the provider. It then reconciles the session-map entry against that destination: a matching entry is retained, a mismatched entry is dropped, and subsequent hooks from other providers are filtered. `/agent auto` checks and cleans the entry again before releasing the pin; if storage cannot be confirmed, it remains pinned. Old queued transcript content from another provider is discarded. Prompt-marker setup is offered only by backends that declare support; agterm does not because a shell builtin can be mistaken for a prompt.
 
 Manual overrides set `WindowState.provider_manual_override=True`. The periodic auto-detection in `_detect_and_apply_provider` skips overridden windows until `/agent auto` clears the flag.
 
@@ -591,6 +616,34 @@ Security (project-scoped, deny-by-default):
 - Excluded dirs are never shown: `node_modules`, `__pycache__`, `.venv`, `dist`, `build`, etc.
 
 Tunables: `CCGRAM_SEND_SEARCH_DEPTH` (default 5), `CCGRAM_SEND_MAX_RESULTS` (default 50).
+
+## Topic Command Panels (`/commands`)
+
+CCGram pins a command panel in General and in each named topic. The panel reads the current topic binding, so it shows only actions that fit that topic.
+
+In General, the panel shows four controls: Commands, Sessions, Audit state, and Update ccgram. General has no agent or terminal session. The first ordinary General message creates and pins the panel. `/commands` opens or refreshes it. `/start` remains available for the welcome message.
+
+In an unbound named topic, use **Set up session** to open the existing session picker. After a session is bound, the panel shows CCGram actions available for that session and the provider's discovered commands. Shell topics do not show agent commands. Commands that require a transcript appear only for transcript-backed providers.
+
+The bound-topic panel includes **Dashboard**. It sends a fresh signed WebApp button to the authorized user's private chat, never to the group. If Telegram refuses the DM, start the bot privately with `/start`, then retry `/dashboard`. The shared native `/` list remains the four controls above.
+
+Agent buttons display and send the provider's original command name. For example, a discovered `spec:work` command appears as `/spec:work`, not `/spec_work`. The panel shows eight agent commands per page when more commands are available. Long command names stay intact in the panel and use a short button label when Telegram's 64-character button limit requires it.
+
+Destructive actions such as `/clear`, `/new`, `/rewind`, `/unbind`, and `/upgrade` ask for confirmation before execution. A panel action is revalidated against its owner, chat, topic, session, and provider before dispatch. Open `/commands` again if a panel is stale.
+
+These mobile screenshots are rendered from the offline HTML prototype. They illustrate Telegram message and inline-button controls, not live Telegram screens.
+
+![Telegram General topic with its four CCGram controls](assets/command-panels/general-mobile.png)
+
+![Telegram Claude topic with native agent command names](assets/command-panels/claude-mobile.png)
+
+![Telegram terminal topic with terminal-only controls](assets/command-panels/terminal-mobile.png)
+
+### Telegram's `/` command list
+
+Telegram does not provide a command-menu scope for individual forum topics. CCGram therefore keeps the native `/` list topic-safe and shared: `/commands`, `/sessions`, `/sync`, and `/upgrade`. Use the pinned panel for topic-specific CCGram and agent commands. Telegram cannot show a different native `/` list immediately when you switch topics.
+
+After upgrading CCGram, restart the bot. Send `/commands` in a chat if Telegram still shows an older command list there.
 
 ## Action Toolbar (`/toolbar`)
 
@@ -657,12 +710,12 @@ CCGram supports Claude Code, Codex CLI, Gemini CLI, Pi, and Shell. Each topic ca
 
 All state files live in `$CCGRAM_DIR` (`~/.ccgram/` by default):
 
-| File                 | Description                                                         |
-| -------------------- | ------------------------------------------------------------------- |
-| `state.json`         | Thread bindings, window states, display names, read offsets         |
-| `session_map.json`   | Hook-generated window → session mappings                            |
-| `events.jsonl`       | Append-only hook event log (read incrementally by monitor)          |
-| `monitor_state.json` | Delivered transcript watermarks and pending Jump-to-live barriers   |
+| File                 | Description                                                       |
+| -------------------- | ----------------------------------------------------------------- |
+| `state.json`         | Thread bindings, window states, display names, read offsets       |
+| `session_map.json`   | Hook-generated window → session mappings                          |
+| `events.jsonl`       | Append-only hook event log (read incrementally by monitor)        |
+| `monitor_state.json` | Delivered transcript watermarks and pending Jump-to-live barriers |
 
 Session transcripts are read from provider-specific locations (read-only): `~/.claude/projects/` (Claude), `~/.codex/sessions/` (Codex), `~/.gemini/tmp/` (Gemini), `~/.pi/agent/sessions/` (Pi). Shell has no transcript — output is captured directly from the tmux pane. The bot never writes to agent data directories; the delivered watermark records relay progress, not a mutation of the raw transcript.
 
@@ -695,6 +748,10 @@ ccgram retries brief Telegram polling conflicts for up to 90 seconds, which can
 occur after a network reconnect. Persistent conflicts stop with a non-zero exit
 so `Restart=on-failure` restarts the service. Check for another bot process that
 uses the same token if the conflict returns.
+
+A graceful shutdown that wedges (for example a stuck update queue) is
+exit-forced after 600 seconds with the stop's own exit code, so
+`Restart=on-failure` cannot be blocked forever by a half-stopped process.
 
 On macOS, you can use a launchd plist or simply run in a detached tmux session:
 

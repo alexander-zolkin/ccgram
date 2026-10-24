@@ -1,13 +1,15 @@
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from ccgram.session import SessionManager
-from ccgram.session_map import session_map_sync
+from ccgram.hooks.state_files import pending_pi_replay_key, serialize_session_map_entry
+from ccgram.multiplexer.base import WindowRef
+from ccgram.session_map import acknowledge_replay_from_start, session_map_sync
 from ccgram.session_resolver import session_resolver
-from ccgram.thread_router import thread_router
+from ccgram.thread_router import ThreadRouter, thread_router
 from ccgram.user_preferences import user_preferences
 from ccgram.window_resolver import resolve_window_alias
 from ccgram.window_state_store import APPROVAL_MODES, WindowState, window_store
@@ -43,6 +45,17 @@ class TestRoutingLoadRepair:
         assert thread_router.get_window_for_thread(100, 2, -1001) is None
         assert thread_router.get_window_for_thread(200, 142, -1001) == "@5"
         assert manager.group_chat_ids == {}
+
+
+class TestFlushState:
+    def test_uses_strict_persistence_checkpoint(self) -> None:
+        manager = object.__new__(SessionManager)
+        persistence = Mock()
+        manager._persistence = persistence
+
+        assert manager.flush_state() is None
+
+        persistence.flush.assert_called_once_with(strict=True)
 
 
 class TestLegacyHerdrMigration:
@@ -203,6 +216,111 @@ class TestLegacyHerdrAliasConvergence:
         assert alias in window_store.window_states
         assert thread_router.get_window_for_thread(7, 41) == alias
         assert resolve_window_alias(alias) == alias
+
+
+class TestBackendAttestedAliasDisplayNamePins:
+    def test_alias_pin_survives_listing_sync_after_attested_fold(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        alias = "herdr-session-v1-" + "a" * 64
+        canonical = "herdr-session-v1-" + "b" * 64
+        state_file = tmp_path / "state.json"
+        map_file = tmp_path / "session_map.json"
+        map_file.write_text(
+            json.dumps(
+                {
+                    f"herdr:{alias}": {
+                        "session_id": "sid-1",
+                        "cwd": "/repo",
+                        "window_name": "manual-name",
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "herdr")
+        monkeypatch.setattr("ccgram.session.config.state_file", state_file)
+        monkeypatch.setattr("ccgram.session.config.session_map_file", map_file)
+        window_store.window_states[alias] = WindowState(
+            session_id="sid-1", cwd="/repo", window_name="manual-name"
+        )
+        window_store.window_states[canonical] = WindowState(
+            session_id="sid-1", cwd="/repo", window_name="stale-name"
+        )
+        mgr.set_display_name(alias, "manual-name")
+
+        # This is the backend's explicit supersession attestation, not an ID
+        # inferred from the cwd, provider, or display name.
+        mgr.reconcile_window_aliases(
+            [
+                WindowRef(
+                    window_id=canonical,
+                    window_name="backend-name",
+                    cwd="/repo",
+                    alias_window_ids=(alias,),
+                )
+            ]
+        )
+        assert alias not in thread_router.window_display_names
+        assert thread_router.get_display_name(canonical) == "manual-name"
+        assert thread_router.pinned_display_names == {canonical}
+        assert window_store.window_states[canonical].window_name == "stale-name"
+        state_backup = json.loads(
+            state_file.with_name("state.json.identity-migration.bak").read_text()
+        )
+        assert state_backup["pinned_display_names"] == [alias]
+
+        # The pin is durable and still protects the adopted display name after
+        # loading a fresh router from state.json's serialized shape.
+        restored_router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _wid: False,
+        )
+        restored_router.from_dict(mgr._serialize_state())
+        assert restored_router.pinned_display_names == {canonical}
+        assert (
+            restored_router.sync_display_names([(canonical, "backend-name")]) is False
+        )
+        assert restored_router.get_display_name(canonical) == "manual-name"
+
+        saves: list[str] = []
+        mgr._save_state = lambda: saves.append("saved")
+        assert mgr.sync_display_names([(canonical, "backend-name")]) is True
+
+        assert thread_router.get_display_name(canonical) == "manual-name"
+        assert window_store.window_states[canonical].window_name == "manual-name"
+        view = mgr.view_window(canonical)
+        assert view is not None
+        assert view.window_name == "manual-name"
+        assert saves == ["saved"]
+
+    def test_existing_canonical_name_keeps_its_pin_on_attested_fold(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        alias = "herdr-session-v1-" + "c" * 64
+        canonical = "herdr-session-v1-" + "d" * 64
+        map_file = tmp_path / "session_map.json"
+        map_file.write_text("{}")
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "herdr")
+        monkeypatch.setattr("ccgram.session.config.state_file", tmp_path / "state.json")
+        monkeypatch.setattr("ccgram.session.config.session_map_file", map_file)
+        mgr.set_display_name(alias, "alias-name")
+        mgr.set_display_name(canonical, "canonical-name")
+
+        mgr.reconcile_window_aliases(
+            [
+                WindowRef(
+                    window_id=canonical,
+                    window_name="backend-name",
+                    cwd="/repo",
+                    alias_window_ids=(alias,),
+                )
+            ]
+        )
+
+        assert thread_router.get_display_name(canonical) == "canonical-name"
+        assert thread_router.pinned_display_names == {canonical}
+        assert mgr.sync_display_names([(canonical, "backend-name")]) is False
+        assert thread_router.get_display_name(canonical) == "canonical-name"
 
 
 class TestThreadBindings:
@@ -667,6 +785,100 @@ class TestSessionMapEntryMayExist:
         assert await session_map_sync.session_map_entry_may_exist("@1") is True
 
 
+class TestProviderSwitchSessionMapRace:
+    def test_fresh_destination_entry_survives_provider_switch(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        old_transcript = tmp_path / ".claude" / "projects" / "repo" / "old.jsonl"
+        old_transcript.parent.mkdir(parents=True)
+        old_transcript.write_text("")
+        new_transcript = tmp_path / ".pi" / "agent" / "sessions" / "new.jsonl"
+        new_transcript.parent.mkdir(parents=True)
+        new_transcript.write_text("")
+        fresh_entry = serialize_session_map_entry(
+            "new-pi-session",
+            "/repo",
+            "agent",
+            str(new_transcript),
+            "pi",
+        )
+        session_map_file.write_text(json.dumps({"ccgram:@1": fresh_entry}))
+        monkeypatch.setattr(
+            "ccgram.session_map.config.session_map_file", session_map_file
+        )
+        monkeypatch.setattr("ccgram.session_map.config.tmux_session_name", "ccgram")
+
+        state = window_store.get_window_state("@1")
+        state.provider_name = "claude"
+        state.session_id = "old-claude-session"
+        state.transcript_path = str(old_transcript)
+
+        mgr.set_window_provider("@1", "pi", cwd="/repo")
+
+        assert json.loads(session_map_file.read_text()) == {"ccgram:@1": fresh_entry}
+        assert state.provider_name == "pi"
+        assert state.session_id == "new-pi-session"
+        assert state.transcript_path == str(new_transcript)
+
+    def test_previous_provider_entry_is_still_cleared(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccgram:@1": serialize_session_map_entry(
+                        "old-claude-session",
+                        "/repo",
+                        "agent",
+                        "/home/user/.claude/projects/repo/old.jsonl",
+                        "claude",
+                    )
+                }
+            )
+        )
+        monkeypatch.setattr(
+            "ccgram.session_map.config.session_map_file", session_map_file
+        )
+        monkeypatch.setattr("ccgram.session_map.config.tmux_session_name", "ccgram")
+        window_store.get_window_state("@1").provider_name = "claude"
+
+        mgr.set_window_provider("@1", "pi", cwd="/repo")
+
+        assert json.loads(session_map_file.read_text()) == {}
+
+
+class TestAcknowledgeReplayFromStart:
+    def test_consumes_only_matching_marker(self, tmp_path, monkeypatch) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccgram:@1": {
+                        "session_id": "s1",
+                        "replay_from_start": True,
+                    },
+                    "ccgram:@2": {
+                        "session_id": "s2",
+                        "replay_from_start": True,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(
+            "ccgram.session_map.config.session_map_file", session_map_file
+        )
+        monkeypatch.setattr("ccgram.session_map.config.multiplexer_name", "tmux")
+        monkeypatch.setattr("ccgram.session_map.config.tmux_session_name", "ccgram")
+
+        assert acknowledge_replay_from_start("@1", "s1") is True
+
+        saved = json.loads(session_map_file.read_text())
+        assert "replay_from_start" not in saved["ccgram:@1"]
+        assert saved["ccgram:@2"]["replay_from_start"] is True
+
+
 class TestWindowStateProviderName:
     def test_default_provider_name_is_empty(self) -> None:
 
@@ -861,13 +1073,11 @@ class TestApprovalMode:
 
 class TestGetWindowForChatThread:
     def test_resolves_bound_window_for_group_topic(self, mgr: SessionManager) -> None:
-        thread_router.bind_thread(100, 42, "@9")
-        thread_router.set_group_chat_id(100, 42, -100123)
+        thread_router.bind_thread(100, 42, "@9", chat_id=-100123)
         assert thread_router.get_window_for_chat_thread(-100123, 42) == "@9"
 
     def test_returns_none_when_chat_mismatch(self, mgr: SessionManager) -> None:
-        thread_router.bind_thread(100, 42, "@9")
-        thread_router.set_group_chat_id(100, 42, -100123)
+        thread_router.bind_thread(100, 42, "@9", chat_id=-100123)
         assert thread_router.get_window_for_chat_thread(-100999, 42) is None
 
 
@@ -929,6 +1139,19 @@ class TestPruneStaleState:
         changed = mgr.prune_stale_state(live_window_ids=set())
         assert changed is False
         assert "@2" in thread_router.window_display_names
+
+    def test_keeps_case_variant_display_name_and_offset_in_use(
+        self, mgr: SessionManager
+    ) -> None:
+        thread_router.window_display_names["abc-def"] = "bound-proj"
+        thread_router.bind_thread(100, 1, "ABC-DEF")
+        user_preferences.user_window_offsets[100] = {"abc-def": 42}
+
+        changed = mgr.prune_stale_state(live_window_ids=set())
+
+        assert changed is False
+        assert thread_router.window_display_names["abc-def"] == "bound-proj"
+        assert user_preferences.user_window_offsets[100]["abc-def"] == 42
 
     def test_keeps_display_name_if_has_window_state(self, mgr: SessionManager) -> None:
         thread_router.window_display_names["@3"] = "with-state"
@@ -1118,6 +1341,86 @@ class TestWriteHooklessSessionMap:
         assert entry["provider_name"] == "codex"
         assert entry["window_name"] == "pumba-codex"
 
+    def test_pi_discovery_without_recovery_starts_at_tail(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.tmux_session_name", "ccgram")
+
+        session_map_sync.write_hookless_session_map(
+            window_id="@7",
+            session_id="pi-uuid",
+            cwd="/my/project",
+            transcript_path="/path/pi.jsonl",
+            provider_name="pi",
+        )
+
+        raw = json.loads(session_map_file.read_text())
+        assert "replay_from_start" not in raw["ccgram:@7"]
+
+    def test_pi_discovery_consumes_deferred_recovery_marker(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        pending_key = pending_pi_replay_key("pi-uuid")
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    pending_key: {
+                        "session_id": "pi-uuid",
+                        "provider_name": "pi",
+                        "replay_from_start": True,
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.tmux_session_name", "ccgram")
+
+        session_map_sync.write_hookless_session_map(
+            window_id="@7",
+            session_id="pi-uuid",
+            cwd="/my/project",
+            transcript_path="/path/pi.jsonl",
+            provider_name="pi",
+        )
+
+        raw = json.loads(session_map_file.read_text())
+        assert raw["ccgram:@7"]["replay_from_start"] is True
+        assert pending_key not in raw
+
+    def test_pi_discovery_does_not_inherit_marker_from_prior_session(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccgram:@7": {
+                        "session_id": "old-pi-uuid",
+                        "provider_name": "pi",
+                        "transcript_path": "/path/old.jsonl",
+                        "replay_from_start": True,
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.tmux_session_name", "ccgram")
+
+        session_map_sync.write_hookless_session_map(
+            window_id="@7",
+            session_id="new-pi-uuid",
+            cwd="/my/project",
+            transcript_path="/path/new.jsonl",
+            provider_name="pi",
+        )
+
+        raw = json.loads(session_map_file.read_text())
+        assert raw["ccgram:@7"]["session_id"] == "new-pi-uuid"
+        assert "replay_from_start" not in raw["ccgram:@7"]
+
     def test_preserves_existing_session_map_entries(
         self, mgr: SessionManager, tmp_path, monkeypatch
     ) -> None:
@@ -1158,6 +1461,34 @@ class TestWriteHooklessSessionMap:
         assert session_map_file.exists()
         raw = json.loads(session_map_file.read_text())
         assert "ccgram:@7" in raw
+
+
+@pytest.mark.parametrize(
+    ("stored_id", "live_id"), [("@1", "@1"), ("abc-def", "ABC-DEF")]
+)
+def test_pinned_display_difference_is_not_repairable_drift(
+    mgr: SessionManager, stored_id: str, live_id: str
+) -> None:
+    thread_router.set_display_name(stored_id, "user-name", pin=True)
+
+    result = mgr.audit_state(
+        live_window_ids={live_id}, live_windows=[(live_id, "backend-name")]
+    )
+
+    assert not any(issue.category == "display_name_drift" for issue in result.issues)
+
+
+def test_exact_unpinned_drift_is_not_hidden_by_a_variant_pin(
+    mgr: SessionManager,
+) -> None:
+    thread_router.set_display_name("abc-def", "alias-name", pin=True)
+    thread_router.set_display_name("ABC-DEF", "canonical-name")
+
+    result = mgr.audit_state(
+        live_window_ids={"ABC-DEF"}, live_windows=[("ABC-DEF", "backend-name")]
+    )
+
+    assert any(issue.category == "display_name_drift" for issue in result.issues)
 
 
 class TestAuditState:
@@ -1245,6 +1576,66 @@ class TestAuditState:
         assert len(stale) == 1
         assert stale[0].fixable
 
+    def test_case_variant_state_is_in_use_by_binding_and_session_map(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "agterm:ABC-DEF": {
+                        "session_id": "sid",
+                        "cwd": "/tmp",
+                        "schema_version": 1,
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "agterm")
+        mgr.window_states["abc-def"] = WindowState(session_id="sid", cwd="/tmp")
+        thread_router.bind_thread(100, 1, "ABC-DEF")
+
+        result = mgr.audit_state(live_window_ids=set(), live_windows=[])
+
+        assert not any(i.category == "stale_window_state" for i in result.issues)
+
+    def test_case_variant_display_and_offset_are_known(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.window_states["ABC-DEF"] = WindowState(session_id="sid", cwd="/tmp")
+        thread_router.window_display_names["abc-def"] = "project"
+        user_preferences.user_window_offsets[100] = {"abc-def": 42}
+
+        result = mgr.audit_state(live_window_ids=set(), live_windows=[])
+
+        assert not any(i.category == "orphaned_display_name" for i in result.issues)
+        assert not any(i.category == "stale_offset" for i in result.issues)
+
+    def test_case_variant_display_name_drift_is_reported(
+        self, mgr: SessionManager
+    ) -> None:
+        thread_router.window_display_names["abc-def"] = "old-name"
+
+        result = mgr.audit_state(
+            live_window_ids={"ABC-DEF"}, live_windows=[("ABC-DEF", "new-name")]
+        )
+
+        drift = [i for i in result.issues if i.category == "display_name_drift"]
+        assert len(drift) == 1
+
+    def test_exact_display_name_spelling_takes_priority(
+        self, mgr: SessionManager
+    ) -> None:
+        thread_router.window_display_names["abc-def"] = "stale-variant"
+        thread_router.window_display_names["ABC-DEF"] = "current"
+
+        result = mgr.audit_state(
+            live_window_ids={"ABC-DEF"}, live_windows=[("ABC-DEF", "current")]
+        )
+
+        assert not any(i.category == "display_name_drift" for i in result.issues)
+
 
 class TestPruneStaleOffsets:
     def test_removes_unknown_windows(self, mgr: SessionManager) -> None:
@@ -1286,6 +1677,39 @@ class TestPruneStaleWindowStates:
         changed = mgr.prune_stale_window_states(live_window_ids=set())
         assert not changed
         assert "@1" in mgr.window_states
+
+    def test_keeps_state_for_case_variant_binding(self, mgr: SessionManager) -> None:
+        mgr.window_states["abc-def"] = WindowState(session_id="s1", cwd="/tmp")
+        thread_router.bind_thread(100, 1, "ABC-DEF")
+
+        changed = mgr.prune_stale_window_states(live_window_ids=set())
+
+        assert not changed
+        assert "abc-def" in mgr.window_states
+
+    def test_keeps_state_for_case_variant_session_map(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "agterm:ABC-DEF": {
+                        "session_id": "sid",
+                        "cwd": "/tmp",
+                        "schema_version": 1,
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "agterm")
+        mgr.window_states["abc-def"] = WindowState(session_id="sid", cwd="/tmp")
+
+        changed = mgr.prune_stale_window_states(live_window_ids=set())
+
+        assert not changed
+        assert "abc-def" in mgr.window_states
 
     def test_keeps_live_states(self, mgr: SessionManager) -> None:
         mgr.window_states["@1"] = WindowState(session_id="s1", cwd="/tmp")
@@ -1459,6 +1883,74 @@ class TestResolveStaleIdsHerdrRestart:
         assert target in mgr.window_states
         assert thread_router.get_window_for_thread(100, 7) == target
 
+    async def test_agterm_stable_uuid_survives_startup_reconciliation(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        window_id = "9F1C2D3E-4A5B-4C6D-8E7F-0A1B2C3D4E5F"
+        thread_router.bind_thread(100, 7, window_id, window_name="project")
+        mgr.window_states[window_id] = WindowState(session_id="S1", cwd="/repo")
+        user_preferences.user_window_offsets[100] = {window_id: 42}
+        self.map_file.write_text("{}")
+        live = [SimpleNamespace(window_id=window_id, window_name="project")]
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "agterm")
+        monkeypatch.setattr(
+            "ccgram.session.tmux_manager",
+            _FakeMux(ids_stable=True, windows=live),
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert window_id in mgr.window_states
+        assert thread_router.get_window_for_thread(100, 7) == window_id
+        assert user_preferences.user_window_offsets[100][window_id] == 42
+
+    async def test_agterm_missing_uuid_does_not_rebind_by_display_name(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        old_id = "11111111-1111-1111-1111-111111111111"
+        new_id = "22222222-2222-2222-2222-222222222222"
+        thread_router.bind_thread(100, 7, old_id, window_name="project")
+        mgr.window_states[old_id] = WindowState(session_id="old", cwd="/repo")
+        self.map_file.write_text("{}")
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "agterm")
+        monkeypatch.setattr(
+            "ccgram.session.tmux_manager",
+            _FakeMux(
+                ids_stable=True,
+                windows=[SimpleNamespace(window_id=new_id, window_name="project")],
+            ),
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert old_id in mgr.window_states
+        assert new_id not in mgr.window_states
+        assert thread_router.get_window_for_thread(100, 7) == old_id
+
+    async def test_agterm_live_uuid_comparison_is_case_insensitive(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        stored_id = "abcdef12-3456-7890-abcd-ef1234567890"
+        live_id = stored_id.upper()
+        thread_router.bind_thread(100, 7, stored_id, window_name="project")
+        mgr.window_states[stored_id] = WindowState(session_id="S1", cwd="/repo")
+        user_preferences.user_window_offsets[100] = {stored_id: 42}
+        self.map_file.write_text("{}")
+        monkeypatch.setattr("ccgram.session.config.multiplexer_name", "agterm")
+        monkeypatch.setattr(
+            "ccgram.session.tmux_manager",
+            _FakeMux(
+                ids_stable=True,
+                windows=[SimpleNamespace(window_id=live_id, window_name="project")],
+            ),
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert stored_id in mgr.window_states
+        assert thread_router.get_window_for_thread(100, 7) == stored_id
+        assert user_preferences.user_window_offsets[100][stored_id] == 42
+
     async def test_tmux_path_is_noop_for_stable_ids(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
@@ -1476,3 +1968,32 @@ class TestResolveStaleIdsHerdrRestart:
 
         assert thread_router.get_window_for_thread(100, 1) == "@1"
         assert "@1" in mgr.window_states
+
+
+class TestCaseFoldedIdentityInTheAudit:
+    """A persisted id may be spelled in different case from the live listing.
+
+    agterm reports UUIDs uppercase and its own lookup case-folds, saying in so
+    many words that a caller may round-trip one lowercased. The audit compares
+    persisted ids against the live set, so an exact-string comparison marks
+    that live session dead and the repair prunes its state, bindings and
+    offsets.
+    """
+
+    def test_a_lowercased_binding_is_not_a_ghost(self) -> None:
+        from ccgram.session import SessionManager
+
+        manager = SessionManager()
+        live = "9F1C2D3E-4A5B-4C6D-8E7F-0A1B2C3D4E5F"
+
+        with patch("ccgram.session.thread_router") as router:
+            router.iter_thread_bindings.return_value = [(100, 42, live.lower())]
+            router.window_display_names = {}
+            router.group_chat_ids = {}
+            router.iter_retired_topics.return_value = []
+            with patch("ccgram.session.session_map_sync") as maps:
+                maps.load_session_map.return_value = {}
+                audit = manager.audit_state({live}, [(live, "proj")], set())
+
+        ghosts = [i for i in audit.issues if i.category == "ghost_binding"]
+        assert ghosts == [], "a live window spelled in another case is not a ghost"

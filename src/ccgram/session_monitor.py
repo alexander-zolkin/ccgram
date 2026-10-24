@@ -37,15 +37,27 @@ from .delivery_contract import (
 )
 from .event_reader import read_new_events
 from .idle_tracker import IdleTracker
-from .monitor_state import BacklogSkipIntent, MonitorState
+from .monitor_state import BacklogSkipIntent, MonitorState, TrackedSession
 from .providers import get_provider_for_window, registry  # noqa: F401 (used by test patches)
-from .session_map import parse_session_map, read_session_map_raw, session_map_prefix
+from .session_map import (
+    acknowledge_replay_from_start,
+    observed_provider,
+    parse_session_map,
+    read_session_map_raw,
+    session_map_prefix,
+    strip_session_map_prefix,
+)
+from .window_state_ports import identity_state
 from .session_lifecycle import session_lifecycle
 from .multiplexer import multiplexer as tmux_manager
+from .multiplexer.base import canonical_window_id
 from .multiplexer.reconciliation import list_windows_for_reconciliation
+from .multiplexer.window_liveness import note_live_windows
 from .multiplexer.topic_mapping import is_agent_topic_window
 from .monitor_events import NewMessage, NewWindowEvent, SessionInfo
-from .transcript_reader import TranscriptReader
+from .transcript_reader import TranscriptReader, render_transcript_batch
+from .session_protocol.events import EventHub
+from .session_protocol.messages import TranscriptBatch
 from .utils import task_done_callback
 
 import json
@@ -67,9 +79,18 @@ _BACKOFF_MIN = 2.0
 _BACKOFF_MAX = 30.0
 _SKIP_RETRY_BASE_SECONDS = 2.0
 _SKIP_RETRY_MAX_SECONDS = 60.0
-_MSG_PREVIEW_LENGTH = 80
-
 logger = structlog.get_logger()
+
+
+def _adoption_lookup(adoptable_window_ids: set[str]) -> set[str]:
+    """The comparison form of the adoption set, built once per pass.
+
+    Folded, because these keys were written by the hook while the set comes
+    from the backend's listing, and agterm reports UUIDs uppercase while a
+    caller may round-trip one lowercased. The set itself keeps the backend's
+    spelling, since the audit reports orphan ids straight out of it.
+    """
+    return {canonical_window_id(wid) for wid in adoptable_window_ids}
 
 
 class SessionMonitor:
@@ -85,6 +106,7 @@ class SessionMonitor:
         projects_path: Path | None = None,
         poll_interval: float | None = None,
         state_file: Path | None = None,
+        event_hub: EventHub | None = None,
     ):
         self.projects_path = (
             projects_path if projects_path is not None else config.claude_projects_path
@@ -98,7 +120,7 @@ class SessionMonitor:
 
         self._running = False
         self._task: asyncio.Task | None = None
-        self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
+        self._event_hub = event_hub or EventHub()
         self._new_window_callback: (
             Callable[[NewWindowEvent], Awaitable[None]] | None
         ) = None
@@ -162,10 +184,32 @@ class SessionMonitor:
         self._skip_notice_receipts.pop(session_id, None)
         self._clear_skip_retry(session_id)
 
+    def _cancel_pending_skip(self, session_id: str) -> None:
+        """Cancel a barrier and restore source work to its durable watermark."""
+        self.state.cancel_skip(session_id)
+        self._transcript_reader.replay_from_watermark(session_id)
+        self.state.save_if_dirty()
+        self._discard_session_delivery_state(session_id)
+
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
-        self._message_callback = callback
+        """Register the legacy Telegram message adapter for monitor tests."""
+
+        async def render_and_deliver(batch: TranscriptBatch) -> None:
+            for message in render_transcript_batch(batch):
+                await callback(message)
+
+        self._event_hub.unregister_durable_consumer("telegram")
+        self._event_hub.register_durable_consumer("telegram", render_and_deliver)
+
+    def register_delivery_consumer(
+        self, name: str, handler: Callable[[TranscriptBatch], Awaitable[None]]
+    ) -> None:
+        self._event_hub.register_durable_consumer(name, handler)
+
+    def unregister_delivery_consumer(self, name: str) -> None:
+        self._event_hub.unregister_durable_consumer(name)
 
     def set_new_window_callback(
         self, callback: Callable[[NewWindowEvent], Awaitable[None]]
@@ -223,11 +267,15 @@ class SessionMonitor:
             chat_id=chat_id,
             snapshot_offset=snapshot_offset,
             range_start=session.last_byte_offset,
+            created_at=time.time(),
         )
         # The durable barrier is written before destructive queue retirement.
         self.state.begin_skip(intent)
         if not self.state.save_if_dirty():
+            # Queue work has not been purged yet. Rewinding here would make
+            # the monitor enqueue a second copy while the original still runs.
             self.state.cancel_skip(session_id)
+            self.state.save_if_dirty()
             return None
         prepared = await self._prepare_pending_skip(intent)
         if prepared is not True:
@@ -236,17 +284,26 @@ class SessionMonitor:
             return None
         return intent
 
-    def _skip_is_current(self, intent: BacklogSkipIntent) -> bool:
+    def _skip_is_current(
+        self, intent: BacklogSkipIntent, *, strict: bool = False
+    ) -> bool | None:
+        """True when the barrier is current, per the registered validator.
+
+        ``strict=False`` (default) collapses a missing or erroring validator
+        to False, for callers that only need a "still valid" gate.
+        ``strict=True`` surfaces that failure as None instead, so a caller
+        that must not act on an unknown verdict can defer to a later pass.
+        """
         callback = self._skip_validate_callback
         if callback is None:
-            return False
+            return None if strict else False
         try:
             return callback(intent)
         except Exception:
             logger.exception(
                 "Failed to validate backlog skip for %s", intent.session_id
             )
-            return False
+            return None if strict else False
 
     def _skip_retry_due(self, session_id: str) -> bool:
         return time.monotonic() >= self._skip_retry_at.get(session_id, 0.0)
@@ -274,9 +331,7 @@ class SessionMonitor:
         """Retire frozen source work before a skip notice may be sent."""
         if not self._skip_is_current(intent):
             logger.warning("Cancelling stale backlog skip for %s", intent.session_id)
-            self.state.cancel_skip(intent.session_id)
-            self.state.save_if_dirty()
-            self._clear_skip_retry(intent.session_id)
+            self._cancel_pending_skip(intent.session_id)
             return None
         if intent.purge_complete:
             return True
@@ -293,9 +348,7 @@ class SessionMonitor:
             return False
         if skipped is None:
             logger.warning("Cancelling stale backlog skip for %s", intent.session_id)
-            self.state.cancel_skip(intent.session_id)
-            self.state.save_if_dirty()
-            self._clear_skip_retry(intent.session_id)
+            self._cancel_pending_skip(intent.session_id)
             return None
         self.state.update_skip_count(intent.session_id, skipped)
         if not self.state.save_if_dirty():
@@ -308,9 +361,7 @@ class SessionMonitor:
     async def _enqueue_pending_skip_notice(self, intent: BacklogSkipIntent) -> bool:
         """Create one receipt-tracked visible notice for a persisted barrier."""
         if not self._skip_is_current(intent):
-            self.state.cancel_skip(intent.session_id)
-            self.state.save_if_dirty()
-            self._clear_skip_retry(intent.session_id)
+            self._cancel_pending_skip(intent.session_id)
             return False
         if intent.session_id in self._skip_notice_receipts or not self._skip_retry_due(
             intent.session_id
@@ -341,6 +392,73 @@ class SessionMonitor:
         self._skip_notice_receipts[intent.session_id] = receipt
         return True
 
+    def _expire_aged_skip_barriers(self) -> None:
+        """Complete barriers whose notice never delivered.
+
+        A skip sacrifices history for liveness. When the visible notice
+        cannot be delivered (rebound topic, dead topic, sustained flood
+        control), the barrier inverts that into permanent source silence.
+        Past the deadline the barrier retires; the skip notice is dropped,
+        not retried.
+        """
+        if not self.state.pending_skips:
+            return
+        now = time.time()
+        for session_id, intent in tuple(self.state.pending_skips.items()):
+            if not intent.created_at:
+                # Legacy record predating the stamp: start its clock now,
+                # through the mutator so the stamp actually persists.
+                self.state.stamp_skip_clock(session_id, now)
+                continue
+            if now - intent.created_at <= config.skip_barrier_deadline_s:
+                continue
+            current = self._skip_is_current(intent, strict=True)
+            if current is None:
+                # Validator unavailable: decide nothing this pass.
+                continue
+            if not current:
+                # Never advance the old source watermark across a rebind:
+                # cancel so the range stays replayable under the new topic.
+                logger.warning(
+                    "Backlog skip barrier expired on a rebound topic; cancelling",
+                    session_id=session_id,
+                )
+                self._cancel_pending_skip(session_id)
+            elif not intent.purge_complete:
+                # The queued range was never retired: prefer replay over
+                # silently skipping bytes the queue may still deliver.
+                logger.warning(
+                    "Backlog skip barrier expired with its purge incomplete; "
+                    "cancelling so the range replays",
+                    session_id=session_id,
+                )
+                self._cancel_pending_skip(session_id)
+            else:
+                logger.warning(
+                    "Backlog skip barrier expired without a delivered notice; "
+                    "advancing the watermark to unblock the source",
+                    session_id=session_id,
+                    barrier_age_seconds=round(now - intent.created_at, 1),
+                )
+                if self.state.complete_skip(session_id):
+                    self._transcript_reader.replay_from_watermark(session_id)
+                else:
+                    self._cancel_pending_skip(session_id)
+            self._discard_session_delivery_state(session_id)
+        # One batched write for any stamps and retirements this pass made.
+        self.state.save_if_dirty()
+
+    async def _advance_skip_barriers(self) -> None:
+        """Resume attempts, then expire aged barriers, then commit delivery.
+
+        Resume runs before expiry so a process that slept past the deadline
+        still gets one notice delivery attempt; expiry then retires aged
+        barriers; commits advance what actually reached Telegram.
+        """
+        await self._resume_pending_skip_notices()
+        self._expire_aged_skip_barriers()
+        self._commit_pending_skips()
+
     async def _resume_pending_skip_notices(self) -> None:
         """Resume persisted skip barriers before reading any skipped bytes."""
         for intent in tuple(self.state.pending_skips.values()):
@@ -366,21 +484,18 @@ class SessionMonitor:
             if intent is None or not self._skip_is_current(intent):
                 # A topic may rebind after the notice was queued or delivered.
                 # Never advance the old source watermark across that boundary.
-                self.state.cancel_skip(session_id)
-                self.state.save_if_dirty()
-                self._delivery_receipts.pop(session_id, None)
-                self._skip_notice_receipts.pop(session_id, None)
-                self._clear_skip_retry(session_id)
+                self._cancel_pending_skip(session_id)
                 continue
             if self.state.complete_skip(session_id):
+                # Rebuild provider context through the skipped boundary before
+                # parsing the next suffix, which may begin a new Codex turn.
+                self._transcript_reader.replay_from_watermark(session_id)
                 self.state.save_if_dirty()
                 self._delivery_receipts.pop(session_id, None)
             else:
                 # The tracked session was removed or re-keyed. Do not retain a
                 # barrier that can no longer be committed or replay safely.
-                self.state.cancel_skip(session_id)
-                self.state.save_if_dirty()
-                self._delivery_receipts.pop(session_id, None)
+                self._cancel_pending_skip(session_id)
             self._skip_notice_receipts.pop(session_id, None)
             self._clear_skip_retry(session_id)
 
@@ -408,9 +523,9 @@ class SessionMonitor:
         delivery_contract.settled_prefix / settled_run_offset (including
         the shared-batch-checkpoint tie rule: persistence lags delivery by
         at most one in-flight batch); this coordinator groups receipts by
-        session, keeps the pending-tools and pending-skip fences, and persists
-        one batched commit per cycle. The settled run
-        is consumed even when the tie rule defers its commit: replay then
+        session, keeps the pending-tool, tool-delivery, and pending-skip
+        fences, and persists one batched commit per cycle. The settled run is
+        consumed even when the tie rule defers its commit: replay then
         re-delivers those messages, which at-least-once permits.
         """
         delivered_offsets: dict[str, int] = {}
@@ -423,6 +538,29 @@ class SessionMonitor:
                 or session_id in self._pending_tools
             ):
                 continue
+            tool_fence = self._transcript_reader._tool_delivery_fences.get(session_id)
+            if tool_fence is not None:
+                release_checkpoint = tool_fence.release_checkpoint
+                fenced_receipts = [
+                    receipt
+                    for receipt in receipts
+                    if receipt.checkpoint is not None
+                    and receipt.checkpoint >= tool_fence.call_checkpoint
+                    and (
+                        release_checkpoint is None
+                        or receipt.checkpoint <= release_checkpoint
+                    )
+                ]
+                if (
+                    release_checkpoint is None
+                    or not any(
+                        receipt.checkpoint == release_checkpoint
+                        for receipt in fenced_receipts
+                    )
+                    or not all(receipt.commit_ready for receipt in fenced_receipts)
+                ):
+                    continue
+                self._transcript_reader._tool_delivery_fences.pop(session_id, None)
             prefix = settled_prefix(receipts)
             if not prefix:
                 continue
@@ -442,6 +580,28 @@ class SessionMonitor:
             else:
                 self._delivery_receipts.pop(session_id, None)
 
+    def _reserve_replay_start(
+        self, window_id: str, session_id: str, path: Path
+    ) -> bool:
+        """Persist offset zero before consuming a session-map replay marker."""
+        tracked = self.state.get_session(session_id)
+        if tracked is None or tracked.file_path != str(path):
+            self.state.update_session(
+                TrackedSession(
+                    session_id=session_id,
+                    file_path=str(path),
+                    last_byte_offset=0,
+                )
+            )
+        if not self.state.save_if_dirty():
+            return False
+        if not acknowledge_replay_from_start(window_id, session_id):
+            logger.warning(
+                "Could not consume replay-from-start marker for session %s",
+                session_id,
+            )
+        return True
+
     async def check_for_updates(self, current_map: dict) -> list[NewMessage]:
         """Check all sessions for new assistant messages.
 
@@ -455,13 +615,23 @@ class SessionMonitor:
         direct_sessions: list[tuple[str, Path]] = []
         fallback_session_ids: set[str] = set()
 
-        for details in current_map.values():
+        for window_id, details in current_map.items():
             session_id = details["session_id"]
             transcript_path = details.get("transcript_path", "")
             if transcript_path:
                 path = Path(transcript_path)
+                replay_from_start = details.get("replay_from_start") is True
+                if replay_from_start and not self._reserve_replay_start(
+                    window_id, session_id, path
+                ):
+                    continue
                 if path.exists():
                     direct_sessions.append((session_id, path))
+                    continue
+                if replay_from_start:
+                    # The explicit hook path is authoritative. Scanning can
+                    # find a different generation and seed it at EOF before
+                    # this file is created.
                     continue
             fallback_session_ids.add(session_id)
 
@@ -473,7 +643,7 @@ class SessionMonitor:
                     session_id,
                     file_path,
                     new_messages,
-                    window_id=sid_to_wid.get(session_id, ""),
+                    window_id=sid_to_wid[session_id],
                 )
             except Exception:
                 logger.exception("Error processing session %s", session_id)
@@ -492,7 +662,7 @@ class SessionMonitor:
                         session_info.session_id,
                         session_info.file_path,
                         new_messages,
-                        window_id=sid_to_wid.get(session_info.session_id, ""),
+                        window_id=sid_to_wid[session_info.session_id],
                     )
                 except Exception:
                     logger.exception(
@@ -542,6 +712,11 @@ class SessionMonitor:
             self.state._dirty = True
 
         for event in events:
+            window_id = strip_session_map_prefix(event.window_key, session_map_prefix())
+            if window_id and not identity_state.accepts_provider_observation(
+                window_id, observed_provider(event.data)
+            ):
+                continue
             try:
                 await self._hook_event_callback(event)
             except _CallbackError:
@@ -585,9 +760,20 @@ class SessionMonitor:
             self.state.save_if_dirty()
 
     async def _detect_and_cleanup_changes(
-        self, raw: dict | None = None
+        self,
+        raw: dict | None = None,
+        *,
+        adoptable_window_ids: set[str] | None,
     ) -> dict[str, dict[str, str]]:
-        """Reconcile session_map; clean up replaced/removed sessions; fire new-window events."""
+        """Reconcile session_map; clean up replaced/removed sessions; fire new-window events.
+
+        ``adoptable_window_ids`` is this cycle's verdict, required rather than
+        defaulted: it is per-cycle input with one production caller, so holding
+        it as monitor state let a stale cycle's answer be reused and let the
+        first cycle run with none at all. ``None`` means no listing was
+        available, and then nothing is adopted — a hook entry is not evidence
+        that ccgram may adopt the window it names.
+        """
         if raw is None:
             raw = await read_session_map_raw()
         if raw is None:
@@ -616,6 +802,11 @@ class SessionMonitor:
             # session_manager forms a hard cycle on bootstrap.
             from .session import session_manager as _sm
 
+            adoptable_lookup = (
+                None
+                if adoptable_window_ids is None
+                else _adoption_lookup(adoptable_window_ids)
+            )
             for window_id, details in adoption_windows.items():
                 provider_name = details.get("provider_name", "")
                 if provider_name:
@@ -628,6 +819,15 @@ class SessionMonitor:
                     # the topic it was bound under; announcing it here would
                     # ask for a second topic for the same agent. Both other
                     # discovery paths skip bound windows for the same reason.
+                    continue
+
+                if (
+                    adoptable_lookup is None
+                    or canonical_window_id(window_id) not in adoptable_lookup
+                ):
+                    # A hook entry proves an agent ran there, not that ccgram
+                    # may adopt it. Installed globally, the hook writes entries
+                    # for windows outside the configured scope too.
                     continue
 
                 if self._new_window_callback:
@@ -653,10 +853,13 @@ class SessionMonitor:
         """Fire a NewWindowEvent for each live window not in session_map / bound.
 
         Surfaces windows the hook never registered (no session_map entry) so
-        they can become topics. On backends that expose agent status natively
-        (herdr), only agent panes qualify — a bare shell pane is not a topic;
-        tmux surfaces every window, preserving today's behavior. The gate is the
-        ``native_agent_status`` capability, not a backend name.
+        they can become topics. What qualifies is the backend's own verdict,
+        carried per window in ``WindowRef.topic_eligible``: herdr marks records
+        holding a guarded target and an agent label, agterm marks in-scope
+        sessions running an agent, tmux marks everything except the placeholder
+        main window, its own window and ``_``-prefixed ones, which its complete
+        listing returns ineligible instead of dropping. No capability flag
+        gates this; keying it on one produced two bugs in a row.
         """
         if not self._new_window_callback:
             return
@@ -665,11 +868,15 @@ class SessionMonitor:
         from .thread_router import thread_router
 
         caps = tmux_manager.capabilities
-        bound_window_ids = {wid for _, _, wid in thread_router.iter_thread_bindings()}
+        known_lookup = _adoption_lookup(known_window_ids)
+        bound_lookup = _adoption_lookup(
+            {wid for _, _, wid in thread_router.iter_thread_bindings()}
+        )
         for window in all_windows:
-            if window.window_id in known_window_ids:
+            window_key = canonical_window_id(window.window_id)
+            if window_key in known_lookup:
                 continue
-            if window.window_id in bound_window_ids:
+            if window_key in bound_lookup:
                 continue
             if not is_agent_topic_window(window, caps):
                 continue
@@ -690,7 +897,7 @@ class SessionMonitor:
     async def _emit_known_unbound_window_events(
         self,
         current_map: dict,
-        live_window_ids: set[str],
+        adoptable_window_ids: set[str],
     ) -> None:
         """Fire a NewWindowEvent for each session_map window that is not bound.
 
@@ -699,9 +906,13 @@ class SessionMonitor:
         poll until it succeeds. ``handle_new_window`` is idempotent — it skips
         windows that are already bound — so this generates no spam for bound tabs.
 
-        ``live_window_ids`` is the set from ``list_windows``. Because ``list_windows``
-        already filters ``__*__`` workspace/tab labels, any such tab is absent from
-        ``live_window_ids`` and is silently skipped here as well.
+        ``adoptable_window_ids`` holds the live windows whose backend marked them
+        ``WindowRef.topic_eligible``. It is NOT the plain live set: the listing
+        this is built from is the complete reconciliation one, because pruning
+        needs every window that exists. Filtering here is what keeps a window
+        the backend excluded — out of scope, ccgram's own, hidden by convention
+        — from being adopted through the session-map path, which reaches this
+        code whenever a globally installed agent hook writes an entry for it.
         """
         if not self._new_window_callback:
             return
@@ -710,10 +921,12 @@ class SessionMonitor:
         from .thread_router import thread_router
 
         bound_window_ids = {wid for _, _, wid in thread_router.iter_thread_bindings()}
+        bound_lookup = _adoption_lookup(bound_window_ids)
+        adoptable_lookup = _adoption_lookup(adoptable_window_ids)
         for window_id, details in current_map.items():
-            if window_id not in live_window_ids:
-                continue  # dead / __*__-filtered — skip
-            if window_id in bound_window_ids:
+            if canonical_window_id(window_id) not in adoptable_lookup:
+                continue  # dead, or the backend says it may not be adopted
+            if canonical_window_id(window_id) in bound_lookup:
                 continue  # already has a topic
             event = NewWindowEvent(
                 window_id=window_id,
@@ -730,43 +943,64 @@ class SessionMonitor:
                 )
 
     def _register_delivery_receipts(
-        self, messages: list[NewMessage]
-    ) -> list[tuple[NewMessage, DeliveryReceipt]]:
-        """Register a non-ready receipt for every parsed message synchronously."""
-        pending: list[tuple[NewMessage, DeliveryReceipt]] = []
-        if self._message_callback is None:
-            return pending
-        for msg in messages:
-            session = self.state.get_session(msg.session_id)
-            checkpoint = session.parsed_offset if session is not None else None
-            receipt = new_delivery_receipt(checkpoint=checkpoint)
-            self._delivery_receipts.setdefault(msg.session_id, []).append(receipt)
-            pending.append((msg, receipt))
+        self, batches: tuple[TranscriptBatch, ...]
+    ) -> list[tuple[TranscriptBatch, str, DeliveryReceipt]]:
+        """Register each parse-cycle batch per consumer before any await.
+
+        All records in a batch share its real source checkpoint. Keeping one
+        receipt per batch and consumer preserves the settled-prefix tie rule:
+        a failed sibling consumer cannot let that checkpoint advance.
+        """
+        pending: list[tuple[TranscriptBatch, str, DeliveryReceipt]] = []
+        consumer_names = self._event_hub.durable_consumer_names()
+        for batch in batches:
+            for consumer_name in consumer_names:
+                receipt = new_delivery_receipt(checkpoint=batch.byte_checkpoint)
+                self._delivery_receipts.setdefault(batch.session_id, []).append(receipt)
+                pending.append((batch, consumer_name, receipt))
         return pending
 
     async def _dispatch_message_with_receipt(
-        self, msg: NewMessage, receipt: DeliveryReceipt | None = None
+        self,
+        batch: TranscriptBatch,
+        receipt: DeliveryReceipt | None = None,
+        consumer_name: str = "telegram",
     ) -> None:
-        """Run one transcript callback under a delivery-boundary receipt."""
-        if self._message_callback is None:
-            return
+        """Run one durable consumer under its source-checkpoint receipt."""
         if receipt is None:
-            session = self.state.get_session(msg.session_id)
-            checkpoint = session.parsed_offset if session is not None else None
-            receipt = new_delivery_receipt(checkpoint=checkpoint)
-            self._delivery_receipts.setdefault(msg.session_id, []).append(receipt)
+            receipt = new_delivery_receipt(checkpoint=batch.byte_checkpoint)
+            self._delivery_receipts.setdefault(batch.session_id, []).append(receipt)
         token = activate_delivery_receipt(receipt)
         try:
-            await self._message_callback(msg)
+            await self._event_hub.dispatch_durable(consumer_name, batch)
         except asyncio.CancelledError:
             receipt.fail()
             raise
         except _CallbackError:
             receipt.fail()
-            logger.exception("Message callback error for session=%s", msg.session_id)
+            logger.exception(
+                "Durable delivery callback error for session=%s consumer=%s",
+                batch.session_id,
+                consumer_name,
+            )
         finally:
             deactivate_delivery_receipt(token)
             receipt.close()
+
+    async def _read_and_sync_session_map(self) -> dict | None:
+        """Discard snapshots invalidated by provider selection during I/O."""
+        # Lazy: session_map is wired by SessionManager during bootstrap.
+        from .session_map import session_map_sync
+
+        revision = session_map_sync.selection_revision
+        raw = await read_session_map_raw()
+        if raw is None or revision != session_map_sync.selection_revision:
+            logger.debug(
+                "Session-map read unconfirmed or selection changed; deferring poll"
+            )
+            return None
+        await session_map_sync.load_session_map(raw)
+        return raw
 
     async def _monitor_loop(self) -> None:
         """Background poll loop."""
@@ -785,13 +1019,21 @@ class SessionMonitor:
         error_streak = 0
         while self._running:
             try:
-                raw_session_map = await read_session_map_raw()
+                # The same long-lived task handles every cycle. Do not attach a
+                # prior message's session_id to reconciliation and hook logs.
+                structlog.contextvars.clear_contextvars()
 
-                # A fresh listing owns identity convergence. It must precede
-                # session-map loading because loading rejects raw legacy keys;
-                # after a successful fold, re-read the hook file under its
-                # normal parser so the canonical key is what lifecycle sees.
+                # Fold backend-attested aliases before hook dispatch and map
+                # loading, both of which require canonical window identities.
                 all_windows = await list_windows_for_reconciliation(tmux_manager)
+                # Set before the session-map paths run, not after: they consume
+                # it. None while a listing is unavailable, so adoption fails
+                # closed instead of reusing a stale cycle's verdict.
+                adoptable_window_ids = (
+                    None
+                    if all_windows is None
+                    else {w.window_id for w in all_windows if w.topic_eligible}
+                )
                 if all_windows is None:
                     logger.warning(
                         "Multiplexer listing unavailable; skipping window reconciliation"
@@ -806,53 +1048,70 @@ class SessionMonitor:
                     # hard cycle on bootstrap (same reason as below).
                     from .session import session_manager as _sm
 
-                    _sm.reconcile_window_aliases(all_windows)
-                    raw_session_map = await read_session_map_raw()
+                    # Lazy: thread routing imports monitor-facing helpers.
+                    from .thread_router import thread_router
 
-                # Dispatch only after identity convergence and the session-map
-                # re-read: hook routing is exact-bound, so consuming a canonical
-                # event before moving a legacy topic binding would drop it.
+                    _sm.reconcile_window_aliases(all_windows)
+                    note_live_windows(all_windows, thread_router.all_bound_window_ids())
+
+                # Hook routing is exact-bound: consuming a canonical event
+                # before moving a legacy topic binding would drop it.
                 await self._read_hook_events()
 
-                await session_map_sync.load_session_map(raw_session_map)
-                current_map = await self._detect_and_cleanup_changes(raw_session_map)
+                raw_session_map = await self._read_and_sync_session_map()
+                if raw_session_map is None:
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+                current_map = await self._detect_and_cleanup_changes(
+                    raw_session_map, adoptable_window_ids=adoptable_window_ids
+                )
 
                 monitored_map = current_map
                 if all_windows is not None:
-                    live_window_ids = {w.window_id for w in all_windows}
+                    live_window_ids = {
+                        canonical_window_id(w.window_id) for w in all_windows
+                    }
                     session_map_sync.prune_session_map(live_window_ids)
+                    # Pruning needs every live window; adoption needs only the
+                    # ones the backend says may be adopted. The listing is
+                    # complete on purpose, so the two sets differ.
                     known_window_ids = set(current_map.keys())
                     await self._emit_unbound_window_events(
                         all_windows, known_window_ids
                     )
                     await self._emit_known_unbound_window_events(
-                        current_map, live_window_ids
+                        current_map, adoptable_window_ids or set()
                     )
                     monitored_map = {
                         window_id: details
                         for window_id, details in current_map.items()
-                        if window_id in live_window_ids
+                        if canonical_window_id(window_id) in live_window_ids
                     }
 
                 # A persisted barrier must be noticed before its source is read
                 # again; this preserves the exact EOF snapshot across restarts.
-                await self._resume_pending_skip_notices()
-                self._commit_pending_skips()
-                new_messages = await self.check_for_updates(monitored_map)
-                # Register every parsed message before the next await. A
+                await self._advance_skip_barriers()
+                await self.check_for_updates(monitored_map)
+                transcript_batches = self._transcript_reader.drain_batches()
+                # Register every normalized batch before the next await. A
                 # shutdown cancellation between parse and dispatch must leave
-                # a non-ready receipt so its offset remains replayable.
-                pending_dispatches = self._register_delivery_receipts(new_messages)
+                # a non-ready receipt so its source offset remains replayable.
+                pending_dispatches = self._register_delivery_receipts(
+                    transcript_batches
+                )
 
-                for msg, receipt in pending_dispatches:
+                for batch, consumer_name, receipt in pending_dispatches:
                     structlog.contextvars.clear_contextvars()
-                    structlog.contextvars.bind_contextvars(session_id=msg.session_id)
-                    status = "complete" if msg.is_complete else "streaming"
-                    preview = msg.text[:_MSG_PREVIEW_LENGTH] + (
-                        "..." if len(msg.text) > _MSG_PREVIEW_LENGTH else ""
+                    structlog.contextvars.bind_contextvars(session_id=batch.session_id)
+                    logger.debug(
+                        "Dispatching %s transcript records for session=%s to %s",
+                        len(batch.records),
+                        batch.session_id,
+                        consumer_name,
                     )
-                    logger.debug("[%s] session=%s: %s", status, msg.session_id, preview)
-                    await self._dispatch_message_with_receipt(msg, receipt)
+                    await self._dispatch_message_with_receipt(
+                        batch, receipt, consumer_name
+                    )
 
                 self.commit_delivered_watermarks()
 

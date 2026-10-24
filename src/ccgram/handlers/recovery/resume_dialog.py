@@ -42,10 +42,14 @@ trying to avoid.
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import structlog
 
 from ...multiplexer import multiplexer as tmux_manager
+
+if TYPE_CHECKING:
+    from ...session_protocol.telegram import TelegramSessionAdapter
 
 logger = structlog.get_logger(__name__)
 
@@ -71,6 +75,7 @@ def is_resume_dialog(pane_text: str | None) -> bool:
 async def dismiss_resume_dialog(
     window_id: str,
     *,
+    adapter: TelegramSessionAdapter,
     settle_timeout: float = _SETTLE_TIMEOUT_S,
 ) -> bool:
     """Select "Resume full session as-is" if the resume menu is showing.
@@ -90,9 +95,10 @@ async def dismiss_resume_dialog(
         return False
 
     # Option 1 ("Resume from summary") is preselected; step down to option 2.
-    await tmux_manager.send_keys(window_id, "Down", enter=False, literal=False)
+    # Keys go through the session core like every other handler input.
+    await adapter.send_keys(window_id, ["Down"])
     await asyncio.sleep(0.15)
-    await tmux_manager.send_keys(window_id, "Enter", enter=False, literal=False)
+    await adapter.send_keys(window_id, ["Enter"])
     logger.info(
         "Resume-size dialog answered 'Resume full session as-is' for window %s",
         window_id,
@@ -111,7 +117,7 @@ async def dismiss_resume_dialog(
         settle_timeout,
         window_id,
     )
-    await tmux_manager.send_keys(window_id, "Escape", enter=False, literal=False)
+    await adapter.send_keys(window_id, ["Escape"])
     if await _wait_until_gone(window_id, settle_timeout):
         return True
 

@@ -27,15 +27,16 @@ from typing import TYPE_CHECKING, Any
 from .. import quiet_threads, window_query
 from ..config import config
 from ..multiplexer import multiplexer as tmux_manager
-from ..multiplexer.window_ops import send_to_window
 from ..providers import get_provider_for_window
 from ..thread_router import thread_router
 from . import agents, rewind, transcript
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Coroutine, Mapping
 
     from telegram import Bot
+
+    from ..session_protocol.telegram import TelegramSessionAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,53 @@ ALLOWED_KEYS = frozenset(
     {"Enter", "Escape", "Up", "Down", "Left", "Right", "Tab", "BTab", "C-c"}
     | {str(n) for n in range(10)}
 )
+
+
+# The PTB application's bot_data: it carries the shared session service the
+# Telegram handlers use (see ``bind_bot_data``, called by ``start_webui``).
+_bot_data: Mapping[str, Any] = {}
+
+_SEND_KEYS_TIMEOUT_S = 5.0
+
+
+def bind_bot_data(bot_data: Mapping[str, Any] | None) -> None:
+    """Give the web UI the application's bot_data (session service inside)."""
+    global _bot_data
+    _bot_data = bot_data if bot_data is not None else {}
+
+
+def _adapter() -> TelegramSessionAdapter:
+    """The Telegram session adapter over the shared session core."""
+    # Lazy: the protocol core pulls the provider/backend graph.
+    from ..session_protocol.telegram import adapter_for
+
+    try:
+        return adapter_for(_bot_data)
+    except RuntimeError as exc:
+        raise WebUIError("session service is not running", 503) from exc
+
+
+async def send_to_window(window_id: str, text: str) -> tuple[bool, str]:
+    """Type ``text`` + Enter into a window, without a Telegram-origin marker.
+
+    The web path deliberately skips the session core's Telegram injection
+    bookkeeping: the resulting user transcript entry must be relayed into
+    the topic like terminal input. Same contract as the removed upstream
+    ``multiplexer.window_ops.send_to_window`` the web UI was built on.
+    """
+
+    async def _once() -> tuple[bool, str]:
+        window = await tmux_manager.find_window_by_id(window_id)
+        if not window:
+            return False, "Window not found (may have been closed)"
+        if await tmux_manager.send_keys(window.window_id, text):
+            return True, "Sent"
+        return False, "Failed to send keys"
+
+    try:
+        return await asyncio.wait_for(_once(), timeout=_SEND_KEYS_TIMEOUT_S)
+    except TimeoutError:
+        return False, "Timed out sending keys"
 
 
 class WebUIError(Exception):
@@ -312,38 +360,47 @@ async def list_sessions() -> list[dict[str, Any]]:
 
 
 def _read_transcript(path: Path, provider_name: str | None) -> list[dict[str, Any]]:
+    """Render a transcript tail the way the Telegram relay renders it.
+
+    One normalization path (upstream's session-protocol parser), so the web
+    history and the live topic never disagree about a message.
+    """
     # Lazy: providers package heavy bootstrap.
     from ..providers import get_provider, registry
+
+    # Lazy: the protocol parser and the relay renderer pull the provider graph.
+    from ..session_protocol.messages import parse_records, read_entries
+    from ..transcript_reader import render_protocol_records
 
     provider = get_provider()  # also populates the registry
     if provider_name:
         # Unknown provider name: keep the default.
         with contextlib.suppress(Exception):
             provider = registry.get(provider_name)
-    entries: list[dict[str, Any]] = []
-    with open(path, encoding="utf-8", errors="replace") as fh:
+    name = provider.capabilities.name
+    with open(path, "rb") as fh:
         # 1M-context transcripts grow to tens of MB; the UI only shows the
         # tail, so skip to the last chunk and drop the partial first line.
         size = path.stat().st_size
         if size > MAX_TRANSCRIPT_BYTES:
             fh.seek(size - MAX_TRANSCRIPT_BYTES)
             fh.readline()
-        for line in fh:
-            data = provider.parse_transcript_line(line)
-            if data:
-                entries.append(data)
-    messages, _ = provider.parse_transcript_entries(entries, {})
-    return [
-        {
-            "role": m.role,
-            "text": m.text,
-            "content_type": m.content_type,
-            "tool_name": m.tool_name,
-            "tool_use_id": m.tool_use_id,
-            "timestamp": m.timestamp,
-        }
-        for m in messages
-    ]
+        raw = fh.read()
+    records, state = parse_records(read_entries(raw, name), name)
+    out: list[dict[str, Any]] = []
+    for pair in records:
+        for m in render_protocol_records("", name, (pair,), state):
+            out.append(
+                {
+                    "role": m.role,
+                    "text": m.text,
+                    "content_type": m.content_type,
+                    "tool_name": m.tool_name,
+                    "tool_use_id": m.tool_use_id,
+                    "timestamp": pair[1].time,
+                }
+            )
+    return out
 
 
 async def history(thread_id: int, limit: int = DEFAULT_HISTORY) -> dict[str, Any]:
@@ -704,7 +761,7 @@ async def _wake_web_only(binding: Binding) -> str:
     session_manager.set_window_approval_mode(wid, approval_mode)
     if provider.capabilities.supports_hook:
         await session_map_sync.wait_for_session_map_entry(wid)
-    await dismiss_resume_dialog(wid)
+    await dismiss_resume_dialog(wid, adapter=_adapter())
     return wid
 
 
@@ -721,15 +778,23 @@ async def _wake(bot: Bot, binding: Binding) -> str:
     cwd = _cwd_for(binding)
     if not cwd or not Path(cwd).is_dir():
         raise WebUIError("session folder is gone; recover it from Telegram", 409)
+    adapter = _adapter()
     ok = await auto_continue_from_message(
-        None, bot, binding.user_id, binding.thread_id, binding.window_id, cwd, ""
+        None,
+        bot,
+        binding.user_id,
+        binding.thread_id,
+        binding.window_id,
+        cwd,
+        "",
+        adapter=adapter,
     )
     new_wid = thread_router.get_window_for_thread(
         binding.user_id, binding.thread_id, binding.chat_id
     )
     if not ok or not new_wid or new_wid == binding.window_id:
         raise WebUIError("could not wake the session; open it in Telegram", 409)
-    await dismiss_resume_dialog(new_wid)
+    await dismiss_resume_dialog(new_wid, adapter=adapter)
     return new_wid
 
 
@@ -941,7 +1006,7 @@ async def create_session(
         bool(text)
         and provider_registry.get(provider).capabilities.launch_accepts_initial_prompt
     )
-    context = SimpleNamespace(bot=_LaunchBot(bot), user_data={})
+    context = SimpleNamespace(bot=_LaunchBot(bot), user_data={}, bot_data=_bot_data)
     # pending_text is NOT handed to launch_window: it would be injected with a
     # Telegram-origin marker and so never relayed into the topic. Send it
     # ourselves once the window is up, through the plain web path.
@@ -1094,7 +1159,7 @@ async def create_web_only_session(
     session_manager.set_window_provider(wid, provider_name)
     session_manager.set_window_approval_mode(wid, mode)
     if mode == "yolo" and provider.capabilities.has_yolo_confirmation:
-        await _accept_yolo_confirmation(wid)
+        await _accept_yolo_confirmation(wid, _adapter())
     if provider.capabilities.supports_hook:
         await session_map_sync.wait_for_session_map_entry(wid)
     view = window_query.view_window(wid)

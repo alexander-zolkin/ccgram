@@ -12,18 +12,23 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 from telegram.error import TelegramError
 
+from ...config import config
 from ...providers import registry as provider_registry
 from ...session import session_manager
 from ...session_map import session_map_sync
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
+from ...multiplexer.base import canonical_window_id
 from ..telegram_origin import send_telegram_to_window
+from ...session_protocol.telegram import TelegramSessionAdapter, adapter_for
+from ...session_protocol.models import ProtocolError
 from ...user_preferences import user_preferences
 from ... import window_query
 from ...window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
@@ -46,6 +51,8 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+_YOLO_CREATION_GUARD_GRACE_S = 10.0
+
 __all__ = [
     "WindowLaunchRequest",
     "WindowLaunchResult",
@@ -61,7 +68,7 @@ class WindowLaunchRequest:
     thread_id: int | None
     provider_name: str
     cwd: str
-    mode: str
+    mode: Literal["normal", "yolo"]
     pending_text: str | None
     # CCGRAM-HOTFIX:model-picker — optional model override for the fresh
     # session; appended as `--model <id>` (claude provider only).
@@ -142,23 +149,43 @@ async def _abort_topic_creation(
     clear_workspace_state(context.user_data)
 
 
+@dataclass(frozen=True, slots=True)
+class _LaunchExtras:
+    """The fork's trusted launch arguments for one fresh session."""
+
+    agent_args: str | None = None
+    command_prefix: str = ""
+    resume_id: str | None = None
+
+    def create_kwargs(self) -> dict[str, Any]:
+        """Only the options that differ from a plain upstream create."""
+        kwargs: dict[str, Any] = {}
+        if self.resume_id:
+            kwargs["resume_id"] = self.resume_id
+        if self.agent_args is not None:
+            kwargs["agent_args"] = self.agent_args
+        if self.command_prefix:
+            kwargs["command_prefix"] = self.command_prefix
+        return kwargs
+
+
 async def _create_topic_window(
     selected_path: str,
-    launch_command: str | None,
+    provider_name: str,
+    approval_mode: Literal["normal", "yolo"],
     chosen_workspace_id: str | None,
     context: ContextTypes.DEFAULT_TYPE,
+    extras: _LaunchExtras | None = None,
 ) -> tuple[bool, str, str, str]:
-    """Create the topic's window, returning ``(success, message, name, id)``.
-
-    Native worktree delegation (herdr): when the flow carries a pending worktree
-    intent, one ``worktree create`` makes the checkout + grouped workspace + the
-    window in a single step. Gated on ``native_worktrees``; tmux always takes the
-    ``create_window`` branch (its worktree was already created on disk earlier).
-    """
+    """Create a topic session through the shared session service."""
+    extras = extras or _LaunchExtras()
     ud = context.user_data
     wt_repo = ud.get(PENDING_WORKTREE_REPO) if ud else None
     wt_branch = ud.get(PENDING_WORKTREE_BRANCH) if ud else None
     wt_path = ud.get(PENDING_WORKTREE_PATH) if ud else None
+    data: dict[str, Any] = {"provider": provider_name, "directory": selected_path}
+    if chosen_workspace_id:
+        data["workspaceId"] = chosen_workspace_id
     if tmux_manager.capabilities.native_worktrees and wt_repo and wt_branch and wt_path:
         # The native worktree API cannot pin a preselected workspace.  Creating
         # into an implicit workspace would violate the user's selection.
@@ -169,40 +196,28 @@ async def _create_topic_window(
                 "",
                 "",
             )
-        success, message, name, window_id = await tmux_manager.create_worktree_window(
-            wt_repo,
-            wt_path,
-            wt_branch,
-            window_name=Path(wt_path).name,
-            launch_command=launch_command,
-        )
-        return success, message, name, window_id
-    # Tmux and agterm create normal durable windows. Herdr uses its guarded
-    # native topic-target transaction.
-    if tmux_manager.capabilities.native_topic_targets is not True:
-        success, message, name, window_id = await tmux_manager.create_window(
-            selected_path,
-            launch_command=launch_command,
-            workspace_id=chosen_workspace_id,
-        )
-        return success, message, name, window_id
+        data["directory"] = wt_repo
+        data["worktree"] = True
+        data["branch"] = wt_branch
     try:
-        target = await tmux_manager.create_topic_target(
-            selected_path,
-            launch_command=launch_command,
-            workspace_id=chosen_workspace_id,
+        created = await adapter_for(context.bot_data).create(
+            data, approval_mode=approval_mode, **extras.create_kwargs()
         )
-    except RuntimeError as exc:
-        return False, str(exc), "", ""
+    except ProtocolError as exc:
+        if exc.status < HTTPStatus.INTERNAL_SERVER_ERROR:
+            return False, exc.message, "", ""
+        raise
     return (
         True,
-        f"Created topic target '{target.label}'",
-        target.label,
-        target.target_id,
+        f"Created topic target '{created.title}'",
+        created.title,
+        created.target_id,
     )
 
 
-async def _wait_for_shell_ready(window_id: str, *, attempts: int = 5) -> None:
+async def _wait_for_shell_ready(
+    window_id: str, adapter: TelegramSessionAdapter, *, attempts: int = 5
+) -> None:
     """Wait for a freshly created tmux window to show a shell prompt."""
     # Lazy: only needed inside the shell-detection branch
     import os
@@ -211,15 +226,66 @@ async def _wait_for_shell_ready(window_id: str, *, attempts: int = 5) -> None:
     from ccgram.providers.shell import KNOWN_SHELLS
 
     for _ in range(attempts):
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w and w.pane_current_command:
-            cmd = os.path.basename(w.pane_current_command.split()[0]).lstrip("-")
+        try:
+            target, _ = await adapter.resolve(window_id)
+        except ProtocolError:
+            target = None
+        if target and target.foreground_argv:
+            cmd = os.path.basename(target.foreground_argv[0]).lstrip("-")
             if cmd in KNOWN_SHELLS:
                 return
         await asyncio.sleep(0.2)
 
 
-async def _accept_yolo_confirmation(window_id: str, *, timeout: float = 8.0) -> bool:
+async def agent_process_started(
+    window_id: str, adapter: TelegramSessionAdapter
+) -> bool | None:
+    """Whether a non-shell process owns the pane right now; None if unknown.
+
+    One probe, no waiting: callers decide whether to retry (launch) or leave
+    the claim quarantined (recovery). ``None`` means the backend could not
+    answer, not that the agent is gone.
+    """
+    # Lazy: only needed for hookless providers
+    import os
+
+    # Lazy: providers package heavy bootstrap
+    from ccgram.providers.shell import KNOWN_SHELLS
+
+    try:
+        target, _ = await adapter.resolve(window_id)
+    except ProtocolError:
+        return None
+    if not target.foreground_argv:
+        return None
+    cmd = os.path.basename(target.foreground_argv[0]).lstrip("-")
+    return cmd not in KNOWN_SHELLS
+
+
+async def _wait_for_agent_process(
+    window_id: str, adapter: TelegramSessionAdapter, *, attempts: int = 50
+) -> bool:
+    """Wait for a hookless agent CLI to replace the shell as the pane's process.
+
+    Without this, the first poll sees the launch shell and treats the agent as
+    already exited, killing the window before the CLI has started. Returns
+    True once a non-shell process owns the pane; False means the pane still
+    shows a launch shell after the whole budget, so the caller must not bind
+    the topic as if the agent had started.
+    """
+    for _ in range(attempts):
+        if await agent_process_started(window_id, adapter):
+            return True
+        await asyncio.sleep(0.2)
+    return False
+
+
+async def _accept_yolo_confirmation(
+    window_id: str,
+    adapter: TelegramSessionAdapter,
+    *,
+    timeout: float | None = None,
+) -> bool:
     """Detect and accept Claude Code's bypass permissions confirmation prompt.
 
     When launched with --dangerously-skip-permissions, Claude Code shows a
@@ -227,16 +293,22 @@ async def _accept_yolo_confirmation(window_id: str, *, timeout: float = 8.0) -> 
     Down+Enter to select the "Yes" option so the session can start.
     """
     loop = asyncio.get_running_loop()
+    timeout = config.yolo_confirmation_timeout if timeout is None else timeout
     deadline = loop.time() + timeout
     while loop.time() < deadline:
         text = await tmux_manager.capture_pane(window_id)
-        if text and "bypass permissions" in text.lower():
+        lower = text.lower() if text else ""
+        if "bypass permissions" in lower and (
+            "no, exit" in lower or "i accept" in lower
+        ):
             await asyncio.sleep(0.3)
-            await tmux_manager.send_keys(window_id, "Down", enter=False, literal=False)
-            await asyncio.sleep(0.15)
-            await tmux_manager.send_keys(window_id, "Enter", enter=False, literal=False)
+            success, _ = await adapter.send_keys(window_id, ["Down", "Enter"])
+            if not success:
+                return False
             logger.info("Accepted bypass permissions prompt for window %s", window_id)
             return True
+        if "⏵⏵ bypass permissions" in lower:
+            return False
         await asyncio.sleep(0.5)
     logger.warning(
         "Bypass permissions prompt not detected within %.0fs for window %s",
@@ -246,7 +318,7 @@ async def _accept_yolo_confirmation(window_id: str, *, timeout: float = 8.0) -> 
     return False
 
 
-def _follow_supersession(window_id: str) -> str:
+def _follow_supersession(window_id: str, *, claim_id: str | None = None) -> str:
     """Re-point creation at the id its window answers to now.
 
     Reconciliation runs on the monitor cycle, so a backend that firms up
@@ -262,16 +334,199 @@ def _follow_supersession(window_id: str) -> str:
     current = window_query.resolve_window_alias(window_id)
     if current == window_id:
         return window_id
+    if canonical_window_id(current) == canonical_window_id(window_id):
+        return current
+    if claim_id is not None:
+        try:
+            thread_router.attach_provisioning_target(claim_id, current)
+            session_manager.flush_state()
+        except BaseException:  # noqa: BLE001
+            _mark_provisioning_uncertain(claim_id)
+            raise
     topic_orchestration.register_pending_creation(current)
     topic_orchestration.clear_pending_creation(window_id)
     logger.info("Creation target superseded: %s -> %s", window_id, current)
     return current
 
 
+def _is_definitive_create_failure(message: str) -> bool:
+    """Return whether a failed create response proves no target exists."""
+    normalized = message.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "directory does not exist",
+            "not a directory",
+            "selected workspace cannot create",
+            "selected herdr workspace no longer exists",
+            "requires a sessionful agent",
+            "does not create worktrees natively",
+            "does not create worktrees",
+        )
+    )
+
+
+async def _await_creation_result(creation):  # noqa: ANN001
+    """Wait for creation while retaining a result delivered with cancellation."""
+    task = asyncio.create_task(creation)
+    try:
+        return await asyncio.shield(task), False
+    except asyncio.CancelledError:
+        # ``shield`` keeps the backend request alive.  Await it so a target
+        # created just before cancellation is still available for cleanup.
+        return await task, True
+
+
+def _mark_provisioning_uncertain(claim_id: str | None) -> None:
+    """Release runtime ownership while retaining durable recovery evidence."""
+    if claim_id is None:
+        return
+    try:
+        thread_router.mark_provisioning_uncertain(claim_id)
+    except KeyError:
+        logger.warning("Provisioning claim disappeared while marking uncertain")
+        return
+    try:
+        session_manager.flush_state()
+    except BaseException:  # noqa: BLE001
+        logger.warning("Could not persist uncertain provisioning claim")
+
+
+def _abort_provisioning_claim(claim_id: str | None) -> None:
+    """Release a claim whose backend operation definitely never started."""
+    if claim_id is None:
+        return
+    try:
+        thread_router.abort_topic_provisioning(
+            claim_id,
+            target_confirmed_absent=True,
+        )
+    except KeyError:
+        logger.warning("Provisioning claim disappeared while aborting")
+        return
+    try:
+        session_manager.flush_state()
+    except BaseException:  # noqa: BLE001
+        logger.warning("Could not persist aborted provisioning claim")
+
+
+async def _cleanup_failed_topic(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Delete a failed exact topic after its target is confirmed absent."""
+    if thread_id is None or chat_id is None:
+        return
+
+    # The storage abort records an unbound exact topic as a retired cleanup
+    # candidate. Use the shared deletion flow so state is cleared before the
+    # Telegram delete and failed deletes remain retryable.
+    # Lazy: cleanup → shell/polling → topics cycle.
+    from ...telegram_client import PTBTelegramClient
+
+    # Lazy: cleanup → shell/polling → topics cycle.
+    from ..cleanup import clear_topic_state
+
+    # Lazy: topic deletion imports cleanup and polling state.
+    from .topic_deletion import cleanup_retired_topic
+
+    retired = next(
+        (
+            topic
+            for topic in thread_router.iter_retired_topics()
+            if topic.user_id == user_id
+            and topic.chat_id == chat_id
+            and topic.thread_id == thread_id
+        ),
+        None,
+    )
+    if retired is None:
+        return
+
+    client = PTBTelegramClient(context.bot)
+
+    async def clear_state_before_delete() -> None:
+        await clear_topic_state(
+            user_id,
+            thread_id,
+            client,
+            context.user_data,
+            window_id=retired.target_id,
+            chat_id=chat_id,
+            window_dead=True,
+        )
+
+    await cleanup_retired_topic(
+        client,
+        retired,
+        router=thread_router,
+        before_delete=clear_state_before_delete,
+    )
+
+
+async def _finish_failed_provisioning(  # noqa: C901
+    *,
+    claim_id: str | None,
+    target_id: str | None,
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None,
+    context: ContextTypes.DEFAULT_TYPE,
+    failure_message: str = "",
+    target_already_absent: bool = False,
+) -> bool:
+    """Abort a proven-absent target or quarantine an uncertain target."""
+    if claim_id is None:
+        if target_id is None:
+            return False
+        if target_already_absent:
+            topic_orchestration.clear_pending_creation(target_id)
+            return True
+        try:
+            target_confirmed_absent, _ = await adapter_for(context.bot_data).close(
+                target_id
+            )
+        except BaseException:  # noqa: BLE001
+            return False
+        if target_confirmed_absent:
+            topic_orchestration.clear_pending_creation(target_id)
+        return bool(target_confirmed_absent)
+
+    if target_id is None and not _is_definitive_create_failure(failure_message):
+        _mark_provisioning_uncertain(claim_id)
+        return False
+
+    target_confirmed_absent = target_id is None or target_already_absent
+    if target_id is not None and not target_already_absent:
+        try:
+            target_confirmed_absent, _ = await adapter_for(context.bot_data).close(
+                target_id
+            )
+        except BaseException:  # noqa: BLE001
+            _mark_provisioning_uncertain(claim_id)
+            return False
+
+    if target_confirmed_absent:
+        _abort_provisioning_claim(claim_id)
+        if target_id is not None:
+            topic_orchestration.clear_pending_creation(target_id)
+        await _cleanup_failed_topic(user_id, thread_id, chat_id, context)
+        return True
+
+    _mark_provisioning_uncertain(claim_id)
+    if target_id is not None:
+        topic_orchestration.clear_pending_creation(target_id)
+    if failure_message:
+        logger.warning("Provisioned target remains quarantined: %s", failure_message)
+    return False
+
+
 # ── main entry point ──────────────────────────────────────────────────────────
 
 
-async def launch_window(  # noqa: PLR0912, PLR0915, C901
+async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
     query: CallbackQuery,
     context: ContextTypes.DEFAULT_TYPE,
     request: WindowLaunchRequest,
@@ -286,23 +541,47 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
     prevents the SessionMonitor from auto-creating a topic while Herdr publishes
     a session identity or before ``bind_thread`` runs below.
     """
-    # Lazy: providers package heavy bootstrap
-    from ccgram.providers import resolve_launch_command
-
     user_id = request.user_id
     pending_thread_id = request.thread_id
     selected_path = request.cwd
     provider_name = request.provider_name
     approval_mode = request.mode
 
-    launch_command = resolve_launch_command(provider_name, approval_mode=approval_mode)
+    query_message = query.message
+    chat = query_message.chat if query_message else None
+    raw_chat_id = (
+        request.chat_id if request.chat_id is not None else getattr(chat, "id", None)
+    )
+    chat_id = raw_chat_id if isinstance(raw_chat_id, int) else None
 
-    # CCGRAM-HOTFIX:fresh-launch-args — upstream's v4 refactor stopped passing
-    # fresh-session args to the new window, which silently dropped the
-    # provider's fresh `make_launch_args()` (claude → `--effort xhigh`).
-    # Restore them, and append the model override from the quick-start model
-    # picker (CCGRAM-HOTFIX:model-picker). The args are appended onto
-    # launch_command so both the create_window and worktree branches get them.
+    claim_id: str | None = None
+    if pending_thread_id is not None and chat_id is not None:
+        try:
+            claim = thread_router.begin_topic_provisioning(
+                user_id,
+                chat_id,
+                thread_id=pending_thread_id,
+                kind="target_for_topic",
+            )
+        except (TypeError, ValueError) as exc:
+            message = str(exc)
+            await _abort_topic_creation(query, message, context)
+            return WindowLaunchResult(success=False, error_message=message)
+        claim_id = claim.claim_id
+        # The exact topic claim must reach disk before the first backend await.
+        try:
+            session_manager.flush_state()
+        except BaseException:  # noqa: BLE001
+            _abort_provisioning_claim(claim_id)
+            raise
+
+    # CCGRAM-HOTFIX:fresh-launch-args — the fresh session gets the provider's
+    # own `make_launch_args()` (claude → `--effort xhigh`) plus the fork's
+    # launch extras: the model override from the quick-start model picker
+    # (CCGRAM-HOTFIX:model-picker), the effort, a grok initial prompt. When
+    # any extra applies, the whole argument string goes to the session backend
+    # as a trusted ``agent_args`` override; otherwise the backend computes the
+    # same provider args itself.
     try:
         provider = provider_registry.get(provider_name)
         fresh_args = provider.make_launch_args()
@@ -322,6 +601,7 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         except Exception:  # noqa: BLE001 — a bad id falls back to a fresh start
             resumed = ""
         fresh_args = resumed if isinstance(resumed, str) else ""
+    provider_args = fresh_args
     # CCGRAM-HOTFIX:model-picker — append the chosen model as `--model <id>` for
     # any provider with a model picker (claude, grok). When no model was picked,
     # grok honours the CCGRAM_GROK_MODEL env default; other providers fall back
@@ -349,8 +629,6 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         from ccgram.providers.claude import with_effort
 
         fresh_args = with_effort(fresh_args, request.effort)
-    if fresh_args:
-        launch_command = f"{launch_command} {fresh_args}"
 
     # CCGRAM-HOTFIX:grok-initial-prompt — for CLIs whose welcome screen would
     # swallow keystrokes sent right after launch (grok), pass the topic's first
@@ -361,13 +639,14 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         # Lazy: shlex only needed on this initial-prompt path.
         import shlex
 
-        launch_command = f"{launch_command} {shlex.quote(request.pending_text)}"
+        fresh_args = f"{fresh_args} {shlex.quote(request.pending_text)}".strip()
         initial_prompt_consumed = True
 
     # CCGRAM-HOTFIX:private-session — a private grok launch redirects GROK_HOME to
     # the private root so the transcript/history lands outside the assistant's
     # scan paths (the cwd is already the private folder). Prefixed as an env
     # assignment on the pane command; grok's hooks inherit it too.
+    command_prefix = ""
     if request.private and provider_name == "grok":
         import shlex
 
@@ -375,30 +654,107 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
 
         try:
             private_home = ensure_grok_private_home()
-            launch_command = (
-                f"GROK_HOME={shlex.quote(str(private_home))} {launch_command}"
-            )
+            command_prefix = f"GROK_HOME={shlex.quote(str(private_home))}"
         except Exception:  # noqa: BLE001 — never block launch on private setup
             logger.exception("private grok: failed to set up private home")
+    launch_extras = _LaunchExtras(
+        agent_args=fresh_args if fresh_args != provider_args else None,
+        command_prefix=command_prefix,
+        resume_id=request.resume_id or None,
+    )
 
     chosen_workspace_id: str | None = (
         context.user_data.get(PENDING_WORKSPACE_ID) if context.user_data else None
     ) or None
 
+    creation_was_cancelled = False
     with topic_orchestration.pending_creation_transaction():
-        (
-            success,
-            message,
-            created_wname,
-            created_wid,
-        ) = await _create_topic_window(
-            selected_path,
-            launch_command,
-            chosen_workspace_id,
-            context,
-        )
+        try:
+            creation, creation_was_cancelled = await _await_creation_result(
+                _create_topic_window(
+                    selected_path,
+                    provider_name,
+                    approval_mode,
+                    chosen_workspace_id,
+                    context,
+                    launch_extras,
+                )
+            )
+        except BaseException:  # noqa: BLE001
+            _mark_provisioning_uncertain(claim_id)
+            raise
+
+        success, message, created_wname, created_wid = creation
+        if success and not created_wid:
+            success = False
+            message = "Backend returned no target ID"
+
         if success:
-            topic_orchestration.register_pending_creation(created_wid)
+            if claim_id is not None:
+                try:
+                    thread_router.attach_provisioning_target(claim_id, created_wid)
+                    session_manager.flush_state()
+                except BaseException:  # noqa: BLE001
+                    _mark_provisioning_uncertain(claim_id)
+                    raise
+            if approval_mode == "yolo":
+                topic_orchestration.register_pending_creation(
+                    created_wid,
+                    ttl_s=(
+                        config.yolo_confirmation_timeout + _YOLO_CREATION_GUARD_GRACE_S
+                    ),
+                )
+            else:
+                topic_orchestration.register_pending_creation(created_wid)
+
+        if not success:
+            if created_wid:
+                try:
+                    if claim_id is not None:
+                        thread_router.attach_provisioning_target(claim_id, created_wid)
+                        session_manager.flush_state()
+                    topic_orchestration.register_pending_creation(created_wid)
+                except BaseException:  # noqa: BLE001
+                    _mark_provisioning_uncertain(claim_id)
+                    raise
+                await _finish_failed_provisioning(
+                    claim_id=claim_id,
+                    target_id=created_wid,
+                    user_id=user_id,
+                    thread_id=pending_thread_id,
+                    chat_id=chat_id,
+                    context=context,
+                    failure_message=message,
+                )
+            elif claim_id is not None:
+                if _is_definitive_create_failure(message):
+                    await _finish_failed_provisioning(
+                        claim_id=claim_id,
+                        target_id=None,
+                        user_id=user_id,
+                        thread_id=pending_thread_id,
+                        chat_id=chat_id,
+                        context=context,
+                        failure_message=message,
+                    )
+                else:
+                    _mark_provisioning_uncertain(claim_id)
+            await _abort_topic_creation(query, message, context)
+            if creation_was_cancelled:
+                raise asyncio.CancelledError
+            return WindowLaunchResult(success=False, error_message=message)
+
+        if creation_was_cancelled:
+            await _finish_failed_provisioning(
+                claim_id=claim_id,
+                target_id=created_wid,
+                user_id=user_id,
+                thread_id=pending_thread_id,
+                chat_id=chat_id,
+                context=context,
+                failure_message="creation cancelled",
+            )
+            raise asyncio.CancelledError
 
     if not success:
         await _abort_topic_creation(query, message, context)
@@ -422,103 +778,151 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
     )
     try:
         await tmux_manager.stamp_pane_title(created_wid, provider_name)
-    except BaseException:
-        # The target exists but launch wiring did not finish. Best-effort close
-        # it before propagating cancellation/errors; if close fails, retain the
-        # pending guard so the monitor cannot adopt it as an orphan.
-        if await tmux_manager.kill_window(created_wid):
-            topic_orchestration.clear_pending_creation(created_wid)
-            if pending_thread_id is not None:
-                thread_router.unbind_thread(
-                    user_id,
-                    pending_thread_id,
-                    retirement_reason="system_replacement",
-                    cleanup_eligible=True,
-                )
+    except BaseException as exc:  # noqa: BLE001
+        created_wid = _follow_supersession(created_wid, claim_id=claim_id)
+        await _finish_failed_provisioning(
+            claim_id=claim_id,
+            target_id=created_wid,
+            user_id=user_id,
+            thread_id=pending_thread_id,
+            chat_id=chat_id,
+            context=context,
+            failure_message=str(exc),
+        )
         raise
 
-    query_message = query.message
-    chat = query_message.chat if query_message else None
     provider_caps = provider_registry.get(provider_name).capabilities
     if provider_caps.chat_first_command_path:
         # Lazy: shell ↔ topics cycle via window_callbacks adoption flow.
         from ..shell.shell_prompt_orchestrator import ensure_setup
 
         try:
-            await _wait_for_shell_ready(created_wid)
-            await ensure_setup(created_wid, "auto")
-        except BaseException:
-            if await tmux_manager.kill_window(created_wid):
-                topic_orchestration.clear_pending_creation(created_wid)
-                if pending_thread_id is not None:
-                    thread_router.unbind_thread(
-                        user_id,
-                        pending_thread_id,
-                        retirement_reason="system_replacement",
-                        cleanup_eligible=True,
-                    )
+            await _wait_for_shell_ready(created_wid, adapter_for(context.bot_data))
+            await ensure_setup(
+                created_wid, "auto", adapter=adapter_for(context.bot_data)
+            )
+        except BaseException as exc:  # noqa: BLE001
+            created_wid = _follow_supersession(created_wid, claim_id=claim_id)
+            await _finish_failed_provisioning(
+                claim_id=claim_id,
+                target_id=created_wid,
+                user_id=user_id,
+                thread_id=pending_thread_id,
+                chat_id=chat_id,
+                context=context,
+                failure_message=str(exc),
+            )
             raise
 
-    if pending_thread_id is not None:
+    provider = provider_registry.get(provider_name)
+    try:
+        if approval_mode == "yolo" and provider.capabilities.has_yolo_confirmation:
+            await _accept_yolo_confirmation(created_wid, adapter_for(context.bot_data))
+
+        if provider.capabilities.supports_hook:
+            map_entry_found = await session_map_sync.wait_for_session_map_entry(
+                created_wid, resolve_window_id=window_query.resolve_window_alias
+            )
+        elif provider_caps.chat_first_command_path:
+            map_entry_found = True
+        else:
+            # Only a pane that actually left its launch shell may be bound;
+            # a timed-out wait reuses the quarantine path below instead of
+            # reporting success for a window the next poll would kill.
+            map_entry_found = await _wait_for_agent_process(
+                created_wid, adapter_for(context.bot_data)
+            )
+    except BaseException as exc:  # noqa: BLE001
+        created_wid = _follow_supersession(created_wid, claim_id=claim_id)
+        await _finish_failed_provisioning(
+            claim_id=claim_id,
+            target_id=created_wid,
+            user_id=user_id,
+            thread_id=pending_thread_id,
+            chat_id=chat_id,
+            context=context,
+            failure_message=str(exc),
+        )
+        raise
+
+    created_wid = _follow_supersession(created_wid, claim_id=claim_id)
+
+    if not map_entry_found:
+        # A hook-registration timeout does not prove that the new terminal is
+        # dead. Re-read presence before deciding whether the target may be
+        # aborted; live or unknown targets remain quarantined for recovery.
+        # Lazy: reconciliation imports the active multiplexer backend.
+        from ...multiplexer.reconciliation import window_presence
+
+        try:
+            presence = await window_presence(created_wid, tmux_manager)
+        except BaseException as exc:  # noqa: BLE001
+            _mark_provisioning_uncertain(claim_id)
+            if claim_id is not None:
+                topic_orchestration.clear_pending_creation(created_wid)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            message = (
+                "Could not verify the new session; ccgram kept it quarantined "
+                "for recovery."
+            )
+            await safe_edit(query, f"⚠ {message}")
+            return WindowLaunchResult(success=False, error_message=message)
+        if presence is False:
+            await _finish_failed_provisioning(
+                claim_id=claim_id,
+                target_id=created_wid,
+                user_id=user_id,
+                thread_id=pending_thread_id,
+                chat_id=chat_id,
+                context=context,
+                failure_message="session target is gone",
+                target_already_absent=True,
+            )
+            message = "Session did not register with ccgram and is gone"
+            await _abort_topic_creation(query, message, context)
+            return WindowLaunchResult(success=False, error_message=message)
+
+        _mark_provisioning_uncertain(claim_id)
+        if claim_id is not None:
+            topic_orchestration.clear_pending_creation(created_wid)
+        message = (
+            "Session is still starting; ccgram kept it quarantined for recovery. "
+            "Try again after it finishes registering."
+        )
+        # Keep pending thread/text state so the recovery flow can finish the
+        # exact topic once the late hook registration becomes observable.
+        await safe_edit(query, f"⚠ {message}")
+        return WindowLaunchResult(success=False, error_message=message)
+
+    if claim_id is not None and pending_thread_id is not None:
+        try:
+            committed = thread_router.commit_topic_provisioning(
+                claim_id,
+                window_name=created_wname,
+            )
+            session_manager.flush_state()
+        except BaseException:  # noqa: BLE001
+            _mark_provisioning_uncertain(claim_id)
+            topic_orchestration.clear_pending_creation(created_wid)
+            raise
+        if not committed:
+            _mark_provisioning_uncertain(claim_id)
+            topic_orchestration.clear_pending_creation(created_wid)
+            message = "Session could not be bound to this topic"
+            await _abort_topic_creation(query, message, context)
+            return WindowLaunchResult(success=False, error_message=message)
+    elif pending_thread_id is not None:
+        # A malformed callback without an observable chat cannot carry a
+        # durable exact-topic claim; retain the legacy synchronous fallback.
         thread_router.bind_thread(
             user_id,
             pending_thread_id,
             created_wid,
             window_name=created_wname,
-            chat_id=chat.id if chat else None,
+            chat_id=chat_id,
         )
-        if chat and chat.type in ("group", "supergroup"):
-            thread_router.set_group_chat_id(user_id, pending_thread_id, chat.id)
-
-    provider = provider_registry.get(provider_name)
-    try:
-        if approval_mode == "yolo" and provider.capabilities.has_yolo_confirmation:
-            await _accept_yolo_confirmation(created_wid)
-
-        map_entry_found = (
-            await session_map_sync.wait_for_session_map_entry(
-                created_wid, resolve_window_id=window_query.resolve_window_alias
-            )
-            if provider.capabilities.supports_hook
-            else True
-        )
-    except BaseException:
-        created_wid = _follow_supersession(created_wid)
-        if await tmux_manager.kill_window(created_wid):
-            topic_orchestration.clear_pending_creation(created_wid)
-            if pending_thread_id is not None:
-                thread_router.unbind_thread(
-                    user_id,
-                    pending_thread_id,
-                    retirement_reason="system_replacement",
-                    cleanup_eligible=True,
-                )
-        raise
-
-    created_wid = _follow_supersession(created_wid)
-
-    if not map_entry_found:
-        # Do not release the guard or binding unless the target is actually
-        # gone. A late hook could otherwise adopt a still-live target into
-        # an orphan topic. Herdr's neutral close only affects its guarded
-        # target pane, never a sibling session in the shared tab.
-        if await tmux_manager.kill_window(created_wid):
-            topic_orchestration.clear_pending_creation(created_wid)
-            if pending_thread_id is not None:
-                thread_router.unbind_thread(
-                    user_id,
-                    pending_thread_id,
-                    retirement_reason="system_replacement",
-                    cleanup_eligible=True,
-                )
-            message = "Session did not register with ccgram in time"
-        else:
-            message = (
-                "Session did not register with ccgram in time and cleanup "
-                "failed; the topic remains quarantined for safe recovery"
-            )
-        await _abort_topic_creation(query, message, context)
-        return WindowLaunchResult(success=False, error_message=message)
+        session_manager.flush_state()
 
     # The target either has a hook record or never needed one. This also clears
     # the no-thread path, which otherwise has no topic bind to release the guard.
@@ -583,6 +987,7 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
                 created_wid,
                 pending_text,
                 chat_id=chat.id if chat else None,
+                adapter=adapter_for(context.bot_data),
             )
         else:
             send_ok, send_msg = await send_telegram_to_window(
@@ -591,6 +996,7 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
                 pending_thread_id,
                 pending_text,
                 chat.id if chat else None,
+                adapter=adapter_for(context.bot_data),
             )
             if not send_ok:
                 logger.warning(

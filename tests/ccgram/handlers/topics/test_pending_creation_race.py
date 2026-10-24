@@ -21,6 +21,7 @@ from ccgram.handlers.topics.topic_orchestration import (  # noqa: E501
     clear_pending_creation,
     pending_creation_transaction,
     handle_new_window,
+    is_pending_creation,
     register_pending_creation,
 )
 from ccgram.handlers.topics import topic_orchestration  # type: ignore[attr-defined]
@@ -73,6 +74,16 @@ def test_pending_creation_expires_after_ttl(monkeypatch):
     assert "@42" not in _pending_user_creations
 
 
+def test_pending_creation_can_outlive_slow_launch(monkeypatch):
+    base = time.monotonic()
+    monkeypatch.setattr(topic_orchestration.time, "monotonic", lambda: base)
+    register_pending_creation("@42", ttl_s=55.0)
+    monkeypatch.setattr(topic_orchestration.time, "monotonic", lambda: base + 40.0)
+    assert _is_pending_user_creation("@42")
+    monkeypatch.setattr(topic_orchestration.time, "monotonic", lambda: base + 56.0)
+    assert not _is_pending_user_creation("@42")
+
+
 def test_clear_pending_creation_ignores_unknown_window():
     register_pending_creation("@42")
     clear_pending_creation("@nonexistent")
@@ -99,43 +110,53 @@ def test_register_pending_creation_ignores_blank_window_id():
     assert not _is_pending_user_creation("")
 
 
+def test_pending_creation_follows_durable_target_alias(monkeypatch):
+    claim = MagicMock(target_id="herdr-session-v1-terminal-fallback")
+    router = MagicMock()
+    router.has_target_provisioning.return_value = False
+    router.iter_topic_provisionings.return_value = [claim]
+    monkeypatch.setattr(topic_orchestration, "thread_router", router)
+    monkeypatch.setattr(
+        topic_orchestration.window_query,
+        "resolve_window_alias",
+        lambda wid: (
+            "herdr-session-v1-stable-session"
+            if wid == "herdr-session-v1-terminal-fallback"
+            else wid
+        ),
+    )
+
+    assert is_pending_creation("herdr-session-v1-stable-session")
+    assert _is_pending_user_creation("herdr-session-v1-stable-session")
+
+
 async def test_handle_new_window_skips_when_pending(monkeypatch):
     register_pending_creation("@42")
 
     create_topic_mock = AsyncMock()
-    rebind_mock = AsyncMock(return_value=False)
     bound_mock = MagicMock(return_value=False)
     monkeypatch.setattr(topic_orchestration, "_is_window_already_bound", bound_mock)
     monkeypatch.setattr(topic_orchestration, "create_topic_in_chat", create_topic_mock)
-    monkeypatch.setattr(
-        topic_orchestration, "_rebind_existing_topic_by_name", rebind_mock
-    )
     monkeypatch.setattr(topic_orchestration, "_auto_detect_provider", AsyncMock())
 
     client = MagicMock()
     await handle_new_window(_make_event(), client)
 
     create_topic_mock.assert_not_awaited()
-    rebind_mock.assert_not_awaited()
 
 
 async def test_handle_new_window_proceeds_when_not_pending(monkeypatch):
     create_topic_mock = AsyncMock()
-    rebind_mock = AsyncMock(return_value=False)
     monkeypatch.setattr(
         topic_orchestration, "_is_window_already_bound", lambda _wid: False
     )
     monkeypatch.setattr(topic_orchestration, "create_topic_in_chat", create_topic_mock)
-    monkeypatch.setattr(
-        topic_orchestration, "_rebind_existing_topic_by_name", rebind_mock
-    )
     monkeypatch.setattr(topic_orchestration, "_auto_detect_provider", AsyncMock())
     monkeypatch.setattr(topic_orchestration, "collect_target_chats", lambda _wid: {123})
 
     client = MagicMock()
     await handle_new_window(_make_event(), client)
 
-    rebind_mock.assert_awaited_once()
     create_topic_mock.assert_awaited_once()
 
 
@@ -144,12 +165,8 @@ async def test_handle_new_window_skips_when_already_bound_takes_priority(monkeyp
     register_pending_creation("@42")  # also pending
     bound_mock = MagicMock(return_value=True)
     create_topic_mock = AsyncMock()
-    rebind_mock = AsyncMock(return_value=False)
     monkeypatch.setattr(topic_orchestration, "_is_window_already_bound", bound_mock)
     monkeypatch.setattr(topic_orchestration, "create_topic_in_chat", create_topic_mock)
-    monkeypatch.setattr(
-        topic_orchestration, "_rebind_existing_topic_by_name", rebind_mock
-    )
     monkeypatch.setattr(topic_orchestration, "_auto_detect_provider", AsyncMock())
 
     client = MagicMock()

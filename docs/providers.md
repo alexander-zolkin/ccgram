@@ -28,7 +28,7 @@ Delivery is at-least-once. CCGram persists a transcript's delivered watermark on
 - `✅ Standard` (normal approvals)
 - `🚀 YOLO` (provider-specific permissive mode)
 
-**From the terminal**: If you create a window manually and start an agent CLI, CCGram auto-detects the provider from the running process name. When the pane command is a JS runtime wrapper (node, bun), it inspects the pane's foreground process to reliably identify the actual CLI. How the foreground process is read is owned by the multiplexer backend — tmux uses `ps -t <tty>`, herdr reads `pane process-info` (no tty needed), and agterm reports foreground argv (no tty or process-group ID) — so detection works through the same seam on all three. The shell provider uses the same seam to classify a bare shell pane, except on agterm: its foreground argv is absent at an idle shell prompt, so the Shell provider is unavailable there. As a last resort, Gemini pane-title symbols (`✦`, `✋`, `◇`) are checked.
+**From the terminal**: If you create a window manually and start an agent CLI, CCGram auto-detects the provider from the running process name. When the pane command is a JS runtime wrapper (node, bun), it inspects the pane's foreground process to reliably identify the actual CLI. Evidence is limited to the executable name and, for wrapper commands, the script path: helper data paths, inline `-e` code, and flag values never name a provider, so a helper that mentions another CLI's directory cannot override the running one. How the foreground process is read is owned by the multiplexer backend — tmux uses `ps -t <tty>`, herdr reads `pane process-info` (no tty needed), and agterm reports foreground argv (no tty or process-group ID) — so detection works through the same seam on all three. The shell provider uses the same seam to classify a bare shell pane. Agterm reports `foregroundShell` (and `splitForegroundShell` for a split peer) for a known shell, so the Terminal provider is available there. This does not prove the shell is at a prompt: a builtin such as `read` is invisible in argv, so agterm disables shell prompt-marker setup rather than risk sending setup commands while foreground state is unknown. As a last resort, Gemini pane-title symbols (`✦`, `✋`, `◇`) are checked.
 
 **Default provider**: Set `CCGRAM_PROVIDER=codex` (or `gemini`, `pi`, `antigravity`, `shell`) to change the default. Claude is the default if unset.
 
@@ -68,15 +68,13 @@ CCGRAM_GEMINI_COMMAND=gemini --yolo
 CCGRAM_ANTIGRAVITY_COMMAND=agy --dangerously-skip-permissions
 ```
 
-## Provider-Specific Commands
+## Provider Commands in Telegram
 
-Each provider exposes its own slash commands to the Telegram menu. Examples:
+Each bound topic's pinned `/commands` panel includes the commands discovered for that topic's provider. Agent command buttons preserve provider-native names. For example, a custom Claude command named `spec:work` stays `/spec:work` in the panel and is sent to Claude unchanged. It is not rewritten to a Telegram-friendly spelling.
 
-- **Claude**: `/clear`, `/compact`, `/cost`, `/doctor`, `/permissions`...
-- **Codex**: `/model`, `/mode`, `/status`, `/diff`, `/compact`, `/mcp`...
-- **Gemini**: `/chat`, `/clear`, `/compress`, `/model`, `/memory`, `/vim`...
-- **Pi**: `/new`, `/compact`, `/followup`, `/scoped_models`, `/export`, `/name`, `/reload`, `/session`, `/share`, `/changelog`... (plus discovered skills/prompts/extensions)
-- **Antigravity**: `/agents`, `/chat`, `/clear`, `/docs`, `/help`, `/mcp`, `/model`, `/plan`, `/skills`, `/theme`, `/tools`...
+The same panel includes CCGram actions that fit the attached session. Shell topics omit agent commands and transcript-only actions. Provider command discovery remains available through the existing provider adapters and custom-command sources.
+
+Telegram's native slash suggestion list cannot vary by forum topic. CCGram therefore keeps `/commands`, `/sessions`, `/sync`, and `/upgrade` in the shared `/` menu. Use the topic panel for provider commands. See [Topic Command Panels](guides.md#topic-command-panels-commands) for screenshots and behavior.
 
 ---
 
@@ -102,7 +100,7 @@ Claude task state is derived from the transcript, not from terminal footer scrap
 
 ## Codex CLI
 
-Codex CLI supports feature-flagged hooks. Install ccgram's lifecycle hooks with `ccgram hook --provider codex --install`; ccgram writes user-level `~/.codex/hooks.json` entries for `SessionStart` and `Stop` and enables `[features].codex_hooks = true` in `~/.codex/config.toml`. Transcript discovery remains as fallback and as the source of message truth.
+Codex CLI supports feature-flagged hooks. Install ccgram's lifecycle hooks with `ccgram hook --provider codex --install`; ccgram writes user-level `~/.codex/hooks.json` entries for `SessionStart` and `Stop` and enables `[features].hooks = true` in `~/.codex/config.toml`. Transcript discovery remains as fallback and as the source of message truth.
 
 ### Interactive Prompts
 

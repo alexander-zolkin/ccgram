@@ -16,6 +16,7 @@ from ccgram.handlers.callback_data import (
 from ccgram.handlers.callback_tokens import resolve_callback_data
 from ccgram.handlers.sessions_dashboard import (
     _build_dashboard,
+    handle_sessions_kill_confirm,
     handle_sessions_refresh,
     sessions_command,
 )
@@ -30,12 +31,16 @@ def deps() -> Iterator[SimpleNamespace]:
         patch("ccgram.handlers.sessions_dashboard.view_window") as view,
         patch("ccgram.handlers.sessions_dashboard.thread_router") as router,
         patch("ccgram.handlers.sessions_dashboard.tmux_manager") as mux,
+        patch(
+            "ccgram.handlers.sessions_dashboard.list_windows_for_reconciliation",
+            new_callable=AsyncMock,
+        ) as listing,
         patch("ccgram.handlers.sessions_dashboard.config") as config,
     ):
         router.get_all_thread_windows.return_value = {}
         router.get_display_name.side_effect = lambda wid: wid
         view.side_effect = lambda wid: WindowState()
-        mux.list_windows = AsyncMock(return_value=[])
+        listing.return_value = []
         config.is_user_allowed.return_value = True
 
         def _sessions(
@@ -44,19 +49,26 @@ def deps() -> Iterator[SimpleNamespace]:
             alive: list[str] | None = None,
             names: dict[str, str] | None = None,
             state: WindowState | None = None,
+            unavailable: bool = False,
         ) -> None:
             router.get_all_thread_windows.return_value = windows
             if names is not None:
                 router.get_display_name.side_effect = lambda wid: names[wid]
             if state is not None:
                 view.side_effect = lambda wid: state
+            if unavailable:
+                listing.return_value = None
+                return
             live = [] if alive is None else alive
-            mux.list_windows = AsyncMock(
-                return_value=[MagicMock(window_id=wid) for wid in live]
-            )
+            listing.return_value = [MagicMock(window_id=wid) for wid in live]
 
         yield SimpleNamespace(
-            view=view, router=router, mux=mux, config=config, sessions=_sessions
+            view=view,
+            router=router,
+            mux=mux,
+            listing=listing,
+            config=config,
+            sessions=_sessions,
         )
 
 
@@ -125,6 +137,32 @@ class TestBuildDashboard:
 
         assert "\U0001f7e2 alive" in text
         assert "⚫ dead" in text
+
+    async def test_liveness_comes_from_the_complete_listing(
+        self, deps: SimpleNamespace
+    ) -> None:
+        """Every id on this dashboard is already bound, so adoptability is
+        beside the point: a live window the backend merely will not auto-adopt
+        must still read as running."""
+        deps.sessions(windows={10: "@0"}, alive=["@0"], names={"@0": "out-of-scope"})
+        deps.mux.list_windows = AsyncMock(return_value=[])
+
+        text, _kb = await _build_dashboard(100)
+
+        assert "\U0001f7e2 out-of-scope" in text
+        assert "⚫" not in text
+
+    async def test_unreachable_multiplexer_is_not_reported_as_stopped(
+        self, deps: SimpleNamespace
+    ) -> None:
+        """A backend that could not be asked is unknown, not stopped."""
+        deps.sessions(windows={10: "@0"}, names={"@0": "proj"}, unavailable=True)
+
+        text, _kb = await _build_dashboard(100)
+
+        assert "⚪ proj" in text
+        assert "⚫" not in text
+        assert "\U0001f7e2" not in text
 
     @pytest.mark.parametrize(
         ("state", "expected_tag", "present"),
@@ -255,3 +293,60 @@ class TestSessionsRefresh:
         mock_edit.assert_called_once()
         assert mock_edit.call_args[0][0] is query
         assert "No active sessions" in mock_edit.call_args[0][1]
+
+
+class TestDashboardKillCleanup:
+    async def test_kill_flushes_and_deletes_retired_topics(
+        self, deps: SimpleNamespace
+    ) -> None:
+        deps.router.iter_thread_bindings.return_value = [(100, 42, "@0")]
+        query = AsyncMock()
+        client = MagicMock()
+        adapter = MagicMock()
+        adapter.close = AsyncMock(return_value=(True, "closed"))
+
+        with (
+            patch(
+                "ccgram.handlers.sessions_dashboard.window_presence",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "ccgram.handlers.sessions_dashboard.clear_topic_state",
+                new_callable=AsyncMock,
+            ),
+            patch("ccgram.handlers.sessions_dashboard.session_manager") as session,
+            patch(
+                "ccgram.handlers.sessions_dashboard.cleanup_retired_topics",
+                new_callable=AsyncMock,
+            ) as cleanup,
+            patch("ccgram.handlers.sessions_dashboard.safe_edit"),
+        ):
+            await handle_sessions_kill_confirm(query, 100, "@0", client, adapter)
+
+        session.flush_state.assert_called_once()
+        cleanup.assert_awaited_once_with(client, router=deps.router)
+
+
+class TestDashboardIdentityFoldsCase:
+    @pytest.mark.parametrize(
+        ("bound", "listed"),
+        [
+            pytest.param("9f1c2d3e-4a5b", "9F1C2D3E-4A5B", id="bound-lower"),
+            pytest.param("9F1C2D3E-4A5B", "9f1c2d3e-4a5b", id="bound-upper"),
+        ],
+    )
+    async def test_a_case_variant_binding_reads_as_running(
+        self, deps: SimpleNamespace, bound: str, listed: str
+    ) -> None:
+        """Raw set membership marked the session stopped and stripped its
+        Esc, Screenshot and Kill controls.
+
+        Both orderings, because the set and the lookup fold independently and
+        one of them alone leaves the other half untested.
+        """
+        deps.sessions(windows={10: bound}, alive=[listed], names={bound: "proj"})
+
+        text, _kb = await _build_dashboard(100)
+
+        assert "\U0001f7e2 proj" in text
+        assert "⚫" not in text

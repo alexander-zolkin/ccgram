@@ -106,10 +106,14 @@ def _push_reply(msg: Any, active_users: list[tuple[Any, ...]]) -> None:
         logger.exception("webui push failed")
 
 
-def publish_web_only_message(msg: Any) -> None:
-    """Route a message from a session whose topic is gone to its web id."""
+def publish_web_only_message(msg: Any) -> bool:
+    """Route a message from a session whose topic is gone to its web id.
+
+    True when a browser subscriber took it, so the caller need not warn
+    that it was dropped.
+    """
     if not bus.has_subscribers:
-        return
+        return False
     try:
         # Lazy: registry reads its JSON on first use; only needed here.
         from .registry import entries
@@ -121,5 +125,7 @@ def publish_web_only_message(msg: Any) -> None:
         ]
         if targets:
             publish_new_message(msg, targets)
+            return True
     except Exception:  # noqa: BLE001 — never break Telegram delivery
         logger.exception("webui web-only publish failed")
+    return False

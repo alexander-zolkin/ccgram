@@ -64,7 +64,7 @@ from ..callback_data import (
 )
 from ..callback_helpers import get_thread_id
 from ..callback_registry import register
-from ..messaging_pipeline.message_sender import safe_edit
+from ..messaging_pipeline.message_sender import interactive_edit as safe_edit
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
     PENDING_MODEL_CHOICES,
@@ -81,7 +81,7 @@ from ..user_state import (
     PENDING_WORKTREE_SUBDIR,
 )
 from .directory_browser import (
-    _PROVIDER_META,
+    _provider_meta,
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
@@ -124,7 +124,7 @@ from .window_launch_service import (
     launch_window,
     launch_window as _create_window_and_bind,
 )
-from .worktree import (
+from ...worktrees import (
     WorktreeError,
     check_worktree_eligibility,
     create_worktree,
@@ -835,7 +835,7 @@ def _provider_supports_model_picker(name: str) -> bool:
 
 def _provider_display_label(name: str) -> str:
     """Human label for a provider (from the picker metadata)."""
-    return _PROVIDER_META.get(name, (name.title(), ""))[0]
+    return _provider_meta(name)[0]
 
 
 def _current_model_label(context: ContextTypes.DEFAULT_TYPE) -> str:

@@ -8,7 +8,9 @@ from telegram.error import TelegramError
 
 from ...thread_router import chat_scope, thread_router
 from ...multiplexer import multiplexer as tmux_manager
+from ...multiplexer.base import canonical_window_id
 from ...multiplexer.reconciliation import list_windows_for_reconciliation
+from ...multiplexer.window_liveness import note_live_windows
 from ...utils import log_throttled
 from . import window_tick
 from .polling_runtime import PollingRuntime
@@ -17,22 +19,21 @@ if TYPE_CHECKING:
     from telegram import Bot
 
     from ...multiplexer.base import WindowRef as TmuxWindow
+    from ...session_protocol.telegram import TelegramSessionAdapter
 
 logger = structlog.get_logger()
-
-# ── Timing constants ──────────────────────────────────────────────────────
 
 _BACKOFF_MIN = 2.0
 _BACKOFF_MAX = 30.0
 
 _LoopError = (TelegramError, OSError, RuntimeError, ValueError)
-# ── Per-iteration tick helper ─────────────────────────────────────────────
 
 
 async def _tick_bound_windows(
     bot: "Bot",
     window_lookup: "dict[str, TmuxWindow]",
     *,
+    adapter: "TelegramSessionAdapter",
     runtime: PollingRuntime | None = None,
 ) -> None:
     """Tick every thread-bound window once.
@@ -50,9 +51,9 @@ async def _tick_bound_windows(
         structlog.contextvars.bind_contextvars(window_id=wid)
         try:
             with chat_scope(chat_id):
-                w = window_lookup.get(wid)
+                w = window_lookup.get(canonical_window_id(wid))
                 await window_tick.tick_window(
-                    bot, user_id, thread_id, wid, w, runtime=runtime
+                    bot, user_id, thread_id, wid, w, runtime=runtime, adapter=adapter
                 )
         except (TelegramError, OSError) as e:
             log_throttled(
@@ -65,10 +66,7 @@ async def _tick_bound_windows(
             )
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────
-
-
-async def status_poll_loop(bot: "Bot") -> None:
+async def status_poll_loop(bot: "Bot", adapter: "TelegramSessionAdapter") -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     # Lazy: imports keep PTB out of the polling package's cold path.
     from ...config import config as _cfg
@@ -80,7 +78,6 @@ async def status_poll_loop(bot: "Bot") -> None:
     # which imports polling_state. Hoisting forms a cycle through
     # polling/__init__.py whenever a module reaches polling_state
     # before polling_coordinator finishes loading.
-    # Lazy: periodic_tasks ↔ coordinator cycle
     from .periodic_tasks import run_lifecycle_tasks, run_periodic_tasks
 
     poll_interval = _cfg.status_poll_interval
@@ -95,11 +92,12 @@ async def status_poll_loop(bot: "Bot") -> None:
                 logger.warning("Status poll skipped: window listing unavailable")
                 await asyncio.sleep(poll_interval)
                 continue
-            window_lookup = {w.window_id: w for w in all_windows}
+            note_live_windows(all_windows, thread_router.all_bound_window_ids())
+            window_lookup = {canonical_window_id(w.window_id): w for w in all_windows}
 
-            await run_periodic_tasks(client, all_windows, timers)
-            await _tick_bound_windows(bot, window_lookup)
-            await run_lifecycle_tasks(client, all_windows)
+            await run_periodic_tasks(client, all_windows, timers, adapter)
+            await _tick_bound_windows(bot, window_lookup, adapter=adapter)
+            await run_lifecycle_tasks(client, all_windows, adapter)
 
         except _LoopError:
             logger.exception("Status poll loop error")

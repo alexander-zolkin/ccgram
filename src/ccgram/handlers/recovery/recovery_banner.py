@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -31,13 +32,16 @@ from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, 
 from telegram.error import TelegramError
 
 from ... import synthetic_continue, window_query
-from ...providers import get_provider, get_provider_for_window, resolve_launch_command
+from ...providers import get_provider, get_provider_for_window
 from ...session import session_manager
 from ...session_map import session_map_sync
 from ...telegram_client import PTBTelegramClient
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
+from ...multiplexer.base import canonical_window_id
 from ..telegram_origin import send_telegram_to_window
+from ...session_protocol.telegram import adapter_for
+from ...session_protocol.models import ProtocolError
 from ...window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
 from ..callback_data import (
     CB_RECOVERY_BACK,
@@ -67,6 +71,8 @@ from .resume_picker import (
 
 if TYPE_CHECKING:
     from telegram.ext import ContextTypes
+
+    from ...session_protocol.telegram import TelegramSessionAdapter
 
 logger = structlog.get_logger()
 
@@ -239,14 +245,258 @@ def build_recovery_keyboard(window_id: str) -> InlineKeyboardMarkup:
     )
 
 
-async def _create_and_bind_window(
+async def _stale_recovery_offer(old_window_id: str) -> str | None:
+    """Why this recovery offer must not be acted on, or None to proceed.
+
+    Every Fresh / Continue / Resume route converges on the replacement below,
+    and the banner offering them may have been drawn from an ambiguous lookup
+    minutes ago. The replacement unbinds before it creates, so a stale offer
+    leaves the old terminal running with its routing handed to a new window.
+
+    One confirmed read answers both questions — does it exist, and is what
+    holds it still an agent — because a presence check followed by a second
+    lookup is a second chance to fail.
+    """
+    if not old_window_id:
+        return None
+
+    # Lazy: importing the reconciliation seam at module load forms a cycle.
+    from ...multiplexer.reconciliation import window_snapshot
+
+    # Lazy: same cycle through provider/session initialization.
+    from ..telegram_origin import agent_origin_returned_to_shell
+
+    confirmed, window = await window_snapshot(old_window_id)
+    if not confirmed:
+        return (
+            "\u26a0 Could not reach the multiplexer, so nothing was changed. "
+            "Try again in a moment."
+        )
+    if window is None:
+        # Confirmed gone: recovery is exactly right.
+        return None
+    if await agent_origin_returned_to_shell(old_window_id, window):
+        # Alive, but the agent exited and left a shell — the case the text
+        # handler deliberately offers recovery for.
+        return None
+    return "That session is running again, so it was left alone."
+
+
+def _is_definitive_create_failure(message: str) -> bool:
+    """Return whether a failed create response proves no target exists."""
+    normalized = message.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "directory does not exist",
+            "not a directory",
+            "selected workspace no longer exists",
+            "requires a sessionful agent",
+            "does not create worktrees",
+        )
+    )
+
+
+async def _await_creation_result(creation):  # noqa: ANN001
+    """Wait for creation while retaining a result delivered with cancellation."""
+    task = asyncio.create_task(creation)
+    try:
+        return await asyncio.shield(task), False
+    except asyncio.CancelledError:
+        return await task, True
+
+
+def _mark_provisioning_uncertain(claim_id: str | None) -> None:
+    """Release runtime ownership while retaining durable recovery evidence."""
+    if claim_id is None:
+        return
+    try:
+        thread_router.mark_provisioning_uncertain(claim_id)
+    except KeyError:
+        logger.warning("Provisioning claim disappeared while marking uncertain")
+        return
+    try:
+        session_manager.flush_state()
+    except BaseException:  # noqa: BLE001
+        logger.warning("Could not persist uncertain provisioning claim")
+
+
+def _abort_provisioning_claim(claim_id: str | None) -> None:
+    """Release a claim whose backend operation definitely never started."""
+    if claim_id is None:
+        return
+    try:
+        thread_router.abort_topic_provisioning(
+            claim_id,
+            target_confirmed_absent=True,
+        )
+    except KeyError:
+        logger.warning("Provisioning claim disappeared while aborting")
+        return
+    try:
+        session_manager.flush_state()
+    except BaseException:  # noqa: BLE001
+        logger.warning("Could not persist aborted provisioning claim")
+
+
+def _clear_failed_target_state(window_id: str) -> None:
+    """Clear state scoped only to a failed replacement target."""
+    # Lazy: cleanup/state registries import recovery and polling modules.
+    from ...session_map import session_map_prefix
+
+    # Lazy: cleanup/state registries import recovery and polling modules.
+    from ...topic_state_registry import topic_state
+
+    # Lazy: cleanup/state registries import recovery and polling modules.
+    from ..callback_tokens import revoke_window_tokens
+
+    topic_state.clear_window(window_id)
+    topic_state.clear_qualified(f"{session_map_prefix()}{window_id}")
+    revoke_window_tokens(window_id)
+
+
+def _follow_provisioning_supersession(window_id: str, *, claim_id: str | None) -> str:
+    """Persist a backend target identity that changed during hook startup."""
+    current = window_query.resolve_window_alias(window_id)
+    if current == window_id:
+        return window_id
+    # Lazy: topic orchestration imports polling and topic handlers.
+    from ..topics import topic_orchestration
+
+    if canonical_window_id(current) == canonical_window_id(window_id):
+        return current
+    if claim_id is not None:
+        try:
+            thread_router.attach_provisioning_target(claim_id, current)
+            session_manager.flush_state()
+        except BaseException:  # noqa: BLE001
+            _mark_provisioning_uncertain(claim_id)
+            raise
+    topic_orchestration.register_pending_creation(current)
+    topic_orchestration.clear_pending_creation(window_id)
+    logger.info("Recovery target superseded: %s -> %s", window_id, current)
+    return current
+
+
+async def _cleanup_failed_topic(
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Delete an exact topic after a target-for-topic failure."""
+    # Lazy: cleanup imports the recovery state registry.
+    from ..cleanup import clear_topic_state
+
+    # Lazy: topic deletion imports cleanup and polling state.
+    from ..topics.topic_deletion import cleanup_retired_topic
+
+    retired = next(
+        (
+            topic
+            for topic in thread_router.iter_retired_topics()
+            if topic.user_id == user_id
+            and topic.chat_id == chat_id
+            and topic.thread_id == thread_id
+        ),
+        None,
+    )
+    if retired is None:
+        return
+
+    async def clear_state_before_delete() -> None:
+        await clear_topic_state(
+            user_id,
+            thread_id,
+            PTBTelegramClient(context.bot),
+            context.user_data,
+            window_id=retired.target_id,
+            chat_id=chat_id,
+            window_dead=True,
+        )
+
+    await cleanup_retired_topic(
+        PTBTelegramClient(context.bot),
+        retired,
+        router=thread_router,
+        before_delete=clear_state_before_delete,
+    )
+
+
+async def _finish_failed_provisioning(  # noqa: C901
+    *,
+    claim_id: str | None,
+    target_id: str | None,
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    failure_message: str = "",
+    preserve_topic: bool = False,
+    target_confirmed_absent: bool = False,
+) -> bool:
+    """Abort a proven-absent target or quarantine an uncertain target."""
+    if claim_id is None:
+        if target_id is None:
+            return False
+        try:
+            absent, _ = await adapter_for(context.bot_data).close(target_id)
+        except BaseException:  # noqa: BLE001
+            return False
+        if absent:
+            # Lazy: topic orchestration imports polling and topic handlers.
+            from ..topics import topic_orchestration
+
+            topic_orchestration.clear_pending_creation(target_id)
+            _clear_failed_target_state(target_id)
+        return bool(absent)
+
+    if target_id is None:
+        if not target_confirmed_absent and not _is_definitive_create_failure(
+            failure_message
+        ):
+            _mark_provisioning_uncertain(claim_id)
+            return False
+        target_confirmed_absent = True
+    elif target_confirmed_absent:
+        pass
+    else:
+        try:
+            target_confirmed_absent, _ = await adapter_for(context.bot_data).close(
+                target_id
+            )
+        except BaseException:  # noqa: BLE001
+            _mark_provisioning_uncertain(claim_id)
+            return False
+
+    # Lazy: topic orchestration imports polling and topic handlers.
+    from ..topics import topic_orchestration
+
+    if target_confirmed_absent:
+        _abort_provisioning_claim(claim_id)
+        if target_id is not None:
+            topic_orchestration.clear_pending_creation(target_id)
+            _clear_failed_target_state(target_id)
+        if not preserve_topic:
+            await _cleanup_failed_topic(user_id, thread_id, chat_id, context)
+        return True
+
+    _mark_provisioning_uncertain(claim_id)
+    topic_orchestration.clear_pending_creation(target_id or "")
+    if failure_message:
+        logger.warning("Provisioned target remains quarantined: %s", failure_message)
+    return False
+
+
+async def _create_and_bind_window(  # noqa: C901, PLR0912, PLR0915
     query: CallbackQuery,
     user_id: int,
     thread_id: int,
     cwd: str,
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    agent_args: str = "",
+    resume_id: str | None = None,
+    continue_session: bool = False,
     success_label: str = "Session started.",
     old_window_id: str = "",
     provider_name: str = "",
@@ -260,18 +510,62 @@ async def _create_and_bind_window(
 
     Returns True on success, False on failure.
     """
-    thread_router.unbind_thread(
-        user_id,
-        thread_id,
-        retirement_reason="system_replacement",
-        cleanup_eligible=True,
+    chat = query.message.chat if query.message else None
+    raw_chat_id = getattr(chat, "id", None)
+    chat_id = (
+        raw_chat_id
+        if isinstance(raw_chat_id, int)
+        else thread_router.resolve_chat_id(user_id, thread_id)
     )
-    # Lazy: polling_state → recovery_banner via callback_registry
-    # side effects.
-    # Lazy: polling.polling_state pulls heavy strategy stack; defer per-call
-    from ..polling.polling_state import lifecycle_strategy
+    claim_id: str | None = None
+    try:
+        provisioning_kwargs = {
+            "thread_id": thread_id,
+            "kind": "replacement" if old_window_id else "target_for_topic",
+        }
+        if old_window_id:
+            provisioning_kwargs["previous_target_id"] = old_window_id
+        claim = thread_router.begin_topic_provisioning(
+            user_id,
+            chat_id,
+            **provisioning_kwargs,
+        )
+    except (TypeError, ValueError) as exc:
+        await safe_edit(query, f"❌ {exc}", reply_markup=None)
+        await query.answer("Failed")
+        return False
+    claim_id = claim.claim_id
+    # Persist the exact topic claim before the first multiplexer read.
+    try:
+        session_manager.flush_state()
+    except BaseException:  # noqa: BLE001
+        _abort_provisioning_claim(claim_id)
+        raise
 
-    lifecycle_strategy.clear_dead_notification(user_id, thread_id)
+    # Every Fresh / Continue / Resume route converges here, and the banner
+    # offering them may have been drawn from an ambiguous lookup minutes ago.
+    # Keep the old binding in place until a replacement has committed.
+    try:
+        refusal = await _stale_recovery_offer(old_window_id)
+    except BaseException:  # noqa: BLE001
+        # The replacement request has not started, so release only its claim;
+        # the previous binding remains untouched for retry/recovery.
+        _abort_provisioning_claim(claim_id)
+        raise
+    if refusal is not None:
+        await _finish_failed_provisioning(
+            claim_id=claim_id,
+            target_id=None,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            context=context,
+            failure_message=refusal,
+            preserve_topic=bool(old_window_id),
+            target_confirmed_absent=True,
+        )
+        await safe_edit(query, refusal, reply_markup=None)
+        return False
 
     if old_window_id:
         old_view = window_query.view_window(old_window_id)
@@ -280,60 +574,218 @@ async def _create_and_bind_window(
             provider_name=provider_name
             or (old_view.provider_name if old_view else None),
         )
-        approval_mode = old_view.approval_mode if old_view else "normal"
+        approval_mode: Literal["normal", "yolo"] = (
+            "yolo" if old_view and old_view.approval_mode == "yolo" else "normal"
+        )
     elif provider_name:
         provider = get_provider_for_window("", provider_name=provider_name)
         approval_mode = "normal"
     else:
         provider = get_provider()
         approval_mode = "normal"
-    launch_command = resolve_launch_command(
-        provider.capabilities.name, approval_mode=approval_mode
-    )
+    creation_was_cancelled = False
+    creation_definitive_failure = False
+    try:
+        created, creation_was_cancelled = await _await_creation_result(
+            adapter_for(context.bot_data).create(
+                {"provider": provider.capabilities.name, "directory": cwd},
+                approval_mode=approval_mode,
+                resume_id=resume_id,
+                continue_session=continue_session,
+            )
+        )
+        creation = (
+            True,
+            f"Created session '{created.title}'",
+            created.title,
+            created.target_id,
+        )
+    except ProtocolError as exc:
+        if exc.status < HTTPStatus.INTERNAL_SERVER_ERROR:
+            creation_definitive_failure = True
+            creation = (False, exc.message, "", "")
+        else:
+            _mark_provisioning_uncertain(claim_id)
+            raise
+    except BaseException:  # noqa: BLE001
+        _mark_provisioning_uncertain(claim_id)
+        raise
+    success, message, created_wname, created_wid = creation
+    if success and not created_wid:
+        success = False
+        message = "Backend returned no target ID"
+    # Lazy: topic orchestration imports polling and topic handlers.
+    from ..topics import topic_orchestration
 
-    success, message, created_wname, created_wid = await tmux_manager.create_window(
-        cwd, agent_args=agent_args, launch_command=launch_command
-    )
     if not success:
+        if created_wid:
+            try:
+                thread_router.attach_provisioning_target(claim_id, created_wid)
+                session_manager.flush_state()
+                topic_orchestration.register_pending_creation(created_wid)
+            except BaseException:  # noqa: BLE001
+                _mark_provisioning_uncertain(claim_id)
+                raise
+            await _finish_failed_provisioning(
+                claim_id=claim_id,
+                target_id=created_wid,
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                context=context,
+                failure_message=message,
+                preserve_topic=bool(old_window_id),
+            )
+        elif creation_definitive_failure or _is_definitive_create_failure(message):
+            await _finish_failed_provisioning(
+                claim_id=claim_id,
+                target_id=None,
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                context=context,
+                failure_message=message,
+                preserve_topic=bool(old_window_id),
+                target_confirmed_absent=creation_definitive_failure,
+            )
+        else:
+            _mark_provisioning_uncertain(claim_id)
         await safe_edit(query, f"❌ {message}")
         _clear_recovery_state(context.user_data)
         await query.answer("Failed")
+        if creation_was_cancelled:
+            raise asyncio.CancelledError
         return False
 
-    # CCGRAM-HOTFIX:fresh-no-dup-topic — mirror the directory flow's MC-2967
-    # race-guard. The awaits below (wait_for_session_map_entry) yield the event
-    # loop; without this tag SessionMonitor's poll sees the new unbound window
-    # and auto-creates a DUPLICATE topic named after the tmux window
-    # ("workspace-3") before bind_thread() runs. Cleared right after the bind.
-    from ..topics import topic_orchestration
+    try:
+        thread_router.attach_provisioning_target(claim_id, created_wid)
+        session_manager.flush_state()
+    except BaseException:  # noqa: BLE001
+        _mark_provisioning_uncertain(claim_id)
+        raise
 
+    # CCGRAM-HOTFIX:fresh-no-dup-topic — tag the new window as pending-creation
+    # before the awaits below yield the loop, so a late SessionMonitor poll
+    # takes the already-bound branch instead of auto-creating a duplicate topic
+    # named after the tmux window. Upstream now does this natively (claim-based
+    # provisioning); released right after the commit below.
     topic_orchestration.register_pending_creation(created_wid)
-
-    if provider.capabilities.supports_hook:
-        await session_map_sync.wait_for_session_map_entry(
-            created_wid,
-            timeout=5.0,
-            resolve_window_id=window_query.resolve_window_alias,
+    if creation_was_cancelled:
+        await _finish_failed_provisioning(
+            claim_id=claim_id,
+            target_id=created_wid,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            context=context,
+            failure_message="creation cancelled",
+            preserve_topic=bool(old_window_id),
         )
-    created_wid = window_query.resolve_window_alias(created_wid)
+        raise asyncio.CancelledError
+
+    map_entry_found = True
+    if provider.capabilities.supports_hook:
+        try:
+            map_entry_found = await session_map_sync.wait_for_session_map_entry(
+                created_wid,
+                resolve_window_id=window_query.resolve_window_alias,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            created_wid = _follow_provisioning_supersession(
+                created_wid, claim_id=claim_id
+            )
+            await _finish_failed_provisioning(
+                claim_id=claim_id,
+                target_id=created_wid,
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                context=context,
+                failure_message=str(exc),
+                preserve_topic=bool(old_window_id),
+            )
+            raise
+    created_wid = _follow_provisioning_supersession(created_wid, claim_id=claim_id)
+
+    if not map_entry_found:
+        # A hook-registration timeout does not prove that the new terminal is
+        # dead. Re-read presence before deciding whether the target may be
+        # aborted; live or unknown targets remain quarantined for recovery.
+        # Lazy: reconciliation imports the active multiplexer backend.
+        from ...multiplexer.reconciliation import window_presence
+
+        try:
+            presence = await window_presence(created_wid, tmux_manager)
+        except BaseException as exc:  # noqa: BLE001
+            _mark_provisioning_uncertain(claim_id)
+            topic_orchestration.clear_pending_creation(created_wid)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            message = (
+                "Could not verify the new session; ccgram kept it quarantined "
+                "for recovery."
+            )
+            await safe_edit(query, f"⚠ {message}")
+            await query.answer("Still starting")
+            return False
+        if presence is False:
+            await _finish_failed_provisioning(
+                claim_id=claim_id,
+                target_id=created_wid,
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                context=context,
+                failure_message="session target is gone",
+                preserve_topic=bool(old_window_id),
+                target_confirmed_absent=True,
+            )
+            message = "Session did not register with ccgram and is gone"
+            await safe_edit(query, f"❌ {message}")
+            _clear_recovery_state(context.user_data)
+            await query.answer("Failed")
+            return False
+
+        _mark_provisioning_uncertain(claim_id)
+        topic_orchestration.clear_pending_creation(created_wid)
+        message = (
+            "Session is still starting; ccgram kept it quarantined for recovery. "
+            "Try again after it finishes registering."
+        )
+        await safe_edit(query, f"⚠ {message}")
+        await query.answer("Still starting")
+        return False
 
     session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
     session_manager.set_window_provider(created_wid, provider.capabilities.name)
     session_manager.set_window_approval_mode(created_wid, approval_mode)
 
-    chat = query.message.chat if query.message else None
-    thread_router.bind_thread(
-        user_id,
-        thread_id,
-        created_wid,
-        window_name=created_wname,
-        chat_id=chat.id if chat and chat.type in ("group", "supergroup") else None,
-    )
-    # CCGRAM-HOTFIX:fresh-no-dup-topic — bind is durable; release the race-guard
-    # so late SessionMonitor polls take the already-bound branch.
+    try:
+        committed = thread_router.commit_topic_provisioning(
+            claim_id,
+            window_name=created_wname,
+        )
+        session_manager.flush_state()
+    except BaseException:  # noqa: BLE001
+        _mark_provisioning_uncertain(claim_id)
+        topic_orchestration.clear_pending_creation(created_wid)
+        raise
+    if not committed:
+        _mark_provisioning_uncertain(claim_id)
+        topic_orchestration.clear_pending_creation(created_wid)
+        message = "Session could not be bound to this topic"
+        await safe_edit(query, f"❌ {message}")
+        _clear_recovery_state(context.user_data)
+        await query.answer("Failed")
+        return False
+
+    # The replacement is committed. The old binding was kept intact until
+    # this point, so every failed path above leaves it usable.
     topic_orchestration.clear_pending_creation(created_wid)
-    if chat and chat.type in ("group", "supergroup"):
-        thread_router.set_group_chat_id(user_id, thread_id, chat.id)
+    # Lazy: polling_state → recovery_banner via callback_registry side effects.
+    from ..polling.polling_state import lifecycle_strategy
+
+    lifecycle_strategy.clear_dead_notification(user_id, thread_id)
 
     client = PTBTelegramClient(context.bot)
     # CCGRAM-HOTFIX:sticky-bind-name — keep an existing topic title on recovery bind.
@@ -356,7 +808,12 @@ async def _create_and_bind_window(
     _clear_recovery_state(context.user_data)
     if pending_text:
         send_ok, send_msg = await send_telegram_to_window(
-            user_id, created_wid, thread_id, pending_text, chat.id if chat else None
+            user_id,
+            created_wid,
+            thread_id,
+            pending_text,
+            chat.id if chat else None,
+            adapter=adapter_for(context.bot_data),
         )
         if not send_ok:
             logger.warning(
@@ -475,6 +932,8 @@ async def _forward_pending_text(  # CCGRAM-HOTFIX:resume-summary-dialog
     thread_id: int,
     pending_text: str,
     chat_id: int | None,
+    *,
+    adapter: TelegramSessionAdapter,
 ) -> bool:
     """Forward the message that woke the topic, once the pane can accept it.
 
@@ -487,7 +946,7 @@ async def _forward_pending_text(  # CCGRAM-HOTFIX:resume-summary-dialog
     Returns False when the menu is still up, so the caller can fall back to the
     recovery banner rather than feed the message to a menu that will eat it.
     """
-    await dismiss_resume_dialog(window_id)
+    await dismiss_resume_dialog(window_id, adapter=adapter)
     if is_resume_dialog(await tmux_manager.capture_pane(window_id)):
         logger.error(
             "autoresume: resume-size dialog still open; NOT forwarding pending"
@@ -496,7 +955,7 @@ async def _forward_pending_text(  # CCGRAM-HOTFIX:resume-summary-dialog
         )
         return False
     send_ok, send_msg = await send_telegram_to_window(
-        user_id, window_id, thread_id, pending_text, chat_id
+        user_id, window_id, thread_id, pending_text, chat_id, adapter=adapter
     )
     if not send_ok:
         logger.warning("autoresume: forward pending text failed: %s", send_msg)
@@ -511,14 +970,21 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
     old_window_id: str,
     cwd: str,
     pending_text: str,
+    *,
+    adapter: TelegramSessionAdapter,
 ) -> bool:
     """Message-driven variant of ``_handle_continue``.
 
-    Resume the most recent session for ``cwd`` via ``--continue``, bind it to the
-    topic, rename, and forward ``pending_text`` — so a message to a hibernated
-    (dead-but-bound) topic wakes the same session with zero taps. Returns True on
-    success; False (never raises) to let the caller fall back to the banner.
+    Resume the topic's session (its own by id, else the cwd-newest via
+    ``--continue``), bind it to the topic, rename, and forward ``pending_text``
+    — so a message to a hibernated (dead-but-bound) topic wakes the same
+    session with zero taps. Creation and the rebind go through the same
+    session core and claim-based provisioning as the recovery buttons. Returns
+    True on success; False (never raises) to let the caller fall back to the
+    banner.
     """
+    claim_id: str | None = None
+    created_wid = ""
     try:
         if not cwd or not Path(cwd).is_dir():
             return False
@@ -531,7 +997,9 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
             old_window_id,
             provider_name=old_view.provider_name if old_view else None,
         )
-        approval_mode = old_view.approval_mode if old_view else "normal"
+        approval_mode: Literal["normal", "yolo"] = (
+            "yolo" if old_view and old_view.approval_mode == "yolo" else "normal"
+        )
         # Preserve the user's topic name across hibernate/wake (don't rename to cwd)
         keep_name = thread_router.get_display_name(old_window_id)
         if not keep_name or keep_name == old_window_id:
@@ -581,22 +1049,50 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
             )
             return False
 
-        launch_command = resolve_launch_command(
-            provider.capabilities.name, approval_mode=approval_mode
-        )
-
-        success, msg, created_wname, created_wid = await tmux_manager.create_window(
-            cwd, agent_args=launch_args, launch_command=launch_command
-        )
-        if not success:
-            logger.warning("autoresume: create_window failed: %s", msg)
+        if await _stale_recovery_offer(old_window_id) is not None:
             return False
+
+        chat = getattr(message, "chat", None)
+        raw_chat_id = getattr(chat, "id", None)
+        chat_id = (
+            raw_chat_id
+            if isinstance(raw_chat_id, int)
+            else thread_router.resolve_chat_id(user_id, thread_id)
+        )
+        claim = thread_router.begin_topic_provisioning(
+            user_id,
+            chat_id,
+            thread_id=thread_id,
+            kind="replacement",
+            previous_target_id=old_window_id,
+        )
+        claim_id = claim.claim_id
+        session_manager.flush_state()
+
+        try:
+            created = await adapter.create(
+                {"provider": provider.capabilities.name, "directory": cwd},
+                approval_mode=approval_mode,
+                agent_args=launch_args,
+            )
+        except ProtocolError as exc:
+            if exc.status < HTTPStatus.INTERNAL_SERVER_ERROR:
+                _abort_provisioning_claim(claim_id)
+                claim_id = None
+            logger.warning("autoresume: create failed: %s", exc.message)
+            return False
+        created_wid, created_wname = created.target_id, created.title
+        if not created_wid:
+            logger.warning("autoresume: backend returned no target id")
+            return False
+        thread_router.attach_provisioning_target(claim_id, created_wid)
+        session_manager.flush_state()
 
         # CCGRAM-HOTFIX:no-dup-topic-on-autoresume — claim the window BEFORE the
         # awaits below (rename, wait_for_session_map_entry) so the window watcher
         # cannot treat it as an orphan and auto-create a duplicate forum topic in
-        # the gap between tmux creation and bind_thread. Without this the race is
-        # real and silent: the new topic gets a HIGHER thread_id, and the
+        # the gap between creation and the bind. Without this the race is real
+        # and silent: the new topic gets a HIGHER thread_id, and the
         # 1-window=1-thread dedup (keep=max(tids)) then evicts the topic the user
         # actually typed in — their reply surfaces in the fresh junk topic.
         from ..topics import topic_orchestration
@@ -613,26 +1109,34 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
             synthetic_continue.arm(created_wid)
 
         if keep_name:
-            await tmux_manager.rename_window(created_wid, keep_name)
+            await adapter.rename(created_wid, keep_name)
         else:
             keep_name = created_wname
 
         if provider.capabilities.supports_hook:
-            await session_map_sync.wait_for_session_map_entry(created_wid)
+            await session_map_sync.wait_for_session_map_entry(
+                created_wid, resolve_window_id=window_query.resolve_window_alias
+            )
+        created_wid = _follow_provisioning_supersession(created_wid, claim_id=claim_id)
 
         session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
         session_manager.set_window_provider(created_wid, provider.capabilities.name)
         session_manager.set_window_approval_mode(created_wid, approval_mode)
 
-        thread_router.unbind_thread(user_id, thread_id)
-        thread_router.bind_thread(
-            user_id, thread_id, created_wid, window_name=keep_name
+        committed = thread_router.commit_topic_provisioning(
+            claim_id, window_name=keep_name
         )
+        session_manager.flush_state()
+        if not committed:
+            logger.warning("autoresume: could not bind window %s", created_wid)
+            return False
+        claim_id = None
         # CCGRAM-HOTFIX:no-dup-topic-on-autoresume — bind is durable, release guard
         topic_orchestration.clear_pending_creation(created_wid)
-        chat = getattr(message, "chat", None)
-        if chat is not None and chat.type in ("group", "supergroup"):
-            thread_router.set_group_chat_id(user_id, thread_id, chat.id)
+        # Lazy: polling_state → recovery_banner via callback_registry side effects.
+        from ..polling.polling_state import lifecycle_strategy
+
+        lifecycle_strategy.clear_dead_notification(user_id, thread_id)
 
         client = PTBTelegramClient(bot)
         # CCGRAM-HOTFIX:sticky-bind-name — autoresume must not clobber the topic
@@ -649,7 +1153,7 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
             logger.debug("autoresume: failed to rename topic: %s", e)
 
         if pending_text and not await _forward_pending_text(
-            user_id, created_wid, thread_id, pending_text, _chat_id
+            user_id, created_wid, thread_id, pending_text, _chat_id, adapter=adapter
         ):
             return False
         logger.info(
@@ -662,6 +1166,16 @@ async def auto_continue_from_message(  # CCGRAM-HOTFIX:autoresume
     except Exception as e:  # never break the inbound message path
         logger.warning("autoresume: failed, falling back to banner: %s", e)
         return False
+    finally:
+        if claim_id is not None:
+            # Created (or possibly created) but never committed: keep the
+            # durable claim for provisioning recovery, as the banner path does.
+            _mark_provisioning_uncertain(claim_id)
+            if created_wid:
+                # Lazy: topic orchestration imports polling and topic handlers.
+                from ..topics import topic_orchestration
+
+                topic_orchestration.clear_pending_creation(created_wid)
 
 
 def _cwd_for_window(window_id: str) -> str:
@@ -818,14 +1332,13 @@ async def _handle_continue(
         await _send_empty_state(query, old_wid, cwd)
         return
 
-    launch_args = provider.make_launch_args(use_continue=True)
     await _create_and_bind_window(
         query,
         user_id,
         thread_id,
         cwd,
         context,
-        agent_args=launch_args,
+        continue_session=True,
         success_label="Continuing previous session.",
         old_window_id=old_wid,
     )

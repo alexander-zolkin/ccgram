@@ -1,28 +1,28 @@
 """Herdr backend for the Multiplexer contract, via the herdr CLI/socket.
 
-Anti-corruption layer over `herdr <https://github.com/ogulcancelik/herdr>`_'s
-Unix-socket JSON-RPC CLI. Every herdr JSON shape (``pane_info`` / ``pane_list``
+Anti-corruption layer over `herdr <https://github.com/herdrdev/herdr>`_'s
+public Unix-socket JSON API. Every herdr JSON shape (``pane_info`` / ``pane_list``
 / ``pane_process_info`` / ``pane_layout`` / ``tab_created`` …) and every
 ``wN:pN``/``wN:tN`` id string stays **private** to this module; callers see
 only the neutral value types from ``multiplexer.base`` (design "Module map":
 herdr.py is adapter, anti-corruption).
 
 Identity mapping: Herdr ``agent.list`` is the sole identity source. A complete
-agent-session composite becomes an opaque durable target. Detected agents that
-do not publish ``agent_session`` are not reconcilable and never receive a
-persistent Telegram topic. Raw locators are used only after a fresh guard
+agent-session composite becomes an opaque durable target. Older Herdr records
+for known hook-capable agents may omit ``agent_session``; those records use the
+current terminal identity as a short-lived fallback so hooks and reconciliation
+can still agree on a live target. Raw locators are used only after a fresh guard
 authorizes one action; they are never persisted as aliases.
 
-The backend shells out to the ``herdr`` CLI (which the design explicitly allows
-as an alternative to talking the socket directly); the socket path is passed
-through ``$HERDR_SOCKET_PATH``. The command runner is injectable so unit tests
-feed JSON fixtures without a live socket and the constructor stays I/O-free
-(the proxy/registry can build the backend before bootstrap; the socket is only
-touched on the first real call).
+Ordinary operations use the public socket API, independently of the CLI's
+private protocol version. ``HERDR_SOCKET_PATH`` selects the endpoint; when
+unset, ``herdr status --json`` discovers it. The command-shaped runner remains
+injectable for tests, and construction stays I/O-free.
 
 Capabilities (design "MultiplexerCapabilities"): ``ids_stable_across_restart``
-is False (a herdr *server* restart re-mints ids — Task 8 re-resolves via
-session id), ``exposes_pane_tty`` is False (no tty in ``process-info`` on
+is False (a herdr *server* restart re-mints ids, and nothing re-resolves a
+stale target: guarded targets hash the agent-session composite, so a
+persisted one simply stops matching), ``exposes_pane_tty`` is False (no tty in ``process-info`` on
 macOS), ``native_agent_status`` and ``supports_event_stream`` are True,
 ``read_max_lines`` is 1000 (the ``pane read --source recent`` clamp).
 """
@@ -67,6 +67,8 @@ from .herdr_events import (
     open_socket_stream,
     translate_event,
 )
+from .herdr_commands import command_request
+from .herdr_socket import HerdrSocketError, request as socket_request
 from .topic_mapping import format_agent_topic_prefix
 
 __all__ = [
@@ -88,9 +90,9 @@ __all__ = [
 logger = structlog.get_logger()
 
 # Supported herdr socket protocols (``herdr status`` → ``server.protocol``).
-# 14–20 are supported. Other versions are attempted with a warning so ccgram
-# remains usable across Herdr upgrades and downgrades.
-HERDR_SUPPORTED_PROTOCOLS = frozenset(range(14, 21))
+# Version numbers are diagnostic; operation and identity schemas remain checked
+# even when a future server adds a new private protocol version.
+HERDR_SUPPORTED_PROTOCOLS = frozenset(range(14, 23))
 HERDR_PROTOCOL_VERSION = max(HERDR_SUPPORTED_PROTOCOLS)
 
 # Static capability declaration for the herdr backend (design Task 7).
@@ -106,6 +108,7 @@ _HERDR_CAPABILITIES = MultiplexerCapabilities(
     supports_display_name_rebind=False,
     supports_workspace_selection=True,
     native_topic_targets=True,
+    supports_shell_prompt_markers=True,
 )
 
 # Filter for self-hosted / internal workspaces and tabs (e.g. ``__main__``).
@@ -137,8 +140,21 @@ _CALL_TIMEOUT_SECONDS = 8.0
 
 # New Pi sessions have been observed to publish their agent_session in ~2.7s.
 # Keep creation discovery bounded, while allowing slow hook/integration startup.
-_CREATED_SESSION_DISCOVERY_TIMEOUT_SECONDS = 5.0
-_CREATED_SESSION_POLL_INTERVAL_SECONDS = 0.1
+# A freshly launched agent must publish its session within this budget
+# for topic creation to commit. Boot under load has been measured past 5s
+# (2026-09-29 incident), and creation waits for the stable session-backed
+# identity, not the terminal fallback, so the budget has to cover real
+# boot time. The poll interval stays a coarse 0.5s: each poll is a full
+# agent.list subprocess, and a 20s window at 0.1s would spawn it ~200
+# times per slow launch.
+_CREATED_SESSION_DISCOVERY_TIMEOUT_SECONDS = 20.0
+_CREATED_SESSION_POLL_INTERVAL_SECONDS = 0.5
+
+# The terminal-derived identity published for a recognized agent whose
+# session has not been reported yet. It rotates to the session identity
+# the moment the agent publishes, so it must never become a topic target
+# or an adoption candidate.
+_TERMINAL_FALLBACK_KIND = "terminal"
 
 # Agent TUIs (Claude Code, Codex, Pi) read a submit key that arrives in the
 # same input batch as the prompt text as a literal newline, so the prompt is
@@ -296,13 +312,27 @@ def _parse_live_record(record: Mapping[str, object]) -> HerdrLiveRecord | None:
         key: _session_field(record.get(key))
         for key in ("terminal_id", "pane_id", "tab_id", "workspace_id")
     }
-    if composite is None:
-        # A terminal locator is transient and cannot identify a session across
-        # a Herdr restart. Wait for the agent to publish its real session.
-        return None
     if any(value is None for value in locators.values()):
         raise HerdrMalformedRecordError(
             "agent.list contains an incomplete live locator"
+        )
+    if composite is None:
+        if "agent" not in record:
+            return None
+        agent = record["agent"]
+        if not isinstance(agent, str) or not agent:
+            raise HerdrMalformedRecordError(
+                "agent.list contains a malformed sessionless agent"
+            )
+        terminal_id = locators["terminal_id"]
+        if agent not in {"claude", "codex", "gemini"} or terminal_id is None:
+            return None
+        # Providers that may remain sessionless still expose a unique terminal
+        # identity. Pi is excluded: Herdr publishes its durable session shortly
+        # after startup, and creating a terminal topic in that gap would create
+        # a second topic when the durable identity arrives.
+        composite = HerdrSessionComposite(
+            "herdr", agent, _TERMINAL_FALLBACK_KIND, terminal_id
         )
     target_id = herdr_session_target_id(composite)
     # ``cwd`` is the agent's own working directory; ``foreground_cwd`` follows
@@ -323,6 +353,13 @@ def _parse_live_record(record: Mapping[str, object]) -> HerdrLiveRecord | None:
 def _parse_agent_records(
     agents: Sequence[object],
 ) -> tuple[list[HerdrLiveRecord], int]:
+    """Parse the records, counting the ones that leave a gap in the account.
+
+    The count is malformed records only. A record that parses to None is not a
+    gap: a recognised agent without a composite already takes a terminal-derived
+    identity, so what remains is an agent ccgram cannot address at all and never
+    holds a binding to.
+    """
     records: list[HerdrLiveRecord] = []
     malformed = 0
     for agent in agents:
@@ -386,7 +423,7 @@ class HerdrManager:
 
         Args:
             socket_path: herdr socket; defaults to ``$HERDR_SOCKET_PATH``.
-            binary: the ``herdr`` executable name/path.
+            binary: CLI used only to discover the socket when none is configured.
             runner: async ``(args) -> (rc, stdout, stderr)`` override for tests.
             stream_opener: event-stream opener override for tests; defaults to
                 the live unix-socket reader (``open_socket_stream``).
@@ -397,19 +434,71 @@ class HerdrManager:
         # subprocess.Popen._execute_child). Bare names force fork_exec, which
         # triggers macOS ``MallocStackLogging`` spam from long-lived parents.
         self._binary = shutil.which(binary) or binary
-        self._run: HerdrRunner = runner or self._subprocess_run
+        self._run: HerdrRunner = runner or self._socket_run
         self._open_stream: HerdrStreamOpener = stream_opener or self._default_stream
 
-    def _default_stream(
+    async def _default_stream(
         self, subscriptions: Sequence[Mapping[str, object]]
     ) -> AsyncGenerator[dict, None]:
-        """Open the live herdr socket and subscribe (default stream opener)."""
-        return open_socket_stream(self._socket_path, subscriptions)
+        """Subscribe on the same resolved socket used by ordinary requests."""
+        socket_path = await self._resolve_socket_path()
+        async for event in open_socket_stream(socket_path, subscriptions):
+            yield event
 
-    # ── CLI plumbing (private) ─────────────────────────────────────────
+    async def _resolve_socket_path(self) -> str:
+        if self._socket_path:
+            return self._socket_path
+        rc, out, _err = await self._subprocess_run(["status", "--json"])
+        if rc == 0:
+            try:
+                status = json.loads(out)
+            except ValueError:
+                status = None
+            server = status.get("server") if isinstance(status, dict) else None
+            path = server.get("socket") if isinstance(server, dict) else None
+            if isinstance(path, str) and path:
+                self._socket_path = path
+                return path
+        raise HerdrError(
+            "Cannot discover the Herdr socket; set HERDR_SOCKET_PATH to the running server"
+        )
+
+    async def _socket_run(self, args: Sequence[str]) -> tuple[int, str, str]:
+        """Adapt internal command arguments without executing the CLI."""
+        try:
+            method, params = command_request(args)
+            path = await self._resolve_socket_path()
+            payload = await socket_request(
+                path, method, params, timeout=_CALL_TIMEOUT_SECONDS
+            )
+            result = payload["result"]
+            if args[0] == "status":
+                if result.get("type") != "pong":
+                    raise HerdrSocketError("herdr ping returned no pong")
+                status = {
+                    "server": {
+                        "running": True,
+                        "version": result.get("version"),
+                        "protocol": result.get("protocol"),
+                        "capabilities": result.get("capabilities", {}),
+                        "socket": path,
+                    }
+                }
+                return 0, json.dumps(status), ""
+            if tuple(args[:2]) == ("pane", "read"):
+                read = result.get("read")
+                text = read.get("text") if isinstance(read, dict) else None
+                if not isinstance(text, str):
+                    raise HerdrSocketError("herdr pane.read returned no text")
+                return 0, text, ""
+            return 0, json.dumps(payload), ""
+        except (HerdrSocketError, HerdrError, ValueError) as exc:
+            return 1, "", str(exc)
+
+    # ── Command runner compatibility seam (private) ────────────────────
 
     async def _subprocess_run(self, args: Sequence[str]) -> tuple[int, str, str]:
-        """Default runner: exec ``herdr <args>`` with the socket env, time-boxed."""
+        """Run the CLI for socket discovery only, with a bounded wait."""
         env = dict(os.environ)
         if self._socket_path:
             env["HERDR_SOCKET_PATH"] = self._socket_path
@@ -505,9 +594,9 @@ class HerdrManager:
         """Verify Herdr is reachable; warn but do not gate on compatibility.
 
         ``HERDR_SUPPORTED_PROTOCOLS`` are accepted without a warning. Other
-        protocol versions and a false CLI compatibility flag are best-effort:
-        ccgram logs a warning and continues so CLI-backed operations can try
-        the current command surface after a Herdr change. Individual commands
+        protocol versions and an injected runner's false compatibility flag are
+        best-effort: the public API is independent of the CLI's private wire
+        protocol. Individual commands
         still report their own transport or schema failures.
 
         Raises:
@@ -542,11 +631,39 @@ class HerdrManager:
             )
 
     async def _agent_list_snapshot(self) -> list[HerdrLiveRecord]:
-        """Read and parse one fresh ``agent.list`` snapshot.
+        """The safe records from one fresh ``agent.list`` snapshot.
 
-        Agents without a complete session composite are ignored because no
-        stable topic identity exists. No focus, title, name, directory, screen,
-        or layout field participates in this snapshot.
+        Known hook-capable agents without a complete session composite use a
+        terminal fallback identity. Shells and malformed records remain
+        ignored. No focus, title, name, directory, screen, or layout field
+        participates in this snapshot.
+
+        Quarantined records are dropped silently, so this subset is safe to
+        address and safe to show, but it is not a complete account of what is
+        live. Anything answering "does this window still exist" must take
+        ``_agent_list_snapshot_checked`` instead.
+        """
+        records, _complete = await self._agent_list_snapshot_checked()
+        return records
+
+    async def _agent_list_snapshot_checked(
+        self,
+    ) -> tuple[list[HerdrLiveRecord], bool]:
+        """The safe records, plus whether they account for every live agent.
+
+        ``False`` when malformed or ambiguous records were quarantined: those
+        panes are live, ccgram may hold bindings to them, and they are absent
+        from the subset returned here. Reporting that subset as complete makes
+        such a binding look like a ghost, which the audit, the polling loop and
+        the destructive guards all act on.
+
+        Completeness means every *addressable* guarded target. A record that
+        merely names a tool is not one: a recognised agent without a composite
+        already gets a terminal-derived identity, and what is left parses to
+        None because ccgram does not recognise the agent at all. Antigravity is
+        the live example, supported here and documented to stay sessionless
+        until its first prompt, so counting it would make reconciliation
+        unknown for every topic while one sits idle.
         """
         result = await self._call_json(["agent", "list"])
         if result is None:
@@ -569,20 +686,41 @@ class HerdrManager:
                 duplicate_target_count=duplicate_targets,
                 duplicate_pane_count=duplicate_panes,
             )
-        return safe
+        complete = not (malformed or duplicate_targets or duplicate_panes)
+        return safe, complete
 
     def target_id_for_live_record(self, record: Mapping[str, object]) -> str | None:
-        """Return a guarded opaque target for one ``agent.list`` record.
-
-        Hook-side discovery uses this parser after it has established a unique
-        live locator match. Malformed, non-agent, or incomplete records do not
-        yield an identity.
-        """
+        """Return an opaque target for one structurally valid live record."""
         try:
             live = _parse_live_record(record)
         except HerdrMalformedRecordError:
             return None
         return live.target_id if live is not None else None
+
+    def target_id_for_live_snapshot(
+        self,
+        record: Mapping[str, object],
+        snapshot: Sequence[object],
+    ) -> str | None:
+        """Return a target only when the full snapshot is unambiguous."""
+        try:
+            selected = _parse_live_record(record)
+        except HerdrMalformedRecordError:
+            return None
+        if selected is None:
+            return None
+        records, malformed = _parse_agent_records(snapshot)
+        safe, duplicate_targets, duplicate_panes = _quarantine_ambiguous_records(
+            records
+        )
+        if malformed or duplicate_targets or duplicate_panes:
+            logger.warning(
+                "quarantining unsafe Herdr hook snapshot",
+                malformed_record_count=malformed,
+                duplicate_target_count=duplicate_targets,
+                duplicate_pane_count=duplicate_panes,
+            )
+        return selected.target_id if selected in safe else None
 
     async def guard_session_target(self, target_id: str) -> HerdrLiveRecord:
         """Resolve one exact target against one fresh live session record."""
@@ -603,13 +741,26 @@ class HerdrManager:
         return matches[0]
 
     @staticmethod
-    def _live_ref(record: HerdrLiveRecord, label: str) -> WindowRef:
-        """Project a live record without exposing reusable locator aliases."""
+    def _live_ref(
+        record: HerdrLiveRecord, label: str, *, adoptable: bool = True
+    ) -> WindowRef:
+        """Project a live record without exposing reusable locator aliases.
+
+        ``topic_eligible`` is stamped here because this parser is already the
+        place that decides what counts: it emits a record only for a live agent
+        carrying a guarded target, and a bare shell pane never reaches it. The
+        verdict travels on the window so discovery needs no herdr-shaped check
+        of its own.
+        """
         return WindowRef(
             window_id=record.target_id,
             window_name=label,
             cwd=record.cwd,
             pane_current_command=record.composite.agent,
+            topic_eligible=adoptable
+            and record.composite.kind != _TERMINAL_FALLBACK_KIND
+            and is_herdr_session_target(record.target_id)
+            and bool(record.composite.agent.strip()),
         )
 
     async def _reconciliation_labels(
@@ -667,36 +818,83 @@ class HerdrManager:
             label = labels.get((record.workspace_id, record.tab_id))
             if label is None:
                 if include_unlabeled:
+                    # Kept for liveness and addressing, never for adoption:
+                    # without labels this cannot tell an internal ``__*__``
+                    # workspace or tab from an ordinary one, and adopting
+                    # ccgram's own pane is the failure that guard exists for.
                     refs.append(
                         self._live_ref(
                             record,
-                            f"Herdr ▸ {record.target_id[-12:]}",
+                            format_agent_topic_prefix(
+                                "Herdr",
+                                record.target_id[-12:],
+                                provider=record.composite.agent,
+                            ),
+                            adoptable=False,
                         )
                     )
                 continue
             workspace_label, tab_label = label
-            if not include_internal and (
+            internal = bool(
                 _INTERNAL_LABEL_RE.match(workspace_label)
                 or _INTERNAL_LABEL_RE.match(tab_label)
-            ):
+            )
+            if internal and not include_internal:
                 continue
             pane = record.pane_id.rsplit(":", 1)[-1]
             refs.append(
                 self._live_ref(
                     record,
-                    format_agent_topic_prefix(workspace_label, tab_label, pane),
+                    format_agent_topic_prefix(
+                        workspace_label,
+                        tab_label,
+                        pane,
+                        provider=record.composite.agent,
+                    ),
+                    adoptable=not internal,
                 )
             )
         return refs
 
     async def list_windows(self) -> list[WindowRef]:
-        """Return a best-effort UI listing; reconciliation uses the tri-state API."""
-        return await self.list_windows_for_reconciliation() or []
+        """Return a best-effort UI listing, hiding ccgram's own internal panes.
+
+        Built from the safe subset directly, not from the reconciliation
+        listing: quarantined records make that listing report unknown, and a
+        picker that empties itself because one unrelated record was malformed
+        would be worse than one showing everything it can address. Showing what
+        is addressable is exactly this listing's job.
+        """
+        try:
+            refs = await self._project_live_refs(await self._agent_list_snapshot())
+        except HerdrError:
+            # Best-effort, as before: a failed agent, workspace or tab listing
+            # empties the picker instead of raising through it. Only the
+            # reconciliation listing distinguishes this from "nothing there".
+            return []
+        return [w for w in refs if w.topic_eligible]
 
     async def list_windows_for_reconciliation(self) -> list[WindowRef] | None:
+        """Every live record, including internal ones, marked unadoptable.
+
+        Internal ``__*__`` workspaces and tabs are ccgram's own and must never
+        be adopted, but they have to stay in the listing: a bound session
+        renamed into one would otherwise vanish from liveness, be audited as a
+        ghost binding and have its topic closed. Existence and adoptability are
+        different questions, so this answers the first and stamps the second.
+        """
         try:
+            records, complete = await self._agent_list_snapshot_checked()
+            if not complete:
+                # Quarantined records are live panes missing from this subset,
+                # so it cannot answer what exists. Saying so beats handing back
+                # a listing whose gaps read as dead bindings.
+                logger.warning(
+                    "herdr agent.list incomplete; reporting liveness unknown"
+                )
+                return None
             return await self._project_live_refs(
-                await self._agent_list_snapshot(), include_unlabeled=True
+                records, include_internal=True, include_unlabeled=True
             )
         except HerdrError:
             return None
@@ -898,12 +1096,13 @@ class HerdrManager:
         enter: bool = True,
         literal: bool = True,
         window_id: str | None = None,
+        raw: bool = True,
     ) -> bool:
         """Reject raw Herdr pane IDs; only a session target may authorize I/O."""
         if window_id is None or pane_id != window_id:
             logger.warning("Rejected raw Herdr pane operation")
             return False
-        return await self.send(window_id, text, enter=enter, literal=literal)
+        return await self.send(window_id, text, enter=enter, literal=literal, raw=raw)
 
     async def _send_to(
         self, pane_id: str, text: str, *, enter: bool, literal: bool
@@ -1150,28 +1349,109 @@ class HerdrManager:
         tab_id: str,
         pane_id: str,
         workspace_id: str | None,
+        terminal_id: str | None = None,
     ) -> HerdrLiveRecord:
-        """Wait for exactly one session reported for a newly-created pane."""
+        """Wait for the pane's stable, session-backed identity.
+
+        Only a complete session composite counts. A terminal-fallback
+        record (the pane's agent has started but not yet published its
+        session) is deliberately skipped: its derived target rotates the
+        moment the real session appears, and a target minted from it
+        goes stale during hook registration, which reads as "session
+        did not register and is gone" while the pane boots on.
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _CREATED_SESSION_DISCOVERY_TIMEOUT_SECONDS
+        # The first poll pins the pane by the locators the creation
+        # transaction owns; every later poll follows the TERMINAL identity
+        # instead. Pane and tab ids are renumbered on structural changes
+        # (compaction), so a slow boot whose pane moved mid-wait would
+        # never re-match on locators and the transaction would roll back
+        # a healthy pane. The terminal id survives renumbering.
+        pinned_seen = False
         while True:
-            matches = [
-                record
-                for record in await self._agent_list_snapshot()
-                if record.tab_id == tab_id
-                and record.pane_id == pane_id
-                and (workspace_id is None or record.workspace_id == workspace_id)
-            ]
-            if len(matches) == 1:
-                return matches[0]
+            records = await self._agent_list_snapshot()
+            terminal_id, pinned_seen = self._advance_created_session_pin(
+                records,
+                tab_id=tab_id,
+                pane_id=pane_id,
+                workspace_id=workspace_id,
+                terminal_id=terminal_id,
+                pinned_seen=pinned_seen,
+            )
+            matches = self._session_backed_matches(records, terminal_id)
             if len(matches) > 1:
                 raise HerdrAmbiguousTargetError(
                     "new Herdr pane reported duplicate sessions"
                 )
+            if len(matches) == 1:
+                first = matches[0]
+                # Guard the pre-pinned identity: before any poll has
+                # confirmed the created pane at this terminal (a sibling
+                # agent cannot share a terminal id with it, but a stale or
+                # misattributed record could sit there), the match must
+                # also carry one of the creation locators. Once the first
+                # poll confirms the pane, renumbering may change both
+                # locators, so later polls trust the terminal id alone.
+                if pinned_seen or first.tab_id == tab_id or first.pane_id == pane_id:
+                    return first
             if loop.time() >= deadline:
                 break
             await asyncio.sleep(_CREATED_SESSION_POLL_INTERVAL_SECONDS)
         raise HerdrUnresolvedTargetError("new Herdr pane did not report a session")
+
+    @staticmethod
+    def _advance_created_session_pin(
+        records: Sequence[HerdrLiveRecord],
+        *,
+        tab_id: str,
+        pane_id: str,
+        workspace_id: str | None,
+        terminal_id: str | None,
+        pinned_seen: bool,
+    ) -> tuple[str | None, bool]:
+        """Advance the created-pane pin one poll; returns (terminal, pinned).
+
+        A pre-pinned terminal is confirmed by any record (a terminal
+        fallback counts) at the creation locators. Without one, the first
+        unique record at the creation locators supplies the terminal id.
+        """
+        if terminal_id is not None:
+            if pinned_seen:
+                return terminal_id, True
+            return terminal_id, any(
+                record.terminal_id == terminal_id
+                and (record.tab_id == tab_id or record.pane_id == pane_id)
+                for record in records
+            )
+        pinned = [
+            record
+            for record in records
+            if record.tab_id == tab_id
+            and record.pane_id == pane_id
+            and (workspace_id is None or record.workspace_id == workspace_id)
+        ]
+        if len(pinned) > 1:
+            raise HerdrAmbiguousTargetError(
+                "new Herdr pane reported duplicate sessions"
+            )
+        if len(pinned) == 1:
+            return pinned[0].terminal_id, True
+        return None, False
+
+    @staticmethod
+    def _session_backed_matches(
+        records: Sequence[HerdrLiveRecord], terminal_id: str | None
+    ) -> list[HerdrLiveRecord]:
+        """Session-published records at one terminal, fallbacks excluded."""
+        if terminal_id is None:
+            return []
+        return [
+            record
+            for record in records
+            if record.terminal_id == terminal_id
+            and record.composite.kind != _TERMINAL_FALLBACK_KIND
+        ]
 
     async def create_topic_target(  # noqa: C901
         self,
@@ -1231,6 +1511,9 @@ class HerdrManager:
             root = (result or {}).get("root_pane") or {}
             tab_id = tab.get("tab_id") if isinstance(tab, Mapping) else None
             pane_id = root.get("pane_id") if isinstance(root, Mapping) else None
+            created_terminal_id = (
+                root.get("terminal_id") if isinstance(root, Mapping) else None
+            )
             label = tab.get("label") if isinstance(tab, Mapping) else None
             if not isinstance(tab_id, str) or not tab_id:
                 raise HerdrError("herdr tab creation returned no tab id")
@@ -1248,6 +1531,9 @@ class HerdrManager:
                 tab_id=tab_id,
                 pane_id=pane_id,
                 workspace_id=workspace_id,
+                terminal_id=created_terminal_id
+                if isinstance(created_terminal_id, str)
+                else None,
             )
             refs = await self._project_live_refs([record])
             if len(refs) != 1:
@@ -1316,6 +1602,7 @@ class HerdrManager:
         if not tab_id:
             tab_id = workspace.get("active_tab_id", "")
         pane_id = root_pane.get("pane_id")
+        created_terminal_id = root_pane.get("terminal_id")
         if not isinstance(tab_id, str) or not tab_id:
             return False, "herdr worktree created without a tab id", "", ""
         if not isinstance(pane_id, str) or not pane_id:
@@ -1342,6 +1629,9 @@ class HerdrManager:
                 tab_id=tab_id,
                 pane_id=pane_id,
                 workspace_id=workspace_id,
+                terminal_id=created_terminal_id
+                if isinstance(created_terminal_id, str)
+                else None,
             )
         except BaseException as exc:
             await self._call_ok(["tab", "close", tab_id])
@@ -1477,7 +1767,7 @@ class HerdrManager:
                         if pending_event is not None:
                             pending_event.cancel()
                             await asyncio.gather(pending_event, return_exceptions=True)
-            except OSError as exc:
+            except (OSError, HerdrError) as exc:
                 logger.debug("herdr event stream error: %s", exc)
             if refresh_subscriptions:
                 # A mapping change is a healthy re-subscription, not a transport

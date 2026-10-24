@@ -1244,11 +1244,18 @@ _hub_task: asyncio.Task[None] | None = None
 _devices_task: asyncio.Task[None] | None = None
 
 
-async def start_webui(bot: Bot | Any) -> None:
-    """Start the web UI when port + password are configured. Never raises."""
+async def start_webui(bot: Bot | Any, bot_data: Any = None) -> None:
+    """Start the web UI when port + password are configured. Never raises.
+
+    ``bot_data`` is the PTB application's, which carries the shared session
+    service: web sends, wakes and launches go through the same session core
+    as Telegram.
+    """
     global _runner
     # Lazy: config singleton reads env at import; keep module import cheap.
     from ..config import config
+
+    service.bind_bot_data(bot_data)
 
     if _runner is not None or not config.webui_port:
         return

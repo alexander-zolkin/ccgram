@@ -10,12 +10,13 @@ from ccgram.handlers.text.text_handler import (
     _bash_capture_tasks,
     _capture_bash_output,
     _check_ui_guards,
-    _forward_message,
+    _forward_message as _forward_message_core,
     _handle_dead_window,
     _handle_unbound_topic,
     handle_text_message,
 )
 from ccgram.handlers.polling.polling_state import lifecycle_strategy
+from ccgram.multiplexer.base import WindowRef
 from ccgram.handlers.topics.directory_browser import (
     STATE_BROWSING_DIRECTORY,
     STATE_CONFIRMING_DEFAULTS,
@@ -29,6 +30,26 @@ from ccgram.handlers.user_state import (
 )
 
 _TH = "ccgram.handlers.text.text_handler"
+_TEST_ADAPTER = MagicMock()
+_TEST_ADAPTER.send_text = AsyncMock(return_value=(True, "Sent"))
+_TEST_ADAPTER.send_keys = AsyncMock(return_value=(True, "Sent"))
+
+
+async def _forward_message(*args, **kwargs):
+    kwargs.setdefault("adapter", _TEST_ADAPTER)
+    return await _forward_message_core(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _use_session_adapter(monkeypatch):
+    _TEST_ADAPTER.send_text.reset_mock(return_value=True, side_effect=True)
+    _TEST_ADAPTER.send_keys.reset_mock(return_value=True, side_effect=True)
+    _TEST_ADAPTER.send_text.return_value = (True, "Sent")
+    _TEST_ADAPTER.send_keys.return_value = (True, "Sent")
+    monkeypatch.setattr(
+        "ccgram.session_protocol.telegram.adapter_for", lambda _: _TEST_ADAPTER
+    )
+    monkeypatch.setattr(f"{_TH}.protocol_adapter_for", lambda _: _TEST_ADAPTER)
 
 
 @pytest.fixture(autouse=True)
@@ -162,28 +183,27 @@ class TestHandleUnboundTopic:
 class TestHandleDeadWindow:
     @patch(f"{_TH}.tmux_manager")
     async def test_alive_window_returns_false(self, mock_tm: MagicMock) -> None:
-        mock_tm.find_window_by_id = AsyncMock(return_value=MagicMock())
+        mock_tm.list_windows_for_reconciliation = AsyncMock(
+            return_value=[WindowRef(window_id="@0", window_name="p", cwd="/p")]
+        )
         message = AsyncMock()
 
-        result = await _handle_dead_window("@0", 100, 42, "hello", {}, message)
+        result = await _handle_dead_window(
+            "@0", 100, 42, "hello", {}, message, adapter=_TEST_ADAPTER
+        )
 
         assert result is False
-
-    @patch(f"{_TH}.tmux_manager")
-    async def test_alive_window_clears_stale_autoclose_timer(
-        self, mock_tm: MagicMock
-    ) -> None:
-        lifecycle_strategy.start_autoclose_timer(100, 42, "dead", 100.0)
-        mock_tm.find_window_by_id = AsyncMock(return_value=MagicMock())
-        message = AsyncMock()
-
-        result = await _handle_dead_window("@0", 100, 42, "hello", {}, message)
-
-        assert result is False
-        assert lifecycle_strategy.get_state(100, 42).autoclose is None
 
     async def test_live_shell_after_agent_exit_shows_recovery(self) -> None:
-        window = MagicMock(pane_current_command="bash")
+        # A real ref, not a MagicMock: WindowRef.matches compares ids, and a
+        # mock would fail to match and route this through the window-is-gone
+        # branch, passing the assertions below without exercising the case.
+        window = WindowRef(
+            window_id="@0",
+            window_name="project",
+            cwd="/tmp/project",
+            pane_current_command="bash",
+        )
         view = MagicMock(cwd="/tmp/project", provider_name="claude")
         message = AsyncMock()
         message.chat.id = -100
@@ -200,13 +220,15 @@ class TestHandleDeadWindow:
             patch(f"{_TH}.safe_reply", new_callable=AsyncMock) as mock_reply,
             patch(f"{_TH}.Path") as mock_path,
         ):
-            mock_tm.find_window_by_id = AsyncMock(return_value=window)
+            mock_tm.list_windows_for_reconciliation = AsyncMock(return_value=[window])
             mock_query.get_window_provider.return_value = "claude"
             mock_query.view_window.return_value = view
             mock_router.get_display_name.return_value = "project"
             mock_path.return_value.is_dir.return_value = True
 
-            result = await _handle_dead_window("@0", 100, 42, "hello", {}, message)
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hello", {}, message, adapter=_TEST_ADAPTER
+            )
 
         assert result is True
         mock_reply.assert_awaited_once()
@@ -224,7 +246,7 @@ class TestHandleDeadWindow:
         mock_render: MagicMock,
         mock_reply: AsyncMock,
     ) -> None:
-        mock_tm.find_window_by_id = AsyncMock(return_value=None)
+        mock_tm.list_windows_for_reconciliation = AsyncMock(return_value=[])
         mock_tr.get_display_name.return_value = "project"
         ws = MagicMock()
         ws.cwd = "/tmp/project"
@@ -240,7 +262,7 @@ class TestHandleDeadWindow:
         with patch(f"{_TH}.Path") as mock_path:
             mock_path.return_value.is_dir.return_value = True
             result = await _handle_dead_window(
-                "@0", 100, 42, "hello", user_data, message
+                "@0", 100, 42, "hello", user_data, message, adapter=_TEST_ADAPTER
             )
 
         assert result is True
@@ -263,7 +285,7 @@ class TestHandleDeadWindow:
         mock_tm: MagicMock,
         mock_reply: AsyncMock,
     ) -> None:
-        mock_tm.find_window_by_id = AsyncMock(return_value=None)
+        mock_tm.list_windows_for_reconciliation = AsyncMock(return_value=[])
         mock_tr.get_display_name.return_value = "project"
         ws = MagicMock()
         ws.cwd = "/tmp/project"
@@ -280,7 +302,9 @@ class TestHandleDeadWindow:
             caps.supports_resume = True
             with patch(f"{_TH}.Path") as mock_path:
                 mock_path.return_value.is_dir.return_value = True
-                await _handle_dead_window("@0", 100, 42, "hello", user_data, message)
+                await _handle_dead_window(
+                    "@0", 100, 42, "hello", user_data, message, adapter=_TEST_ADAPTER
+                )
 
         body = mock_reply.call_args.args[1]
         assert "Start fresh" in body
@@ -302,7 +326,7 @@ class TestHandleDeadWindow:
         _mock_reply: AsyncMock,
         cwd: str,
     ) -> None:
-        mock_tm.find_window_by_id = AsyncMock(return_value=None)
+        mock_tm.list_windows_for_reconciliation = AsyncMock(return_value=[])
         mock_tr.get_display_name.return_value = "project"
         ws = MagicMock()
         ws.cwd = cwd
@@ -318,7 +342,7 @@ class TestHandleDeadWindow:
             str_mock = MagicMock(return_value="/cwd")
             mock_path.cwd.return_value.__str__ = str_mock
             result = await _handle_dead_window(
-                "@0", 100, 42, "hello", user_data, message
+                "@0", 100, 42, "hello", user_data, message, adapter=_TEST_ADAPTER
             )
 
         assert result is True
@@ -419,7 +443,15 @@ class TestForwardMessage:
         with patch(f"{_TH}.get_interactive_window", return_value=None):
             await _forward_message("@0", 100, 42, "hello", bot, message)
 
-        mock_send.assert_called_once_with(100, "@0", 42, "hello", ANY)
+        mock_send.assert_awaited_once_with(
+            100,
+            "@0",
+            42,
+            "hello",
+            ANY,
+            adapter=_TEST_ADAPTER,
+            action_id=ANY,
+        )
 
     @patch(f"{_TH}.safe_reply", new_callable=AsyncMock)
     @patch(
@@ -488,7 +520,6 @@ class TestForwardMessage:
         dummy_task.cancel.assert_called_once()
         assert (100, 42) not in _bash_capture_tasks
 
-    @patch(f"{_TH}.handle_interactive_ui", new_callable=AsyncMock)
     @patch(f"{_TH}.get_interactive_window", return_value="@0")
     @patch(
         f"{_TH}.send_telegram_to_window",
@@ -496,21 +527,255 @@ class TestForwardMessage:
         return_value=(True, "ok"),
     )
     @patch(f"{_TH}.window_query")
-    async def test_refreshes_interactive_ui(
+    async def test_sends_escape_verifies_then_delivers(
         self,
         mock_sm: MagicMock,
         _mock_send: AsyncMock,
         _mock_get_iw: MagicMock,
-        mock_handle_ui: AsyncMock,
+        monkeypatch,
     ) -> None:
+        """Interactive mode: Escape, verified dismissal, then delivery."""
         bot = AsyncMock()
         message = AsyncMock()
+        message.chat.id = -100
+
+        sent_keys = []
+
+        async def fake_send_keys(wid, keys, **kw):
+            sent_keys.append((wid, keys, kw))
+            return True, "Sent"
+
+        async def no_prompt(wid, pane_id=None):
+            return False
+
+        _TEST_ADAPTER.send_keys = AsyncMock(side_effect=fake_send_keys)
+
+        cleared = []
+        import ccgram.handlers.interactive as _int_mod
+
+        monkeypatch.setattr(_int_mod, "pane_has_interactive_prompt", no_prompt)
+
+        monkeypatch.setattr(
+            _int_mod,
+            "clear_interactive_mode",
+            lambda *a, **kw: cleared.append(a),
+        )
 
         await _forward_message("@0", 100, 42, "hello", bot, message)
 
-        mock_handle_ui.assert_called_once()
-        assert mock_handle_ui.call_args.args[0] is bot
-        assert mock_handle_ui.call_args.args[1:] == (100, "@0", 42)
+        escape_calls = [(keys, kw) for _, keys, kw in sent_keys if keys == ["Escape"]]
+        assert escape_calls, "an Escape keypress was sent"
+        assert all(kw.get("expected_prompt") is None for _, kw in escape_calls)
+        assert cleared, "clear_interactive_mode should have been called"
+        assert _mock_send.await_count == 1, "text must be forwarded after Escape"
+
+
+class TestDismissalFailurePaths:
+    """Review 2026-09-25: a failed or unconfirmed dismissal must never
+    forward the text, must keep the tracking, and must echo the text."""
+
+    def _wire(self, monkeypatch, *, escape_result, prompt_still_shown):
+        sent_keys = []
+
+        async def fake_send_keys(wid, keys, **kw):
+            sent_keys.append((wid, keys, kw))
+            if isinstance(escape_result, Exception):
+                raise escape_result
+            return escape_result, "send failed"
+
+        async def fake_prompt(wid, pane_id=None):
+            return prompt_still_shown
+
+        _TEST_ADAPTER.send_keys = AsyncMock(side_effect=fake_send_keys)
+        import ccgram.handlers.interactive as _int_mod
+
+        monkeypatch.setattr(_int_mod, "pane_has_interactive_prompt", fake_prompt)
+        return sent_keys
+
+    @patch(f"{_TH}.get_interactive_window", return_value="@0")
+    @patch(f"{_TH}.send_telegram_to_window", new_callable=AsyncMock)
+    @patch(f"{_TH}.window_query")
+    async def test_escape_returns_false_keeps_state_and_text(
+        self, _wq, _mock_send, _get_iw, monkeypatch
+    ) -> None:
+        message = AsyncMock()
+        message.chat.id = -100
+        self._wire(monkeypatch, escape_result=False, prompt_still_shown=False)
+
+        cleared = []
+        import ccgram.handlers.interactive as _int_mod
+
+        monkeypatch.setattr(
+            _int_mod, "clear_interactive_mode", lambda *a, **kw: cleared.append(a)
+        )
+
+        await _forward_message("@0", 100, 42, "precious words", AsyncMock(), message)
+
+        assert _mock_send.await_count == 0, "no forward on failed Escape"
+        assert cleared == [], "tracking must be retained"
+        text = (
+            message.reply_text.call_args.args[-1]
+            if message.reply_text.call_args
+            else ""
+        )
+        assert "precious words" in str(text), "the notice must echo the text"
+
+    @patch(f"{_TH}.get_interactive_window", return_value="@0")
+    @patch(f"{_TH}.send_telegram_to_window", new_callable=AsyncMock)
+    @patch(f"{_TH}.window_query")
+    async def test_escape_raises_keeps_state_and_text(
+        self, _wq, _mock_send, _get_iw, monkeypatch
+    ) -> None:
+        message = AsyncMock()
+        message.chat.id = -100
+        self._wire(
+            monkeypatch,
+            escape_result=RuntimeError("mux down"),
+            prompt_still_shown=False,
+        )
+
+        cleared = []
+        import ccgram.handlers.interactive as _int_mod
+
+        monkeypatch.setattr(
+            _int_mod, "clear_interactive_mode", lambda *a, **kw: cleared.append(a)
+        )
+
+        await _forward_message("@0", 100, 42, "precious words", AsyncMock(), message)
+
+        assert _mock_send.await_count == 0, "no forward on Escape exception"
+        assert cleared == []
+
+    @patch(f"{_TH}.get_interactive_window", return_value="@0")
+    @patch(f"{_TH}.send_telegram_to_window", new_callable=AsyncMock)
+    @patch(f"{_TH}.window_query")
+    async def test_dismissal_never_confirms_keeps_state_and_text(
+        self, _wq, _mock_send, _get_iw, monkeypatch
+    ) -> None:
+        """Escape sends fine, but the prompt never goes away: the bounded
+        loop exhausts, nothing is forwarded, tracking stays."""
+        message = AsyncMock()
+        message.chat.id = -100
+        self._wire(monkeypatch, escape_result=True, prompt_still_shown=True)
+
+        cleared = []
+        import ccgram.handlers.interactive as _int_mod
+
+        monkeypatch.setattr(
+            _int_mod, "clear_interactive_mode", lambda *a, **kw: cleared.append(a)
+        )
+        import ccgram.handlers.text.text_handler as _th_mod
+
+        monkeypatch.setattr(_th_mod, "_DISMISS_CONFIRM_ATTEMPTS", 2)
+        monkeypatch.setattr(_th_mod, "_DISMISS_CONFIRM_INTERVAL_S", 0.0)
+
+        await _forward_message("@0", 100, 42, "precious words", AsyncMock(), message)
+
+        assert _mock_send.await_count == 0, "no forward without confirmation"
+        assert cleared == []
+        notice = str(message.reply_text.call_args.args[-1])
+        assert "precious words" in notice
+
+    @patch(f"{_TH}.get_interactive_window", return_value="@0")
+    @patch(
+        f"{_TH}.send_telegram_to_window",
+        new_callable=AsyncMock,
+        return_value=(True, "ok"),
+    )
+    @patch(f"{_TH}.window_query")
+    async def test_sibling_pane_prompt_targets_owning_pane(
+        self, _wq, _mock_send, _get_iw, monkeypatch
+    ) -> None:
+        """A prompt owned by a NON-active sibling pane gets its Escape sent
+        to that pane, never window-level (which hits the active pane)."""
+        message = AsyncMock()
+        message.chat.id = -100
+        sent_keys = self._wire(
+            monkeypatch, escape_result=True, prompt_still_shown=False
+        )
+
+        import ccgram.handlers.interactive as _int_mod
+
+        monkeypatch.setattr(_int_mod, "get_interactive_pane", lambda *a, **kw: "%7")
+        monkeypatch.setattr(_int_mod, "clear_interactive_mode", lambda *a, **kw: None)
+
+        await _forward_message("@0", 100, 42, "hello", AsyncMock(), message)
+
+        pane_escapes = [
+            (t, k, kw)
+            for t, k, kw in sent_keys
+            if k == ["Escape"] and kw.get("pane_id") == "%7"
+        ]
+        assert pane_escapes, "Escape must target the owning pane"
+        window_escapes = [(t, k) for t, k, _ in sent_keys if k == ["Escape"]]
+        assert len(window_escapes) == 1
+        assert _mock_send.await_count == 1
+
+    @patch(f"{_TH}.get_interactive_window", return_value="@0")
+    @patch(
+        f"{_TH}.send_telegram_to_window",
+        new_callable=AsyncMock,
+        return_value=(True, "ok"),
+    )
+    @patch(f"{_TH}.window_query")
+    async def test_capture_failure_never_confirms_dismissal(
+        self, _wq, _mock_send, _get_iw, monkeypatch
+    ) -> None:
+        """An unreadable pane proves nothing: bounded retries exhaust, no
+        forward, tracking stays (Greptile P1: failed capture counted as
+        confirmation)."""
+        from ccgram.handlers.interactive.interactive_ui import PromptStateError
+
+        message = AsyncMock()
+        message.chat.id = -100
+        self._wire(monkeypatch, escape_result=True, prompt_still_shown=False)
+
+        async def failing(wid, pane_id=None):
+            raise PromptStateError("no pane text")
+
+        import ccgram.handlers.interactive as _int_mod
+        import ccgram.handlers.text.text_handler as _th_mod
+
+        monkeypatch.setattr(_int_mod, "pane_has_interactive_prompt", failing)
+        monkeypatch.setattr(_int_mod, "clear_interactive_mode", lambda *a, **kw: None)
+        monkeypatch.setattr(_th_mod, "_DISMISS_CONFIRM_ATTEMPTS", 2)
+        monkeypatch.setattr(_th_mod, "_DISMISS_CONFIRM_INTERVAL_S", 0.0)
+
+        await _forward_message("@0", 100, 42, "precious words", AsyncMock(), message)
+
+        assert _mock_send.await_count == 0, "unknown capture state must not forward"
+
+    @patch(f"{_TH}.get_interactive_window", return_value="@0")
+    @patch(
+        f"{_TH}.send_telegram_to_window",
+        new_callable=AsyncMock,
+        return_value=(True, "ok"),
+    )
+    @patch(f"{_TH}.window_query")
+    async def test_active_pane_second_prompt_blocks_forward(
+        self, _wq, _mock_send, _get_iw, monkeypatch
+    ) -> None:
+        """Owner pane clear, but the ACTIVE pane still shows a prompt: the
+        window-level send would feed it the text (Greptile P1: sibling
+        owner replacement)."""
+        message = AsyncMock()
+        message.chat.id = -100
+        self._wire(monkeypatch, escape_result=True, prompt_still_shown=False)
+
+        async def prompt_on_active_only(wid, pane_id=None):
+            return pane_id is None
+
+        import ccgram.handlers.interactive as _int_mod
+
+        monkeypatch.setattr(
+            _int_mod, "pane_has_interactive_prompt", prompt_on_active_only
+        )
+        monkeypatch.setattr(_int_mod, "get_interactive_pane", lambda *a, **kw: "%7")
+        monkeypatch.setattr(_int_mod, "clear_interactive_mode", lambda *a, **kw: None)
+
+        await _forward_message("@0", 100, 42, "hello", AsyncMock(), message)
+
+        assert _mock_send.await_count == 0, "no forward while the active pane prompts"
 
     @patch(
         f"{_TH}.send_telegram_to_window",
@@ -531,6 +796,28 @@ class TestForwardMessage:
             await _forward_message("@0", 100, 42, "hello", bot, message)
 
         message.chat.send_action.assert_awaited_once_with(ChatAction.TYPING)
+
+    @patch(
+        f"{_TH}.send_telegram_to_window",
+        new_callable=AsyncMock,
+        return_value=(True, "ok"),
+    )
+    @patch(f"{_TH}.window_query")
+    async def test_typing_failure_still_forwards_text(
+        self, _mock_sm: MagicMock, mock_send: AsyncMock
+    ) -> None:
+        """Regression #257: a timed-out typing action must not drop the text."""
+        from telegram.error import TimedOut
+
+        bot = AsyncMock()
+        message = AsyncMock()
+        message.chat.send_action = AsyncMock(side_effect=TimedOut())
+
+        with patch(f"{_TH}.get_interactive_window", return_value=None):
+            await _forward_message("@0", 100, 42, "hello", bot, message)
+
+        mock_send.assert_awaited_once()
+        assert mock_send.call_args.args[3] == "hello"
 
 
 class TestBashCaptureCleanup:
@@ -602,3 +889,265 @@ class TestBashCaptureCleanup:
             await task_a  # A's finally runs
 
         assert _bash_capture_tasks.get(key) is sentinel
+
+
+class TestDeadWindowNeedsAConfirmedRead:
+    """An unreachable backend must not unbind a live topic.
+
+    find_window_by_id answers None both for a window that is gone and for a
+    backend that could not be reached. With a stale or invalid cached cwd, the
+    dead branch unbinds the thread as system_replacement and drops the user
+    into the directory browser, so the live session loses its topic.
+    """
+
+    async def test_unreachable_backend_preserves_the_binding(self) -> None:
+        message = AsyncMock()
+        with (
+            patch(f"{_TH}.tmux_manager") as mock_tm,
+            patch(f"{_TH}.window_query") as mock_query,
+            patch(f"{_TH}.thread_router") as mock_router,
+            patch(f"{_TH}.safe_reply", new_callable=AsyncMock) as mock_reply,
+        ):
+            mock_tm.list_windows_for_reconciliation = AsyncMock(return_value=None)
+            mock_query.is_legacy_herdr.return_value = False
+            # An invalid cached cwd: the shape that reaches the unbind.
+            mock_query.view_window.return_value = MagicMock(cwd="/nonexistent")
+
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hi", {}, message, adapter=_TEST_ADAPTER
+            )
+
+        assert result is True
+        mock_router.unbind_thread.assert_not_called()
+        assert mock_reply.await_args is not None
+        assert "Could not reach" in mock_reply.await_args[0][1]
+
+
+class TestStaleDeadMarkerDoesNotOutliveTheWindow:
+    """The dead marker is sticky, so a live window must be able to clear it.
+
+    tick_window returns early once the marker is set, so nothing else clears
+    it. An agterm session comes back under the same UUID after an app restart,
+    and with a stale cached cwd the dead branch unbinds the topic.
+    """
+
+    async def test_live_agent_clears_the_marker_instead_of_unbinding(self) -> None:
+        lifecycle_strategy.mark_dead_notified(100, 42, "@0")
+        window = WindowRef(
+            window_id="@0",
+            window_name="project",
+            cwd="/tmp/project",
+            pane_current_command="claude",
+        )
+        message = AsyncMock()
+        with (
+            patch(f"{_TH}.tmux_manager") as mock_tm,
+            patch(f"{_TH}.window_query") as mock_query,
+            patch(f"{_TH}.thread_router") as mock_router,
+            patch(
+                f"{_TH}.agent_origin_returned_to_shell",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            mock_tm.list_windows_for_reconciliation = AsyncMock(return_value=[window])
+            mock_query.is_legacy_herdr.return_value = False
+            mock_query.get_window_provider.return_value = "claude"
+            # Stale cached cwd: the shape that otherwise reaches the unbind.
+            mock_query.view_window.return_value = MagicMock(cwd="/nonexistent")
+
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hi", {}, message, adapter=_TEST_ADAPTER
+            )
+
+        assert result is False
+        mock_router.unbind_thread.assert_not_called()
+        assert not lifecycle_strategy.is_dead_notified(100, 42, "@0")
+
+    async def test_shell_return_still_shows_recovery(self) -> None:
+        """The marker clearing must not swallow the case recovery exists for."""
+        window = WindowRef(
+            window_id="@0",
+            window_name="project",
+            cwd="/tmp/project",
+            pane_current_command="bash",
+        )
+        message = AsyncMock()
+        message.chat.id = -100
+        with (
+            patch(f"{_TH}.tmux_manager") as mock_tm,
+            patch(f"{_TH}.window_query") as mock_query,
+            patch(f"{_TH}.thread_router") as mock_router,
+            patch(
+                f"{_TH}.agent_origin_returned_to_shell",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(f"{_TH}.render_banner", return_value=("recovery", MagicMock())),
+            patch(f"{_TH}.safe_reply", new_callable=AsyncMock) as mock_reply,
+            patch(f"{_TH}.Path") as mock_path,
+        ):
+            mock_tm.list_windows_for_reconciliation = AsyncMock(return_value=[window])
+            mock_query.is_legacy_herdr.return_value = False
+            mock_query.get_window_provider.return_value = "claude"
+            mock_query.view_window.return_value = MagicMock(
+                cwd="/tmp/project", provider_name="claude"
+            )
+            mock_router.get_display_name.return_value = "project"
+            mock_path.return_value.is_dir.return_value = True
+
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hi", {}, message, adapter=_TEST_ADAPTER
+            )
+
+        assert result is True
+        mock_reply.assert_awaited_once()
+
+
+class TestUnknownAgentStateDoesNotClearTheMarker:
+    """agterm reports no foreground for a shell, an unreadable process group
+    and a failed lookup alike, and detection maps all three to "". Treating
+    that as "an agent is running" clears the dead marker, forwards the next
+    message, and the shared send guard types it into the pane with Return, so
+    a session restored under the same UUID as a plain shell runs it.
+    """
+
+    @staticmethod
+    async def _run(
+        pane_command: str, *, bound_provider: str = "claude"
+    ) -> tuple[bool, AsyncMock, AsyncMock, AsyncMock]:
+        lifecycle_strategy.mark_dead_notified(100, 42, "@0")
+        window = WindowRef(
+            window_id="@0",
+            window_name="project",
+            cwd="/tmp/project",
+            pane_current_command=pane_command,
+        )
+        message = AsyncMock()
+        with (
+            patch(f"{_TH}.tmux_manager") as mock_tm,
+            patch(f"{_TH}.window_query") as mock_query,
+            patch(f"{_TH}.thread_router") as mock_router,
+            patch(
+                f"{_TH}.agent_origin_returned_to_shell",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                f"{_TH}.discover_and_register_transcript",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as mock_sync_provider,
+            patch(f"{_TH}.safe_reply", new_callable=AsyncMock) as mock_reply,
+        ):
+            mock_tm.list_windows_for_reconciliation = AsyncMock(return_value=[window])
+            mock_query.is_legacy_herdr.return_value = False
+            mock_query.get_window_provider.return_value = bound_provider
+            # Stale cached cwd: the shape that reaches the unbind.
+            mock_query.view_window.return_value = MagicMock(cwd="/nonexistent")
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hi", {}, message, adapter=_TEST_ADAPTER
+            )
+        return result, mock_router, mock_reply, mock_sync_provider
+
+    @pytest.mark.parametrize("pane_command", ["", "vim", "less", "top", "bash"])
+    async def test_a_non_agent_foreground_keeps_the_marker_and_forwards_nothing(
+        self, pane_command: str
+    ) -> None:
+        handled, mock_router, mock_reply, mock_sync_provider = await self._run(
+            pane_command
+        )
+
+        assert handled is True, "the message must not be forwarded to the pane"
+        assert lifecycle_strategy.is_dead_notified(100, 42, "@0")
+        mock_router.unbind_thread.assert_not_called()
+        mock_sync_provider.assert_not_awaited()
+        assert mock_reply.await_args is not None
+        assert "nothing confirms an agent" in mock_reply.await_args[0][1]
+
+    @pytest.mark.parametrize("pane_command", ["claude", "codex"])
+    async def test_a_named_agent_still_clears_the_marker(
+        self, pane_command: str
+    ) -> None:
+        """Any confirmed agent is enough to resume forwarding safely."""
+        handled, mock_router, _, mock_sync_provider = await self._run(pane_command)
+
+        assert handled is False, "a live agent's topic keeps forwarding"
+        assert not lifecycle_strategy.is_dead_notified(100, 42, "@0")
+        mock_router.unbind_thread.assert_not_called()
+        mock_sync_provider.assert_awaited_once()
+
+    async def test_an_agent_exit_during_provider_sync_enters_recovery(self) -> None:
+        lifecycle_strategy.mark_dead_notified(100, 42, "@0")
+        user_data: dict = {}
+        window = WindowRef(
+            window_id="@0",
+            window_name="project",
+            cwd="/tmp/project",
+            pane_current_command="claude",
+        )
+        message = AsyncMock()
+        message.chat.id = -100
+        with (
+            patch(f"{_TH}.tmux_manager") as mock_tm,
+            patch(f"{_TH}.window_query") as mock_query,
+            patch(f"{_TH}.thread_router") as mock_router,
+            patch(
+                f"{_TH}.agent_origin_returned_to_shell",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                f"{_TH}.discover_and_register_transcript",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(f"{_TH}.render_banner", return_value=("recovery", MagicMock())),
+            patch(f"{_TH}.safe_reply", new_callable=AsyncMock) as mock_reply,
+            patch(f"{_TH}.Path") as mock_path,
+        ):
+            mock_tm.list_windows_for_reconciliation = AsyncMock(return_value=[window])
+            mock_query.is_legacy_herdr.return_value = False
+            mock_query.get_window_provider.return_value = "claude"
+            mock_query.view_window.return_value = MagicMock(
+                cwd="/tmp/project", provider_name="claude"
+            )
+            mock_router.get_display_name.return_value = "project"
+            mock_path.return_value.is_dir.return_value = True
+
+            handled = await _handle_dead_window(
+                "@0",
+                100,
+                42,
+                "keep this prompt",
+                user_data,
+                message,
+                adapter=_TEST_ADAPTER,
+            )
+
+        assert handled is True
+        assert lifecycle_strategy.is_dead_notified(100, 42, "@0")
+        assert user_data[PENDING_THREAD_TEXT] == "keep this prompt"
+        assert user_data[RECOVERY_WINDOW_ID] == "@0"
+        mock_router.unbind_thread.assert_not_called()
+        mock_reply.assert_awaited_once()
+
+    async def test_a_shell_bound_topic_accepts_a_shell_foreground(self) -> None:
+        handled, mock_router, _, mock_sync_provider = await self._run(
+            "bash", bound_provider="shell"
+        )
+
+        assert handled is False
+        assert not lifecycle_strategy.is_dead_notified(100, 42, "@0")
+        mock_router.unbind_thread.assert_not_called()
+        mock_sync_provider.assert_awaited_once()
+
+    async def test_a_shell_bound_topic_syncs_a_detected_agent(self) -> None:
+        handled, mock_router, _, mock_sync_provider = await self._run(
+            "codex", bound_provider="shell"
+        )
+
+        assert handled is False
+        assert not lifecycle_strategy.is_dead_notified(100, 42, "@0")
+        mock_router.unbind_thread.assert_not_called()
+        mock_sync_provider.assert_awaited_once()

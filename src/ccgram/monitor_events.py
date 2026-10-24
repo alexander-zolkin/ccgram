@@ -36,6 +36,7 @@ class NewMessage:
     role: str = "assistant"  # "user" or "assistant"
     tool_name: str | None = None  # For tool_use messages, the tool name
     turn_end: bool = False  # the reply that ends the turn
+    provider_name: str = ""  # Transcript provider for queue provenance
 
 
 @dataclass

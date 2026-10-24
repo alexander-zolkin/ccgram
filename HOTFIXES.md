@@ -78,6 +78,26 @@ would have degraded to the recovery banner in silence.
 If a marker block can't be reconciled (upstream rewrote the function), re-derive
 the behaviour, keep the marker, and update this file's entry.
 
+### Upstream v4.17 merge (2026-10-24) — what moved
+
+Upstream replaced the per-provider transcript parsers with one protocol parser
+(`session_protocol/messages.py`) and routes every handler-side terminal
+mutation through the session core (`session_protocol/telegram.py` adapter);
+`tests/ccgram/session_protocol/test_boundaries.py` enforces both. Ports:
+
+- `turn_end` (notify-when-done) is computed in
+  `transcript_reader.render_protocol_records` from the Claude line's
+  `stop_reason`; `transcript_parser.py` is gone.
+- Fork launch extras (model, effort, grok initial prompt, private `GROK_HOME`)
+  reach the backend as `CreationOptions.agent_args` / `command_prefix`.
+- `autoresume` creates and rebinds through `adapter.create` +
+  claim-based provisioning (`begin/attach/commit_topic_provisioning`).
+- Grok: lines are parsed by `messages._grok`; the whole-file read keeps the
+  entry-index cursor (`GrokProvider.read_transcript_file`).
+- `CCGRAM_AUTODELETE_DEAD_TOPICS` (upstream: delete a dead session's topic)
+  defaults to **false** in the fork — hibernated topics must survive.
+- The web UI gets the session service through `start_webui(bot, bot_data)`.
+
 ---
 
 ## Fork-only features (not hotfixes)
@@ -168,6 +188,9 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 - **What:** when a Telegram topic probe times out, rebind the existing topic
   rather than creating a fresh one.
 - **Why:** probe timeouts were misread as "topic gone" → duplicate topic.
+- **Since the v4.17 merge:** upstream removed the same-name rebind this patched
+  and treats an inconclusive probe as "unresolved" in
+  `topic_provisioning_recovery.py` natively; the marker sits there.
 
 ### `rich-tables` — Telegram-safe Markdown tables & headers
 - **Files:** `rich_tables.py` (**new module**),
@@ -328,6 +351,11 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
   send triggered the unpin probe → unbind of a deleted topic), so the probe is
   factored into `_probe_topic_after_death` and runs directly on the quiet path.
   Set `CCGRAM_DEAD_BANNER=1` for upstream behaviour.
+- **Since the v4.17 merge:** upstream itself no longer posts a banner on death
+  (it deletes the topic, or retains it with `CCGRAM_AUTODELETE_DEAD_TOPICS=false`,
+  the fork default). On the retain path the fork sets the 💀 emoji and sends the
+  banner only with `CCGRAM_DEAD_BANNER=1`; deleted-topic detection is the
+  periodic `probe_topic_existence`. The autoclose timer is gone upstream.
 - **Why:** on this host window death is *routine and intentional* —
   `~/.ccgram/idle-hibernator.py` kills idle windows to free RAM while the topic
   stays bound, and `autoresume` (`CCGRAM_AUTORESUME_DEAD=true`) continues the
@@ -473,6 +501,8 @@ Listed by feature. "Commit" is where the marker was introduced on this fork.
 ### `transcript-decode-guard` — a bad byte doesn't kill the relay
 - **Files:** `transcript_reader.py`
 - **What:** transcript reads tolerate non-UTF-8 bytes instead of raising.
+  Since the v4.17 merge reads are binary; a line that fails UTF-8 decoding is
+  re-decoded with U+FFFD instead of stalling the session on it.
 - **Why:** one malformed byte in a transcript took down the whole relay for
   that window.
 

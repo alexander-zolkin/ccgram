@@ -43,7 +43,8 @@ class _FakeTmux:
 
     Models the real thing: the menu stays on screen until the keystroke that
     dismisses it lands, so a test can't accidentally pass by running out of
-    scripted frames.
+    scripted frames. It is read through the multiplexer and receives keys
+    through the session adapter, so one fake plays both roles.
     """
 
     def __init__(self, *, showing_dialog: bool, clear_key: str | None):
@@ -54,11 +55,12 @@ class _FakeTmux:
     async def capture_pane(self, window_id):  # noqa: ARG002
         return _DIALOG if self._showing else _READY
 
-    async def send_keys(self, window_id, text, **kwargs):  # noqa: ARG002
-        self.keys.append(text)
-        if self._clear_key is not None and text == self._clear_key:
-            self._showing = False
-        return True
+    async def send_keys(self, window_id, keys, **kwargs):  # noqa: ARG002
+        for key in keys:
+            self.keys.append(key)
+            if self._clear_key is not None and key == self._clear_key:
+                self._showing = False
+        return True, "Sent"
 
 
 @pytest.fixture()
@@ -92,22 +94,22 @@ class TestIsResumeDialog:
 class TestDismissResumeDialog:
     async def test_no_dialog_sends_nothing(self, fake_tmux):
         fake = fake_tmux(showing_dialog=False)
-        assert await dismiss_resume_dialog("@1") is False
+        assert await dismiss_resume_dialog("@1", adapter=fake) is False
         assert fake.keys == []  # must not disturb a live prompt
 
     async def test_selects_resume_full_session_as_is(self, fake_tmux):
         fake = fake_tmux(clear_key="Enter")
-        assert await dismiss_resume_dialog("@1") is True
+        assert await dismiss_resume_dialog("@1", adapter=fake) is True
         # Down moves off the preselected "Resume from summary" onto option 2.
         assert fake.keys == ["Down", "Enter"]
 
     async def test_escape_fallback_when_enter_does_not_take(self, fake_tmux):
         # Enter is ignored (a repaint ate it); only Escape clears the menu.
         fake = fake_tmux(clear_key="Escape")
-        assert await dismiss_resume_dialog("@1", settle_timeout=0.5) is True
+        assert await dismiss_resume_dialog("@1", adapter=fake, settle_timeout=0.5) is True
         assert fake.keys == ["Down", "Enter", "Escape"]
 
     async def test_reports_failure_when_menu_never_clears(self, fake_tmux):
         fake = fake_tmux(clear_key=None)
-        assert await dismiss_resume_dialog("@1", settle_timeout=0.5) is False
+        assert await dismiss_resume_dialog("@1", adapter=fake, settle_timeout=0.5) is False
         assert fake.keys == ["Down", "Enter", "Escape"]

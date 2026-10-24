@@ -150,14 +150,15 @@ async def test_suspected_topic_uses_send_probe(monkeypatch):
         calls.append(("probe", chat_id, thread_id))
         return False
 
-    async def fake_unbind(client, user_id, chat_id, thread_id, wid):
+    async def fake_unbind(client, user_id, chat_id, thread_id, wid, adapter):
         calls.append(("unbind", thread_id, wid))
 
-    monkeypatch.setattr(tl, "probe_topic_exists", fake_exists)
+    adapter = object()
+    monkeypatch.setattr(tl, "probe_topic_exists_by_send", fake_exists)
     monkeypatch.setattr(tl, "_unbind_deleted_topic", fake_unbind)
-    assert await tl._probe_suspected(object(), 1, -100, 42, "@42") is False
+    assert await tl._probe_suspected(object(), 1, -100, 42, "@42", adapter) is False
     tl.note_thread_gone(-100, 42)
-    assert await tl._probe_suspected(object(), 1, -100, 42, "@42") is True
+    assert await tl._probe_suspected(object(), 1, -100, 42, "@42", adapter) is True
     assert calls == [("probe", -100, 42), ("unbind", 42, "@42")]
     assert (-100, 42) not in tl._suspected_gone
 

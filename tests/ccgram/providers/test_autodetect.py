@@ -12,6 +12,7 @@ from ccgram.providers import (
 )
 from ccgram.providers.process_detection import _pgid_cache
 from ccgram.session_monitor import SessionMonitor
+from ccgram.thread_router import thread_router
 
 
 class TestDetectProviderFromPane:
@@ -200,6 +201,9 @@ class _NewWindowHarness:
             window = MagicMock()
             window.pane_current_command = pane_command
         self.mux.find_window_by_id = AsyncMock(return_value=window)
+        # still_present reads this; confirmed empty means no stale same-name
+        # binding is alive, which is the state these cases describe.
+        self.mux.list_windows_for_reconciliation = AsyncMock(return_value=[])
         self.mux.get_pane_title = AsyncMock(return_value=pane_title)
 
         event = NewWindowEvent(
@@ -224,10 +228,12 @@ def new_window():
             return_value="",
         ) as detect,
     ):
+        thread_router.reset()
         config.group_id = None
         session_manager.iter_thread_bindings.return_value = []
         session_manager.view_window.return_value = MagicMock(provider_name="")
         yield _NewWindowHarness(detect, session_manager, mux)
+    thread_router.reset()
 
 
 class TestHandleNewWindowAutoDetection:
@@ -307,7 +313,7 @@ class TestSessionMonitorProviderFromMap:
             ),
             patch("ccgram.session.session_manager") as mock_sm,
         ):
-            await monitor._detect_and_cleanup_changes()
+            await monitor._detect_and_cleanup_changes(adoptable_window_ids=set(new_map))
             mock_sm.set_window_provider.assert_called_once_with("@5", "codex")
 
     async def test_skips_provider_when_not_in_map(self, tmp_path) -> None:
@@ -335,5 +341,5 @@ class TestSessionMonitorProviderFromMap:
             ),
             patch("ccgram.session.session_manager") as mock_sm,
         ):
-            await monitor._detect_and_cleanup_changes()
+            await monitor._detect_and_cleanup_changes(adoptable_window_ids=set(new_map))
             mock_sm.set_window_provider.assert_not_called()

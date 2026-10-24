@@ -17,7 +17,7 @@ from ...providers import registry as provider_registry
 from ...thread_router import thread_router
 from ..callback_data import CB_MODE_SELECT, CB_PROV_SELECT, CB_WIZ_MODEL_PICK
 from ..callback_helpers import get_thread_id
-from ..messaging_pipeline.message_sender import safe_edit
+from ..messaging_pipeline.message_sender import interactive_edit as safe_edit
 from ..user_state import PENDING_MODEL_CHOICES, PENDING_MODEL_ID, PENDING_MODEL_NAME
 from .directory_browser import (
     build_mode_picker,

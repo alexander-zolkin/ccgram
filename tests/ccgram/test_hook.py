@@ -10,6 +10,7 @@ import pytest
 from ccgram.hook import (
     _claude_settings_file,
     _closest_claude_ancestor,
+    _ensure_codex_feature_flag,
     _foreground_pgid_on_tty,
     _hook_status,
     _install_hook,
@@ -21,7 +22,6 @@ from ccgram.hook import (
     get_installed_events,
     hook_main,
 )
-from ccgram.config import config
 from ccgram.providers.base import UUID_RE
 
 
@@ -31,6 +31,108 @@ def _is_hook_installed(settings: dict) -> bool:
 
 def _expected_module_command() -> str:
     return f"{shlex.quote(sys.executable)} -m ccgram.main hook"
+
+
+@pytest.fixture(autouse=True)
+def _clear_ambient_multiplexer_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep hook tests independent of the terminal running pytest."""
+    for key in (
+        "HERDR_SOCKET_PATH",
+        "HERDR_WORKSPACE_ID",
+        "HERDR_PANE_ID",
+        "HERDR_TAB_ID",
+        "TMUX_PANE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+class TestCodexFeatureFlag:
+    @pytest.mark.parametrize(
+        ("existing", "expected", "result"),
+        [
+            pytest.param(
+                "[features]\nhooks = true\n",
+                "[features]\nhooks = true\n",
+                0,
+                id="current-enabled",
+            ),
+            pytest.param(
+                "[features]\ncodex_hooks = true\n",
+                "[features]\nhooks = true\n",
+                0,
+                id="migrate-enabled",
+            ),
+            pytest.param(
+                "[features]\ncodex_hooks = true\nhooks = true\n",
+                "[features]\nhooks = true\n",
+                0,
+                id="remove-duplicate-legacy-key",
+            ),
+            pytest.param(
+                "[features]\nhooks = false\n",
+                "[features]\nhooks = false\n",
+                1,
+                id="current-disabled",
+            ),
+            pytest.param(
+                "[features]\ncodex_hooks = false\n",
+                "[features]\nhooks = false\n",
+                1,
+                id="migrate-disabled",
+            ),
+            pytest.param(
+                "[profiles.work.features]\nhooks = false\n",
+                "[profiles.work.features]\nhooks = false\n\n[features]\nhooks = true\n",
+                0,
+                id="ignore-profile-features",
+            ),
+            pytest.param(
+                "[features]\nunified_exec = true\n\n[[plugins]]\nhooks = false\n",
+                "[features]\nhooks = true\nunified_exec = true\n\n[[plugins]]\nhooks = false\n",
+                0,
+                id="stop-at-array-table",
+            ),
+            pytest.param(
+                "[features]  \nunified_exec = true\n",
+                "[features]  \nhooks = true\nunified_exec = true\n",
+                0,
+                id="allow-trailing-header-whitespace",
+            ),
+            pytest.param(
+                '[features]\n"hooks" = true\n',
+                '[features]\n"hooks" = true\n',
+                0,
+                id="preserve-quoted-current-key",
+            ),
+            pytest.param(
+                '[features]\n"codex_hooks" = true\n',
+                '[features]\n"hooks" = true\n',
+                0,
+                id="migrate-quoted-legacy-key",
+            ),
+        ],
+    )
+    def test_ensures_current_top_level_flag(
+        self,
+        tmp_path,
+        monkeypatch,
+        existing: str,
+        expected: str,
+        result: int,
+    ) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(existing)
+        monkeypatch.setattr("ccgram.hook._codex_config_file", lambda: config_file)
+
+        assert _ensure_codex_feature_flag() == result
+        assert config_file.read_text() == expected
+
+    def test_creates_config_with_current_flag(self, tmp_path, monkeypatch) -> None:
+        config_file = tmp_path / "config.toml"
+        monkeypatch.setattr("ccgram.hook._codex_config_file", lambda: config_file)
+
+        assert _ensure_codex_feature_flag() == 0
+        assert config_file.read_text() == "[features]\nhooks = true\n"
 
 
 class TestInstallHook:
@@ -494,7 +596,16 @@ class TestTabDelimitedParsing:
         mock_result = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=tmux_output + "\n", stderr=""
         )
-        with patch("ccgram.hook.subprocess.run", return_value=mock_result):
+
+        def _fake_run(args, **_kwargs):
+            # The session_map key probe asks ccgram's session for its window
+            # list; a blanket mock would hand it the display-message output and
+            # make every window look like it lives in ccgram's session.
+            if len(args) > 1 and args[1] == "list-windows":
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return mock_result
+
+        with patch("ccgram.hook.subprocess.run", side_effect=_fake_run):
             hook_main()
 
         session_map = json.loads((tmp_path / "session_map.json").read_text())
@@ -592,7 +703,7 @@ class TestClaudeSettingsFile:
 class TestSessionMapKeyForLinkedWindow:
     """A window linked into ccgram's session belongs to more than one tmux
     session. The hook must key session_map under the session readers resolve
-    against (config.tmux_session_name), not whichever session tmux happens to
+    against (TMUX_SESSION_NAME), not whichever session tmux happens to
     report for the firing pane, or the binding is written and never found.
     """
 
@@ -606,14 +717,14 @@ class TestSessionMapKeyForLinkedWindow:
         return _fake
 
     def test_linked_window_keys_under_ccgram_session(self, monkeypatch) -> None:
-        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setenv("TMUX_SESSION_NAME", "ccgram")
         monkeypatch.setattr(subprocess, "run", self._run("@12\n@34\n"))
         assert _session_map_session_for("@34", "agentdeck_foo_1234") == "ccgram"
 
     def test_resolve_window_id_uses_ccgram_session_for_linked_window(
         self, monkeypatch
     ) -> None:
-        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setenv("TMUX_SESSION_NAME", "ccgram")
 
         def _fake_run(args, **_kwargs):
             if args[1] == "display-message":
@@ -632,8 +743,35 @@ class TestSessionMapKeyForLinkedWindow:
             "/dev/ttys001",
         )
 
+    def test_grouped_session_window_keys_under_ccgram_session(
+        self, monkeypatch
+    ) -> None:
+        """A pane in a session *grouped* with ccgram's (``tmux new-session -t
+        <session>``) shares that session's window list without linking the
+        windows, so tmux reports ``window_linked_sessions=1``. The key must
+        still resolve to ccgram's session or the binding is never found.
+        """
+        monkeypatch.setenv("TMUX_SESSION_NAME", "ccgram")
+
+        def _fake_run(args, **_kwargs):
+            if args[1] == "display-message":
+                return subprocess.CompletedProcess(
+                    args, 0, "grouped-1234\t@1\tcode\t/dev/ttys003\t1\n", ""
+                )
+            if args[1] == "list-windows":
+                return subprocess.CompletedProcess(args, 0, "@1\n", "")
+            pytest.fail(f"unexpected command: {args}")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        assert _resolve_window_id("%1") == (
+            "ccgram:@1",
+            "@1",
+            "code",
+            "/dev/ttys003",
+        )
+
     def test_unlinked_window_keeps_pane_session(self, monkeypatch) -> None:
-        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setenv("TMUX_SESSION_NAME", "ccgram")
         monkeypatch.setattr(subprocess, "run", self._run("@12\n"))
         assert (
             _session_map_session_for("@99", "agentdeck_foo_1234")
@@ -641,14 +779,14 @@ class TestSessionMapKeyForLinkedWindow:
         )
 
     def test_pane_already_in_ccgram_session_is_unchanged(self, monkeypatch) -> None:
-        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setenv("TMUX_SESSION_NAME", "ccgram")
         monkeypatch.setattr(
             subprocess, "run", lambda *a, **k: pytest.fail("no tmux probe needed")
         )
         assert _session_map_session_for("@12", "ccgram") == "ccgram"
 
     def test_tmux_failure_falls_back_to_pane_session(self, monkeypatch) -> None:
-        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setenv("TMUX_SESSION_NAME", "ccgram")
         monkeypatch.setattr(subprocess, "run", self._run("", returncode=1))
         assert (
             _session_map_session_for("@34", "agentdeck_foo_1234")
@@ -659,12 +797,39 @@ class TestSessionMapKeyForLinkedWindow:
         def _boom(*_args, **_kwargs):
             raise subprocess.TimeoutExpired(cmd="tmux", timeout=5)
 
-        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+        monkeypatch.setenv("TMUX_SESSION_NAME", "ccgram")
         monkeypatch.setattr(subprocess, "run", _boom)
         assert (
             _session_map_session_for("@34", "agentdeck_foo_1234")
             == "agentdeck_foo_1234"
         )
+
+    def test_does_not_import_config(self, monkeypatch) -> None:
+        """Regression #252: config loads the project's .env and raises on an
+        empty TELEGRAM_BOT_TOKEN, so the hook path must never import it."""
+        monkeypatch.setitem(sys.modules, "ccgram.config", None)
+        monkeypatch.setenv("TMUX_SESSION_NAME", "ccgram")
+        monkeypatch.setattr(subprocess, "run", self._run("@34\n"))
+        assert _session_map_session_for("@34", "agentdeck_foo_1234") == "ccgram"
+
+    def test_session_name_from_ccgram_env_file(self, monkeypatch, tmp_path) -> None:
+        """TMUX_SESSION_NAME set only in $CCGRAM_DIR/.env must match readers."""
+        (tmp_path / ".env").write_text("TMUX_SESSION_NAME=bots\n")
+        monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
+        monkeypatch.delenv("TMUX_SESSION_NAME", raising=False)
+        monkeypatch.setattr(subprocess, "run", self._run("@34\n"))
+        assert _session_map_session_for("@34", "agentdeck_foo_1234") == "bots"
+
+    def test_project_env_file_is_ignored(self, monkeypatch, tmp_path) -> None:
+        """The hook's cwd is the agent's project; its .env must not apply."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / ".env").write_text("TMUX_SESSION_NAME=other\nTELEGRAM_BOT_TOKEN=\n")
+        monkeypatch.chdir(project)
+        monkeypatch.setenv("CCGRAM_DIR", str(tmp_path / "ccgram"))
+        monkeypatch.delenv("TMUX_SESSION_NAME", raising=False)
+        monkeypatch.setattr(subprocess, "run", self._run("@34\n"))
+        assert _session_map_session_for("@34", "agentdeck_foo_1234") == "ccgram"
 
 
 class TestNestedSessionDetection:
@@ -960,3 +1125,64 @@ class TestProviderFromPaneTty:
 
     def test_empty_tty_returns_none(self) -> None:
         assert _provider_from_pane_tty("") is None
+
+    @pytest.mark.parametrize(
+        ("foreground_commands", "provider"),
+        [
+            pytest.param(
+                "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js\n"
+                'node -e L("~/.codex/plugins/cache/claude-mem-local")\n',
+                "claude",
+                id="claude-npm-wrapper-with-codex-named-helper",
+            ),
+            pytest.param(
+                "node /usr/lib/node_modules/@openai/codex/bin/codex.js\n"
+                "claude -p hello\n",
+                "codex",
+                id="codex-wrapper-wins-over-child-claude",
+            ),
+            pytest.param(
+                "npx @openai/codex --version\n",
+                "codex",
+                id="npx-wrapper",
+            ),
+            pytest.param(
+                "vim ~/.codex/config.toml\n",
+                None,
+                id="editor-on-codex-config-never-detects",
+            ),
+            pytest.param(
+                "python3 -c 'import codex'\n",
+                None,
+                id="code-string-is-not-a-script",
+            ),
+            pytest.param(
+                "node --require /opt/codex-hooks/register.js app.js\n",
+                None,
+                id="require-value-is-not-a-script",
+            ),
+            pytest.param(
+                "gemini what's up\n",
+                "gemini",
+                id="unmatched-quote-line-still-counts",
+            ),
+            pytest.param(
+                "vim ~/notes/pi\n",
+                None,
+                id="path-mentioning-pi-is-not-pi",
+            ),
+            pytest.param(
+                "node /srv/app/main.js\nnode /srv/gemini-cli/index.js\n",
+                "gemini",
+                id="gemini-script-argument",
+            ),
+        ],
+    )
+    def test_provider_evidence_is_executable_and_script_only(
+        self, foreground_commands: str, provider: str | None
+    ) -> None:
+        result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=foreground_commands, stderr=""
+        )
+        with patch("ccgram.hook.subprocess.run", return_value=result):
+            assert _provider_from_pane_tty("/dev/ttys012") == provider

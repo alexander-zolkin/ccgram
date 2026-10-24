@@ -40,6 +40,7 @@ class ContentTask:
     source_checkpoint: int | None = None
     enqueued_monotonic: float = field(default_factory=time.monotonic, compare=False)
     is_backlog_notice: bool = False
+    source_provider_name: str | None = None
     # CCGRAM-HOTFIX:webui-extras — the reply that ends the turn; it rings even
     # when the rest of the turn goes out silent ("notify when done").
     turn_end: bool = False
@@ -52,6 +53,9 @@ class StatusUpdateTask:
     window_id: str
     text: str | None
     thread_id: int | None = None
+    # Poll refreshes are replaceable. Hook notices are durable and must not be
+    # discarded merely because Telegram temporarily rate-limits the chat.
+    transient: bool = False
 
 
 @dataclass(frozen=True, slots=True)

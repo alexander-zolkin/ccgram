@@ -15,25 +15,30 @@ from ccgram.providers import (
     registry,
     resolve_launch_command,
 )
-from ccgram.providers.base import AgentMessage
+from ccgram.monitor_events import NewMessage
 from ccgram.providers.grok import GrokProvider
 from ccgram.providers.grok_discovery import (
     encode_cwd_dirname,
     discover_session_for_cwd,
 )
 from ccgram.providers.process_detection import classify_provider_from_argv
+from ccgram.session_protocol.messages import SourceEntry, parse_records, read_entries
+from ccgram.transcript_reader import render_protocol_records
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "grok_chat_history.jsonl"
 
 
-def _parse_fixture(provider: GrokProvider) -> list[AgentMessage]:
-    entries = []
-    for line in _FIXTURE.read_text(encoding="utf-8").splitlines():
-        parsed = provider.parse_transcript_line(line)
-        if parsed is not None:
-            entries.append(parsed)
-    messages, _pending = provider.parse_transcript_entries(entries, {})
-    return messages
+def _parse_fixture(_provider: GrokProvider | None = None) -> list[NewMessage]:
+    """The fixture through the one shared parser + relay renderer."""
+    records, state = parse_records(read_entries(_FIXTURE, "grok"), "grok")
+    return render_protocol_records("s", "grok", records, state)
+
+
+def _records(entries: list[dict]) -> list:
+    pairs, _state = parse_records(
+        [SourceEntry(i, e) for i, e in enumerate(entries)], "grok"
+    )
+    return [record for _, record in pairs]
 
 
 # ── Registration / capabilities ──────────────────────────────────────────
@@ -124,16 +129,10 @@ def test_transcript_assistant_text_and_tool_calls() -> None:
 
 
 def test_transcript_tool_results_resolve_pending() -> None:
-    provider = GrokProvider()
-    entries = [
-        provider.parse_transcript_line(line)
-        for line in _FIXTURE.read_text().splitlines()
-    ]
-    entries = [e for e in entries if e is not None]
-    _messages, pending = provider.parse_transcript_entries(entries, {})
+    _records_, state = parse_records(read_entries(_FIXTURE, "grok"), "grok")
     # Both client tool calls were resolved by their tool_result lines.
-    assert "call-1" not in pending
-    assert "call-2" not in pending
+    assert "call-1" not in state.pending_tools
+    assert "call-2" not in state.pending_tools
 
 
 def test_tool_result_carries_tool_name() -> None:
@@ -143,31 +142,31 @@ def test_tool_result_carries_tool_name() -> None:
     assert {"List", "Bash"} <= {m.tool_name for m in results}
 
 
-def test_is_user_transcript_entry() -> None:
-    provider = GrokProvider()
-    assert provider.is_user_transcript_entry(
-        {"type": "user", "content": [{"type": "text", "text": "hello"}]}
-    )
-    assert not provider.is_user_transcript_entry(
-        {"type": "user", "content": "x", "synthetic_reason": "setup"}
-    )
-    assert not provider.is_user_transcript_entry(
+def test_only_real_user_turns_become_user_records() -> None:
+    def users(entry: dict) -> list:
+        return [r for r in _records([entry]) if r.role == "user"]
+
+    assert users({"type": "user", "content": [{"type": "text", "text": "hello"}]})
+    assert not users({"type": "user", "content": "x", "synthetic_reason": "setup"})
+    assert not users(
         {"type": "user", "content": [{"type": "text", "text": "<user_info>\nx"}]}
     )
-    assert not provider.is_user_transcript_entry({"type": "assistant", "content": "hi"})
+    assert not users({"type": "assistant", "content": "hi"})
 
 
-def test_parse_history_entry_unwraps_user_query() -> None:
-    provider = GrokProvider()
-    msg = provider.parse_history_entry(
-        {
-            "type": "user",
-            "content": [{"type": "text", "text": "<user_query>\nhi\n</user_query>"}],
-        }
+def test_user_record_unwraps_user_query() -> None:
+    (record,) = _records(
+        [
+            {
+                "type": "user",
+                "content": [
+                    {"type": "text", "text": "<user_query>\nhi\n</user_query>"}
+                ],
+            }
+        ]
     )
-    assert msg is not None
-    assert msg.role == "user"
-    assert msg.text == "hi"
+    assert record.role == "user"
+    assert record.parts == ({"type": "text", "text": "hi"},)
 
 
 # ── cwd encoding + discovery ──────────────────────────────────────────────

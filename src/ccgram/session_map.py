@@ -27,9 +27,9 @@ import os
 import shutil
 import time
 import structlog
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import aiofiles
 
@@ -37,6 +37,7 @@ from .config import config
 from .herdr_targets import is_herdr_session_target
 from .hooks.state_files import StateFileValidationError, parse_session_map_entry
 from .utils import atomic_write_json, log_throttle_reset, log_throttled
+from .multiplexer.base import canonical_window_id
 from .window_resolver import is_window_id, session_map_prefix_for
 
 logger = structlog.get_logger()
@@ -155,6 +156,52 @@ def is_backend_window_id(window_id: str) -> bool:
     return bool(window_id)
 
 
+def _resolve_existing_window_id(window_id: str) -> str:
+    """Reuse the persisted spelling for a case-insensitive window identity."""
+    # Lazy: session_map and thread_router/store are mutually wired at startup.
+    from .thread_router import thread_router
+
+    # Lazy: window_state_store is wired by SessionManager construction.
+    from .window_state_store import is_window_store_wired, window_store
+
+    key = canonical_window_id(window_id)
+    if is_window_store_wired():
+        state_id = next(
+            (
+                wid
+                for wid in window_store.iter_window_ids()
+                if canonical_window_id(wid) == key
+            ),
+            None,
+        )
+        if state_id is not None:
+            return state_id
+    try:
+        return next(
+            (
+                wid
+                for _, _, wid in thread_router.iter_thread_bindings()
+                if wid and canonical_window_id(wid) == key
+            ),
+            window_id,
+        )
+    except RuntimeError:
+        return window_id
+
+
+def _find_session_map_key(raw: Mapping[str, object], window_id: str) -> str | None:
+    prefix = session_map_prefix()
+    expected = f"{prefix}{window_id}"
+    if expected in raw:
+        return expected
+    wanted = canonical_window_id(window_id)
+    for key in raw:
+        candidate = strip_session_map_prefix(key, prefix)
+        if candidate is not None and canonical_window_id(candidate) == wanted:
+            return key
+    return None
+
+
 def _transcript_mtime(transcript_path: str) -> float | None:
     if not transcript_path:
         return None
@@ -222,20 +269,36 @@ def _prefer_existing_primary(
 def effective_session_map_info(
     window_id: str,
     info: dict[str, Any],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     preferred = _prefer_existing_primary(window_id, info)
     if preferred is not None:
         return preferred
-    return {
+    effective: dict[str, Any] = {
         "session_id": info.get("session_id", ""),
         "cwd": info.get("cwd", ""),
         "window_name": info.get("window_name", ""),
         "transcript_path": info.get("transcript_path", ""),
         "provider_name": info.get("provider_name", ""),
     }
+    if info.get("replay_from_start") is True:
+        effective["replay_from_start"] = True
+    return effective
 
 
-def parse_session_map(raw: dict[str, Any], prefix: str) -> dict[str, dict[str, str]]:
+def observed_provider(info: dict[str, Any]) -> str:
+    """Prefer transcript evidence to a possibly stale provider claim."""
+    # Lazy: the provider registry imports session state during initialization.
+    from .providers import detect_provider_from_transcript_path
+
+    path = info.get("transcript_path")
+    inferred = (
+        detect_provider_from_transcript_path(path) if isinstance(path, str) else None
+    )
+    provider = info.get("provider_name")
+    return inferred or (provider.lower() if isinstance(provider, str) else "")
+
+
+def parse_session_map(raw: dict[str, Any], prefix: str) -> dict[str, dict[str, Any]]:
     """Parse session_map.json entries matching a backend prefix.
 
     Returns {window_id: {"session_id": ..., "cwd": ...}} for matching entries,
@@ -248,9 +311,12 @@ def parse_session_map(raw: dict[str, Any], prefix: str) -> dict[str, dict[str, s
     reflects the raw session_map rather than a wiring crash. When wired,
     the result also incorporates the in-memory primary-session preference.
     """
+    # Lazy: identity ports need the SessionManager-installed window store.
+    from .window_state_ports import identity_state
+
     if not isinstance(raw, dict):
         return {}
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, dict[str, Any]] = {}
     for key, info in raw.items():
         if not isinstance(key, str):
             continue
@@ -277,10 +343,55 @@ def parse_session_map(raw: dict[str, Any], prefix: str) -> dict[str, dict[str, s
         except StateFileValidationError as exc:
             logger.debug("Skipping invalid session_map entry %s: %s", key, exc)
             continue
-        effective = effective_session_map_info(window_name, info)
+        resolved_name = _resolve_existing_window_id(window_name)
+        provider_name = observed_provider(info)
+        if not identity_state.accepts_provider_observation(
+            resolved_name, provider_name
+        ):
+            continue
+        effective = effective_session_map_info(resolved_name, info)
+        effective_provider = observed_provider(effective)
+        if effective_provider:
+            effective["provider_name"] = effective_provider
         if effective["session_id"]:
-            result[window_name] = effective
+            result[resolved_name] = effective
     return result
+
+
+def acknowledge_replay_from_start(window_id: str, session_id: str) -> bool:
+    """Consume a replay marker after offset zero is durably reserved."""
+    map_file = config.session_map_file
+    if not map_file.exists():
+        return False
+    lock_path = map_file.with_suffix(".lock")
+    try:
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            try:
+                raw = json.loads(map_file.read_text())
+                if not isinstance(raw, dict):
+                    return False
+                key = f"{session_map_prefix()}{window_id}"
+                info = raw.get(key)
+                if not isinstance(info, dict) or info.get("session_id") != session_id:
+                    return False
+                if info.get("replay_from_start") is not True:
+                    return True
+                info.pop("replay_from_start")
+                atomic_write_json(map_file, raw)
+                logger.debug(
+                    "Consumed replay-from-start marker for session %s", session_id
+                )
+                return True
+            except json.JSONDecodeError, OSError:
+                return False
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+    except OSError as exc:
+        logger.warning(
+            "Failed to lock session_map replay marker for %s: %s", window_id, exc
+        )
+        return False
 
 
 def _read_session_map_for_pruning() -> dict[str, Any] | None:
@@ -296,13 +407,21 @@ def _read_session_map_for_pruning() -> dict[str, Any] | None:
 def _dead_session_map_entries(
     raw: dict[str, Any], live_window_ids: set[str]
 ) -> list[tuple[str, str]]:
+    """Entries whose window is absent from the live listing.
+
+    The comparison folds case on both sides. A key written by the hook and a
+    listing from the backend can spell the same agterm UUID differently, and
+    deleting the entry here loses the session's provider, cwd and transcript
+    path for a session that is still running.
+    """
     prefix = session_map_prefix()
+    live = {canonical_window_id(wid) for wid in live_window_ids}
     return [
         (key, window_id)
         for key in raw
         if key.startswith(prefix)
         and is_backend_window_id(window_id := key[len(prefix) :])
-        and window_id not in live_window_ids
+        and canonical_window_id(window_id) not in live
     ]
 
 
@@ -318,15 +437,19 @@ def _remove_dead_session_map_entries(
     # longer exists" while the directory was sitting there (#176). The dead
     # entry still goes; the state a live topic still points at stays until the
     # topic unbinds and ``_remove_stale_window_states`` reclaims it.
-    bound_wids = thread_router.all_bound_window_ids()
+    bound_lookup = {
+        canonical_window_id(wid) for wid in thread_router.all_bound_window_ids() if wid
+    }
     changed_state = False
     for key, window_id in dead_entries:
         logger.info("Pruning dead session_map entry: %s (window %s)", key, window_id)
         del raw[key]
         log_throttle_reset(f"preserve-primary:{window_id}")
-        if window_id not in bound_wids and window_store.has_window(window_id):
-            window_store.remove_window(window_id)
-            changed_state = True
+        if canonical_window_id(window_id) not in bound_lookup:
+            state_window_id = _resolve_existing_window_id(window_id)
+            if window_store.has_window(state_window_id):
+                window_store.remove_window(state_window_id)
+                changed_state = True
     return changed_state
 
 
@@ -343,6 +466,11 @@ class SessionMapSync:
 
     def __init__(self, *, schedule_save: Callable[[], None]) -> None:
         self._schedule_save: Callable[[], None] = schedule_save
+        self.selection_revision = 0
+
+    def invalidate_selection_snapshots(self) -> None:
+        """Invalidate reads started before an in-process provider selection."""
+        self.selection_revision += 1
 
     # ------------------------------------------------------------------
     # Public: async read/sync methods
@@ -408,6 +536,7 @@ class SessionMapSync:
             # whether the entry passes schema validation.  Validation failures
             # are forward-compat / corruption guards; they must not delete
             # in-memory state for a window that is present in the file.
+            window_id = _resolve_existing_window_id(window_id)
             valid_wids.add(window_id)
             try:
                 # Validation gate — see the identical pattern in parse_session_map()
@@ -417,7 +546,9 @@ class SessionMapSync:
             except StateFileValidationError as exc:
                 logger.debug("Skipping invalid session_map entry %s: %s", key, exc)
                 continue
-            if self._sync_window_from_session_map(window_id, info):
+            if self._sync_window_from_session_map(
+                window_id, info, prefer_existing_primary=True
+            ):
                 changed = True
 
         return valid_wids, old_format_sids, old_format_keys, changed
@@ -445,13 +576,15 @@ class SessionMapSync:
         # leaves this guard dead — sweeping the state of every bound window
         # whose provider has no hook to keep it in the session map.
         bound_wids = {wid for wid in thread_router.all_bound_window_ids() if wid}
+        valid_lookup = {canonical_window_id(wid) for wid in valid_wids}
+        bound_lookup = {canonical_window_id(wid) for wid in bound_wids}
         stale_wids = [
             w
             for w in window_store.iter_window_ids()
             if (
                 w
-                and w not in valid_wids
-                and w not in bound_wids
+                and canonical_window_id(w) not in valid_lookup
+                and canonical_window_id(w) not in bound_lookup
                 and window_store.get_session_id_for_window(w) not in old_format_sids
                 and not window_store.is_archived_legacy_herdr(w)
                 # A window being created is neither in the session map (its
@@ -493,7 +626,12 @@ class SessionMapSync:
     async def wait_for_session_map_entry(
         self,
         window_id: str,
-        timeout: float = 5.0,
+        # Headroom for the hook write, NOT the creation-discovery budget:
+        # this wait starts only after creation has already seen the
+        # session-backed record, so it covers the residual gap between the
+        # agent publishing its session and the SessionStart hook landing in
+        # session_map.json (slow boots measured past the old 5s).
+        timeout: float = 15.0,
         interval: float = 0.5,
         *,
         resolve_window_id: Callable[[str], str] | None = None,
@@ -521,7 +659,6 @@ class SessionMapSync:
         while loop.time() < deadline:
             if resolve_window_id is not None:
                 current_id = resolve_window_id(window_id)
-            key = f"{session_map_prefix()}{current_id}"
             try:
                 if config.session_map_file.exists():
                     async with aiofiles.open(config.session_map_file, "r") as f:
@@ -529,7 +666,8 @@ class SessionMapSync:
                     session_map = json.loads(content)
                     if not isinstance(session_map, dict):
                         raise ValueError("session_map root is not an object")
-                    info = session_map.get(key)
+                    key = _find_session_map_key(session_map, current_id)
+                    info = session_map.get(key) if key is not None else None
                     if isinstance(info, dict):
                         parse_session_map_entry(info)
                         logger.debug(
@@ -743,11 +881,30 @@ class SessionMapSync:
                             )
                     display_name = thread_router.get_display_name(window_id)
                     # Lazy: same session_map ↔ stores cycle as _prefer_existing_primary
-                    from .hooks.state_files import serialize_session_map_entry
-
-                    session_map[window_key] = serialize_session_map_entry(
-                        session_id, cwd, display_name, transcript_path, provider_name
+                    from .hooks.state_files import (
+                        pending_pi_replay_key,
+                        serialize_session_map_entry,
                     )
+
+                    pending_key = pending_pi_replay_key(session_id)
+                    existing = session_map.get(window_key)
+                    replay_from_start = provider_name == "pi" and (
+                        pending_key in session_map
+                        or (
+                            isinstance(existing, dict)
+                            and existing.get("session_id") == session_id
+                            and existing.get("replay_from_start") is True
+                        )
+                    )
+                    session_map[window_key] = serialize_session_map_entry(
+                        session_id,
+                        cwd,
+                        display_name,
+                        transcript_path,
+                        provider_name,
+                        replay_from_start=replay_from_start,
+                    )
+                    session_map.pop(pending_key, None)
                     atomic_write_json(map_file, session_map)
                     logger.info(
                         "Registered hookless session: %s -> session_id=%s, cwd=%s",
@@ -772,9 +929,10 @@ class SessionMapSync:
         raw = await read_session_map_raw()
         if raw is None:
             return True
-        info = raw.get(f"{session_map_prefix()}{window_id}")
-        if info is None:
+        key = _find_session_map_key(raw, window_id)
+        if key is None:
             return False
+        info = raw[key]
         try:
             # The premise is that the monitor will rebuild state from this
             # entry, which only holds for entries load_session_map accepts. One
@@ -786,30 +944,99 @@ class SessionMapSync:
             return False
         return True
 
-    def clear_session_map_entry(self, window_id: str) -> None:
-        """Remove a window's entry from session_map.json if present."""
-        if not config.session_map_file.exists():
-            return
+    def _preserve_destination_provider_entry(
+        self, window_id: str, info: dict[str, Any]
+    ) -> bool:
+        """Load and retain a valid entry written by the destination provider."""
+        try:
+            parse_session_map_entry(info)
+        except StateFileValidationError:
+            return False
+
+        # The provider-switch callback runs after the destination provider is
+        # stored. If SessionStart won the file-lock race, keep and load its
+        # fresh entry instead of deleting the new association.
+        # Lazy: session_map and window_state_store are mutually wired at startup.
+        from .window_state_store import window_store
+
+        state = window_store.window_states.get(window_id)
+        destination = state.provider_name.casefold() if state else ""
+        provider = observed_provider(info)
+        if not destination or provider.casefold() != destination:
+            return False
+        existing_provider = (
+            observed_provider(
+                {
+                    "provider_name": state.provider_name,
+                    "transcript_path": state.transcript_path,
+                }
+            )
+            if state
+            else ""
+        )
+        prefer_existing_primary = bool(
+            state and state.session_id and existing_provider == destination
+        )
+        if self._sync_window_from_session_map(
+            window_id, info, prefer_existing_primary=prefer_existing_primary
+        ):
+            self._schedule_save()
+        logger.debug(
+            "Preserved fresh session_map entry for %s provider %s",
+            window_id,
+            destination,
+        )
+        return True
+
+    def clear_session_map_entry(
+        self, window_id: str
+    ) -> Literal["cleared", "preserved"] | None:
+        """Reconcile the destination entry; None means storage is unconfirmed."""
+        self.invalidate_selection_snapshots()
+        try:
+            config.session_map_file.stat()
+        except FileNotFoundError:
+            return "cleared"
+        except OSError:
+            return None
         lock_path = config.session_map_file.with_suffix(".lock")
         try:
             with open(lock_path, "w") as lock_f:
                 fcntl.flock(lock_f, fcntl.LOCK_EX)
                 try:
-                    raw = json.loads(config.session_map_file.read_text())
-                    key = f"{session_map_prefix()}{window_id}"
-                    if key in raw:
-                        del raw[key]
-                        atomic_write_json(config.session_map_file, raw)
-                        logger.debug("Cleared session_map entry for %s", window_id)
-                except (json.JSONDecodeError, OSError):  # fmt: skip
-                    return
+                    content = config.session_map_file.read_text()
+                except FileNotFoundError:
+                    return "cleared"
+                try:
+                    return self._reconcile_destination_entry(
+                        window_id, json.loads(content)
+                    )
                 finally:
                     fcntl.flock(lock_f, fcntl.LOCK_UN)
-        except OSError as exc:
-            # Lock failure means the entry clear was lost — surface it.
+        except json.JSONDecodeError, OSError:
             logger.warning(
-                "Failed to lock session_map for clearing %s: %s", window_id, exc
+                "Could not reconcile session_map for %s", window_id, exc_info=True
             )
+            return None
+
+    def _reconcile_destination_entry(
+        self, window_id: str, raw: Any
+    ) -> Literal["cleared", "preserved"] | None:
+        """Caller holds the session-map file lock throughout this operation."""
+        if not isinstance(raw, dict):
+            return None
+        key = _find_session_map_key(raw, window_id)
+        if key is None:
+            return "cleared"
+        info = raw.get(key)
+        if isinstance(info, dict) and self._preserve_destination_provider_entry(
+            window_id, info
+        ):
+            return "preserved"
+        del raw[key]
+        atomic_write_json(config.session_map_file, raw)
+        logger.debug("Cleared session_map entry for %s", window_id)
+        return "cleared"
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -819,6 +1046,8 @@ class SessionMapSync:
         self,
         window_id: str,
         info: dict[str, Any],
+        *,
+        prefer_existing_primary: bool = True,
     ) -> bool:
         """Sync a single window's state from session_map entry.
 
@@ -830,7 +1059,18 @@ class SessionMapSync:
         # Lazy: window_state_store / thread_router proxies wired by SessionManager constructor
         from .window_state_store import window_store
 
-        effective = effective_session_map_info(window_id, info)
+        effective = (
+            effective_session_map_info(window_id, info)
+            if prefer_existing_primary
+            else info
+        )
+        # Lazy: identity ports depend on the installed SessionManager store.
+        from .window_state_ports import identity_state
+
+        if not identity_state.accepts_provider_observation(
+            window_id, observed_provider(effective)
+        ):
+            return False
         new_sid = effective["session_id"]
         if not new_sid:
             return False

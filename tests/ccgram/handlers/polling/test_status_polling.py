@@ -10,7 +10,6 @@ from telegram import Bot
 from telegram.error import BadRequest, TelegramError
 
 from ccgram.handlers.topics.topic_lifecycle import (
-    check_autoclose_timers,
     probe_topic_existence,
     prune_stale_state,
     reset_probe_schedule,
@@ -32,8 +31,8 @@ from ccgram.handlers.polling.polling_state import (
 )
 from ccgram.handlers.polling.polling_types import (
     MAX_PROBE_FAILURES,
+    PROBE_SUSPENSION_SECONDS,
     TickContext,
-    is_shell_prompt,
 )
 from ccgram.config import config
 from ccgram.providers.base import StatusUpdate
@@ -68,137 +67,19 @@ def _assert_clear_called_once_with_client(mock_clear, user_id, bot, thread_id):
 
 
 _window_poll_state = terminal_poll_state._states
-_topic_poll_state = lifecycle_strategy._states
 _dead_notified = lifecycle_strategy._dead_notified
 _pane_alert_hashes = interactive_strategy._pane_alert_hashes
-_start_autoclose_timer = lifecycle_strategy.start_autoclose_timer
-
-
-def _has_autoclose(user_id: int, thread_id: int) -> bool:
-    ts = _topic_poll_state.get((user_id, thread_id))
-    return ts is not None and ts.autoclose is not None
 
 
 @pytest.fixture(autouse=True)
 def _reset():
     reset_probe_schedule()
     _window_poll_state.clear()
-    _topic_poll_state.clear()
     _dead_notified.clear()
     yield
     reset_probe_schedule()
     _window_poll_state.clear()
-    _topic_poll_state.clear()
     _dead_notified.clear()
-
-
-class TestAutocloseTimers:
-    @pytest.mark.parametrize(
-        ("state", "minutes", "elapsed"),
-        [("done", 30, 30 * 60 + 1), ("dead", 10, 10 * 60 + 1)],
-        ids=["done", "dead"],
-    )
-    async def test_check_expired(
-        self, state: str, minutes: int, elapsed: float
-    ) -> None:
-        _start_autoclose_timer(1, 42, state, 0.0)
-        bot = AsyncMock(spec=Bot)
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr,
-            patch("ccgram.handlers.topics.topic_lifecycle.time") as mock_time,
-            patch("ccgram.handlers.topics.topic_lifecycle.clear_topic_state"),
-        ):
-            mock_config.autoclose_done_minutes = 30
-            mock_config.autoclose_dead_minutes = minutes
-            mock_time.monotonic.return_value = elapsed
-            mock_tr.resolve_chat_id.return_value = -100
-            await check_autoclose_timers(bot)
-        bot.close_forum_topic.assert_called_once_with(
-            chat_id=-100, message_thread_id=42
-        )
-        bot.delete_forum_topic.assert_not_called()
-        mock_tr.unbind_thread.assert_called_once_with(
-            1, 42, retirement_reason="remote_closed"
-        )
-        assert not _has_autoclose(1, 42)
-
-    async def test_check_not_expired_yet(self) -> None:
-        _start_autoclose_timer(1, 42, "done", 0.0)
-        bot = AsyncMock(spec=Bot)
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topics.topic_lifecycle.time") as mock_time,
-        ):
-            mock_config.autoclose_done_minutes = 30
-            mock_config.autoclose_dead_minutes = 10
-            mock_time.monotonic.return_value = 29 * 60
-            await check_autoclose_timers(bot)
-        bot.close_forum_topic.assert_not_called()
-        assert _has_autoclose(1, 42)
-
-    async def test_check_disabled_when_zero(self) -> None:
-        _start_autoclose_timer(1, 42, "done", 0.0)
-        bot = AsyncMock(spec=Bot)
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topics.topic_lifecycle.time") as mock_time,
-        ):
-            mock_config.autoclose_done_minutes = 0
-            mock_config.autoclose_dead_minutes = 0
-            mock_time.monotonic.return_value = 999999
-            await check_autoclose_timers(bot)
-        bot.close_forum_topic.assert_not_called()
-
-    async def test_check_telegram_error_does_not_clear_timer(self) -> None:
-        """A non-fatal TelegramError leaves the timer so the next cycle retries."""
-        _start_autoclose_timer(1, 42, "done", 0.0)
-        bot = AsyncMock(spec=Bot)
-        bot.close_forum_topic.side_effect = TelegramError("fail")
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr,
-            patch("ccgram.handlers.topics.topic_lifecycle.time") as mock_time,
-        ):
-            mock_config.autoclose_done_minutes = 30
-            mock_config.autoclose_dead_minutes = 10
-            mock_time.monotonic.return_value = 30 * 60 + 1
-            mock_tr.resolve_chat_id.return_value = -100
-            await check_autoclose_timers(bot)
-        # Timer must stay so the next cycle can retry.
-        assert _has_autoclose(1, 42)
-
-    async def test_check_treats_missing_topic_as_removed(self) -> None:
-        """A gone topic is cleaned up whether close_forum_topic says it's gone."""
-        _start_autoclose_timer(1, 42, "done", 0.0)
-        bot = AsyncMock(spec=Bot)
-        bot.close_forum_topic.side_effect = BadRequest("Topic_id_invalid")
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr,
-            patch("ccgram.handlers.topics.topic_lifecycle.time") as mock_time,
-            patch(
-                "ccgram.handlers.topics.topic_lifecycle.clear_topic_state",
-                new_callable=AsyncMock,
-            ) as mock_clear,
-        ):
-            mock_config.autoclose_done_minutes = 30
-            mock_config.autoclose_dead_minutes = 10
-            mock_time.monotonic.return_value = 30 * 60 + 1
-            mock_tr.resolve_chat_id.return_value = -100
-            mock_tr.get_window_for_thread.return_value = "@0"
-
-            await check_autoclose_timers(bot)
-
-        bot.close_forum_topic.assert_called_once_with(
-            chat_id=-100, message_thread_id=42
-        )
-        bot.delete_forum_topic.assert_not_called()
-        mock_tr.unbind_thread.assert_called_once_with(
-            1, 42, retirement_reason="remote_closed"
-        )
-        mock_clear.assert_awaited_once()
-        assert not _has_autoclose(1, 42)
 
 
 class TestTranscriptActivityHeuristic:
@@ -554,7 +435,6 @@ class TestQuietStartupSettlement:
 
         runtime = PollingRuntime.create()
         runtime.poll_state.begin_startup_timer("@0", time.monotonic() - 31.0)
-        runtime.lifecycle.start_autoclose_timer(1, 42, "done", 0.0)
         runtime.lifecycle.record_typing_sent(1, 42)
         bot = AsyncMock(spec=Bot)
 
@@ -588,7 +468,6 @@ class TestQuietStartupSettlement:
         assert state.startup_time is None
         assert state.has_seen_status is False
         assert state.startup_quietly_settled is True
-        assert runtime.lifecycle.get_state(1, 42).autoclose is None
         assert runtime.lifecycle.get_state(1, 42).last_typing_sent is None
         mock_emoji.assert_awaited_once()
         mock_enqueue.assert_not_awaited()
@@ -711,8 +590,57 @@ class TestProbeFailures:
         bot = AsyncMock(spec=Bot)
         with patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr:
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
         bot.unpin_all_forum_topic_messages.assert_not_called()
+
+    async def test_probe_retries_after_suspension_expires(self) -> None:
+        from ccgram.handlers.topics import topic_lifecycle as tl
+
+        ws = terminal_poll_state.get_state("@5")
+        ws.probe_failures = MAX_PROBE_FAILURES
+        ws.probe_suspended_at = 100.0
+        bot = AsyncMock(spec=Bot)
+        with (
+            patch.object(tl, "thread_router") as mock_tr,
+            patch.object(
+                tl.time,
+                "monotonic",
+                return_value=100.0 + PROBE_SUSPENSION_SECONDS - 0.1,
+            ),
+            patch(
+                "ccgram.handlers.polling.polling_state.time.monotonic",
+                return_value=100.0 + PROBE_SUSPENSION_SECONDS - 0.1,
+            ),
+        ):
+            mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
+            mock_tr.resolve_chat_id.return_value = -100
+            await probe_topic_existence(bot, MagicMock())
+
+        bot.unpin_all_forum_topic_messages.assert_not_called()
+
+        with (
+            patch.object(tl, "thread_router") as mock_tr,
+            patch.object(
+                tl.time,
+                "monotonic",
+                return_value=100.0 + PROBE_SUSPENSION_SECONDS,
+            ),
+            patch(
+                "ccgram.handlers.polling.polling_state.time.monotonic",
+                return_value=100.0 + PROBE_SUSPENSION_SECONDS,
+            ),
+        ):
+            mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
+            mock_tr.resolve_chat_id.return_value = -100
+            await probe_topic_existence(bot, MagicMock())
+
+        bot.unpin_all_forum_topic_messages.assert_awaited_once_with(
+            chat_id=-100,
+            message_thread_id=42,
+            rate_limit_args=NO_RETRY_RATE_LIMIT_ARGS,
+        )
+        assert ws.probe_failures == 0
+        assert ws.probe_suspended_at is None
 
     async def test_probe_success_resets_counter(self) -> None:
         terminal_poll_state.get_state("@5").probe_failures = 2
@@ -720,7 +648,7 @@ class TestProbeFailures:
         with patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr:
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
         assert (
             _window_poll_state.get("@5") is None
             or _window_poll_state["@5"].probe_failures == 0
@@ -744,7 +672,7 @@ class TestProbeFailures:
         with patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr:
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
         assert _window_poll_state["@5"].probe_failures == 1
 
     async def test_probe_suspends_after_max_failures(self) -> None:
@@ -756,7 +684,7 @@ class TestProbeFailures:
             for _ in range(MAX_PROBE_FAILURES + 1):
                 # Stands in for PROBE_INTERVAL elapsing between poll cycles.
                 reset_probe_schedule()
-                await probe_topic_existence(bot)
+                await probe_topic_existence(bot, MagicMock())
         assert bot.unpin_all_forum_topic_messages.call_count == MAX_PROBE_FAILURES
         assert _window_poll_state["@5"].probe_failures == MAX_PROBE_FAILURES
 
@@ -787,7 +715,7 @@ class TestProbeFailures:
                 return_value=mock_window if window_alive else None
             )
             mock_tm.kill_window = AsyncMock()
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
         mock_tm.kill_window.assert_not_called()
         mock_cleanup.assert_called_once_with(1, 42, bot, window_id="@5", chat_id=-100)
         mock_tr.unbind_thread.assert_called_once_with(
@@ -861,7 +789,11 @@ class TestProviderSwitchPromptSetup:
                 return_value=MagicMock(pane_current_command=pane_command, cwd="/proj")
             )
             exited = await discover_and_register_transcript(
-                "@7", client=bot, user_id=1, thread_id=42
+                "@7",
+                client=bot,
+                user_id=1,
+                thread_id=42,
+                adapter=MagicMock(),
             )
 
         assert exited is True
@@ -911,7 +843,11 @@ class TestProviderSwitchPromptSetup:
                 return_value=MagicMock(pane_current_command="claude", cwd="/proj")
             )
             await discover_and_register_transcript(
-                "@7", client=bot, user_id=1, thread_id=42
+                "@7",
+                client=bot,
+                user_id=1,
+                thread_id=42,
+                adapter=MagicMock(),
             )
 
         mock_ensure.assert_not_awaited()
@@ -957,7 +893,11 @@ class TestProviderSwitchPromptSetup:
             mock_tmux.get_pane_title = AsyncMock(return_value="")
             mock_config.return_value = "ccgram:"
             await discover_and_register_transcript(
-                "@7", client=bot, user_id=1, thread_id=42
+                "@7",
+                client=bot,
+                user_id=1,
+                thread_id=42,
+                adapter=MagicMock(),
             )
 
         mock_sm.set_window_provider.assert_called_once_with("@7", "shell")
@@ -1007,7 +947,7 @@ class TestProviderSwitchPromptSetup:
             )
             mock_tmux.get_pane_title = AsyncMock(return_value="")
             mock_config.return_value = "ccgram:"
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_ensure.assert_awaited_once()
         assert mock_ensure.call_args[0] == ("@7", "provider_switch")
@@ -1103,7 +1043,11 @@ class TestProviderSwitchChain:
                 )
             )
             await discover_and_register_transcript(
-                "@7", client=bot, user_id=1, thread_id=42
+                "@7",
+                client=bot,
+                user_id=1,
+                thread_id=42,
+                adapter=MagicMock(),
             )
             assert state.provider_name == "shell"
             assert state.transcript_path == ""
@@ -1121,7 +1065,11 @@ class TestProviderSwitchChain:
                 )
             )
             await discover_and_register_transcript(
-                "@7", client=bot, user_id=1, thread_id=42
+                "@7",
+                client=bot,
+                user_id=1,
+                thread_id=42,
+                adapter=MagicMock(),
             )
             assert state.provider_name == "gemini"
             mock_clear_capture.assert_called_once_with("@7")
@@ -1137,7 +1085,11 @@ class TestProviderSwitchChain:
                 )
             )
             await discover_and_register_transcript(
-                "@7", client=bot, user_id=1, thread_id=42
+                "@7",
+                client=bot,
+                user_id=1,
+                thread_id=42,
+                adapter=MagicMock(),
             )
             assert state.provider_name == "shell"
             assert state.transcript_path == ""
@@ -1193,7 +1145,7 @@ class TestMaybeDiscoverTranscript:
             )
             mock_tmux.get_pane_title = AsyncMock(return_value="")
             mock_config.return_value = "ccgram:"
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_sm.register_hookless_session.assert_not_called()
         mock_sm.write_hookless_session_map.assert_not_called()
@@ -1211,10 +1163,14 @@ class TestMaybeDiscoverTranscript:
             patch(
                 "ccgram.handlers.recovery.transcript_discovery.tmux_manager"
             ) as mock_tmux,
+            patch(
+                "ccgram.handlers.shell.shell_prompt_orchestrator.ensure_setup",
+                new_callable=AsyncMock,
+            ),
         ):
             mock_ws.window_states = {"@7": MagicMock(session_id="", cwd="")}
             mock_tmux.find_window_by_id = AsyncMock(return_value=None)
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
         mock_sm.register_hookless_session.assert_not_called()
 
     async def test_falls_back_to_tmux_cwd_when_state_cwd_empty(self) -> None:
@@ -1261,7 +1217,7 @@ class TestMaybeDiscoverTranscript:
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.get_pane_title = AsyncMock(return_value="")
             mock_config.return_value = "ccgram:"
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_sm.set_window_provider.assert_called_once_with(
             "@7", "codex", cwd="/my/project"
@@ -1288,7 +1244,7 @@ class TestMaybeDiscoverTranscript:
             mock_ws.window_states = {
                 "@7": MagicMock(session_id="", cwd="/proj", provider_name="claude")
             }
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
         mock_sm.register_hookless_session.assert_not_called()
 
     async def test_skips_when_window_not_tracked(self) -> None:
@@ -1303,7 +1259,7 @@ class TestMaybeDiscoverTranscript:
             patch("ccgram.window_state_ports.identity_state.window_store") as mock_ws,  # noqa: F841
         ):
             mock_ws.window_states = {}
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
         mock_sm.register_hookless_session.assert_not_called()
 
     async def test_registers_when_transcript_found(self) -> None:
@@ -1342,6 +1298,10 @@ class TestMaybeDiscoverTranscript:
             patch(
                 "ccgram.handlers.recovery.transcript_discovery.tmux_manager"
             ) as mock_tmux,
+            patch(
+                "ccgram.handlers.shell.shell_prompt_orchestrator.ensure_setup",
+                new_callable=AsyncMock,
+            ),
         ):
             mock_ws.window_states = {
                 "@7": MagicMock(session_id="", cwd="/my/project", provider_name="codex")
@@ -1350,7 +1310,7 @@ class TestMaybeDiscoverTranscript:
             mock_window = MagicMock(pane_current_command="bun")
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.get_pane_title = AsyncMock(return_value="")
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_sms.register_hookless_session.assert_called_once_with(
             window_id="@7",
@@ -1426,7 +1386,7 @@ class TestMaybeDiscoverTranscript:
                 return_value=MagicMock(pane_current_command="bun")
             )
             mock_tmux.get_pane_title = AsyncMock(return_value="")
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_sms.register_hookless_session.assert_not_called()
         mock_sms.write_hookless_session_map.assert_not_called()
@@ -1481,7 +1441,7 @@ class TestMaybeDiscoverTranscript:
                 return_value=MagicMock(pane_current_command="bun")
             )
             mock_tmux.get_pane_title = AsyncMock(return_value="")
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_sms.register_hookless_session.assert_called_once_with(
             window_id="@7",
@@ -1525,7 +1485,7 @@ class TestMaybeDiscoverTranscript:
                 return_value=MagicMock(pane_current_command="bun")
             )
             mock_tmux.get_pane_title = AsyncMock(return_value="")
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_sm.register_hookless_session.assert_not_called()
         mock_sm.write_hookless_session_map.assert_not_called()
@@ -1578,7 +1538,7 @@ class TestMaybeDiscoverTranscript:
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.get_pane_title = AsyncMock(return_value="")
             mock_asyncio.to_thread = AsyncMock(side_effect=[event, None])
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         assert mock_asyncio.to_thread.call_count == 2
         discover_call = mock_asyncio.to_thread.call_args_list[0]
@@ -1650,7 +1610,7 @@ class TestMaybeDiscoverTranscript:
             mock_config.return_value = "ccgram:"
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.get_pane_title = AsyncMock(return_value="")
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_sms.register_hookless_session.assert_called_once_with(
             window_id="@7",
@@ -1735,7 +1695,7 @@ class TestMaybeDiscoverTranscript:
                 return_value=MagicMock(pane_current_command="bun")
             )
             mock_tmux.get_pane_title = AsyncMock(return_value="")
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_codex.discover_transcript.assert_called_once()
         mock_gemini.discover_transcript.assert_called_once()
@@ -1762,12 +1722,16 @@ class TestMaybeDiscoverTranscript:
             patch(
                 "ccgram.handlers.recovery.transcript_discovery.tmux_manager"
             ) as mock_tmux,
+            patch(
+                "ccgram.handlers.shell.shell_prompt_orchestrator.ensure_setup",
+                new_callable=AsyncMock,
+            ),
         ):
             mock_ws.window_states = {
                 "@7": MagicMock(session_id="", cwd="/proj", provider_name="")
             }
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_sm.register_hookless_session.assert_not_called()
 
@@ -1810,7 +1774,7 @@ class TestMaybeDiscoverTranscript:
             )
             mock_tmux.get_pane_title = AsyncMock(return_value="")
             mock_asyncio.to_thread = AsyncMock(return_value=None)
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         discover_call = mock_asyncio.to_thread.call_args_list[0]
         assert discover_call.args[0] == mock_provider.discover_transcript
@@ -1852,7 +1816,7 @@ class TestMaybeDiscoverTranscript:
             mock_config.return_value = "ccgram:"
             mock_tmux.find_window_by_id = AsyncMock(return_value=None)
             mock_asyncio.to_thread = AsyncMock(return_value=None)
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         discover_call = mock_asyncio.to_thread.call_args_list[0]
         assert discover_call.args[0] == mock_provider.discover_transcript
@@ -1923,6 +1887,7 @@ class TestMaybeDiscoverTranscript:
                         pane_tty="/dev/ttys007",
                         cwd="/proj",
                     ),
+                    adapter=MagicMock(),
                 )
         finally:
             _pgid_cache.clear()
@@ -2002,6 +1967,7 @@ class TestMaybeDiscoverTranscript:
                         pane_tty="/dev/ttys007",
                         cwd="/proj",
                     ),
+                    adapter=MagicMock(),
                 )
         finally:
             _pgid_cache.clear()
@@ -2087,7 +2053,7 @@ class TestMaybeDiscoverTranscript:
             )
             mock_tmux.get_pane_title = AsyncMock(return_value="◇  Ready (ccgram)")
             mock_config.return_value = "ccgram:"
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_codex.discover_transcript.assert_not_called()
         mock_gemini.discover_transcript.assert_called_once()
@@ -2185,7 +2151,7 @@ class TestMaybeDiscoverTranscript:
                 )
             )
             mock_config.return_value = "ccgram:"
-            await discover_and_register_transcript("@7")
+            await discover_and_register_transcript("@7", adapter=MagicMock())
 
         mock_sm.set_window_provider.assert_called_once_with(
             "@7",
@@ -2203,12 +2169,19 @@ class TestMaybeDiscoverTranscript:
 
 
 class TestDeadWindowNotification:
-    async def test_quiet_by_default_skips_banner(self) -> None:
-        """CCGRAM-HOTFIX:quiet-dead-banner — no unsolicited "Session … ended."."""
+    async def test_retained_topic_quiet_by_default(self) -> None:
+        """CCGRAM-HOTFIX:quiet-dead-banner — a retained (hibernated) topic gets
+        the 💀 emoji and no unsolicited "Session … ended." banner."""
         bot = AsyncMock(spec=Bot)
         with (
-            patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_sm,
             patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(config, "autodelete_dead_topics", False),
+            patch.object(config, "dead_banner_notify", False),
             patch(
                 "ccgram.handlers.polling.window_tick.apply.rate_limit_send_message",
                 new_callable=AsyncMock,
@@ -2218,109 +2191,79 @@ class TestDeadWindowNotification:
                 new_callable=AsyncMock,
             ) as mock_emoji,
         ):
+            mock_tr.iter_thread_bindings_with_chat.return_value = [(1, -100, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
             mock_tr.get_display_name.return_value = "test"
-            mock_sm.view_window.return_value = MagicMock(cwd="/proj")
             await _handle_dead_window_notification(bot, 1, 42, "@5")
 
         mock_send.assert_not_called()
-        # the silent part of the transition still runs
         mock_emoji.assert_awaited_once()
-        bot.unpin_all_forum_topic_messages.assert_awaited_once()
+        assert mock_emoji.await_args.args[3] == "dead"
+        # retained: the marker stays sticky so the topic is not re-probed
         assert (1, 42, "@5") in _dead_notified
 
-    async def test_quiet_probe_unbinds_deleted_topic(self) -> None:
-        """The skipped send doubled as a probe; the probe still detects deletion."""
+    async def test_retained_topic_banner_when_opted_in(self, tmp_path) -> None:
+        """CCGRAM_DEAD_BANNER=1 brings the recovery banner back."""
         bot = AsyncMock(spec=Bot)
-        bot.unpin_all_forum_topic_messages.side_effect = BadRequest(
-            "Message thread not found"
-        )
         with (
-            patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_sm,
             patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
+            patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_wq,
             patch(
-                "ccgram.handlers.polling.window_tick.apply.update_topic_emoji",
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
                 new_callable=AsyncMock,
+                return_value=False,
             ),
-            patch(
-                "ccgram.handlers.polling.window_tick.apply.clear_topic_state",
-                new_callable=AsyncMock,
-            ) as mock_cleanup,
-        ):
-            mock_tr.resolve_chat_id.return_value = -100
-            mock_tr.get_display_name.return_value = "test"
-            mock_sm.view_window.return_value = MagicMock(cwd="/proj")
-            await _handle_dead_window_notification(bot, 1, 42, "@5")
-
-        mock_cleanup.assert_awaited_once()
-        mock_tr.unbind_thread.assert_called_once_with(
-            1, 42, retirement_reason="remote_deleted"
-        )
-
-    async def test_marks_notified_even_when_send_fails(self) -> None:
-        bot = AsyncMock(spec=Bot)
-        with (
+            patch.object(config, "autodelete_dead_topics", False),
             patch.object(config, "dead_banner_notify", True),
-            patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_sm,
-            patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
             patch(
                 "ccgram.handlers.polling.window_tick.apply.rate_limit_send_message",
                 new_callable=AsyncMock,
-                return_value=None,
-            ),
-            patch(
-                "ccgram.handlers.polling.window_tick.apply.update_topic_emoji",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "ccgram.handlers.polling.window_tick.apply.render_banner",
-                return_value=("⚠ Session ended", None),
-            ),
-            patch(
-                "ccgram.handlers.polling.window_tick.apply.asyncio.to_thread",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
-        ):
-            mock_tr.resolve_chat_id.return_value = -100
-            mock_tr.get_display_name.return_value = "test"
-            mock_sm.view_window.return_value = MagicMock(cwd="/proj")
-            await _handle_dead_window_notification(bot, 1, 42, "@5")
-
-        assert (1, 42, "@5") in _dead_notified
-
-    async def test_no_retry_after_failed_send(self) -> None:
-        bot = AsyncMock(spec=Bot)
-        with (
-            patch.object(config, "dead_banner_notify", True),
-            patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_sm,
-            patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
-            patch(
-                "ccgram.handlers.polling.window_tick.apply.rate_limit_send_message",
-                new_callable=AsyncMock,
-                return_value=None,
             ) as mock_send,
             patch(
                 "ccgram.handlers.polling.window_tick.apply.update_topic_emoji",
                 new_callable=AsyncMock,
             ),
-            patch(
-                "ccgram.handlers.polling.window_tick.apply.render_banner",
-                return_value=("⚠ Session ended", None),
-            ),
-            patch(
-                "ccgram.handlers.polling.window_tick.apply.asyncio.to_thread",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
         ):
+            mock_tr.iter_thread_bindings_with_chat.return_value = [(1, -100, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
             mock_tr.get_display_name.return_value = "test"
-            mock_sm.view_window.return_value = MagicMock(cwd="/proj")
-            await _handle_dead_window_notification(bot, 1, 42, "@5")
+            mock_wq.view_window.return_value = MagicMock(cwd=str(tmp_path))
+            mock_wq.get_window_provider.return_value = "claude"
             await _handle_dead_window_notification(bot, 1, 42, "@5")
 
-        mock_send.assert_called_once()
+        mock_send.assert_awaited_once()
+        assert mock_send.await_args.kwargs["reply_markup"] is not None
+
+    async def test_unknown_presence_clears_provisional_notification(self) -> None:
+        bot = AsyncMock(spec=Bot)
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            mock_tr.iter_thread_bindings_with_chat.return_value = [(1, -100, 42, "@5")]
+            await _handle_dead_window_notification(bot, 1, 42, "@5")
+
+        assert (1, 42, "@5") not in _dead_notified
+
+    async def test_present_window_does_not_reopen_topic(self) -> None:
+        bot = AsyncMock(spec=Bot)
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as presence,
+        ):
+            mock_tr.iter_thread_bindings_with_chat.return_value = [(1, -100, 42, "@5")]
+            await _handle_dead_window_notification(bot, 1, 42, "@5")
+
+        presence.assert_awaited_once()
+        assert (1, 42, "@5") not in _dead_notified
 
     @pytest.mark.parametrize(
         "error_msg",
@@ -2347,7 +2290,7 @@ class TestDeadWindowNotification:
             mock_tr.resolve_chat_id.return_value = -100
             mock_tm.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tm.kill_window = AsyncMock()
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
 
         mock_tm.kill_window.assert_not_called()
         mock_cleanup.assert_called_once_with(1, 42, bot, window_id="@5", chat_id=-100)
@@ -2515,7 +2458,9 @@ class TestUpdateStatusMessage:
         bot = AsyncMock(spec=Bot)
         with _tick_env(window=None) as env:
             await _update_status(bot, 1, "@0", thread_id=42)
-        env.enqueue.assert_called_once_with(ANY, 1, "@0", None, thread_id=42)
+        env.enqueue.assert_called_once_with(
+            ANY, 1, "@0", None, thread_id=42, transient=True
+        )
 
     async def test_empty_capture_keeps_existing_status(self) -> None:
         bot = AsyncMock(spec=Bot)

@@ -280,9 +280,9 @@ async def probe_topic(bot: Any, thread_id: int) -> dict[str, Any]:
     """
     # Lazy: probe + teardown live in the topics handler layer.
     from ..handlers.topics.topic_lifecycle import _unbind_deleted_topic
-    from ..handlers.topics.topic_probe import probe_topic_exists
+    from ..handlers.topics.topic_probe import probe_topic_exists_by_send
     from ..telegram_client import PTBTelegramClient
-    from .service import _owner_user_id, find_binding
+    from .service import _adapter, _owner_user_id, find_binding
 
     binding = find_binding(thread_id)
     if binding.web_only or not binding.chat_id:
@@ -292,11 +292,16 @@ async def probe_topic(bot: Any, thread_id: int) -> dict[str, Any]:
         return {"exists": None, "cached": True}
     _probed_at[thread_id] = now
     client = PTBTelegramClient(bot)
-    exists = await probe_topic_exists(client, binding.chat_id, thread_id)
+    exists = await probe_topic_exists_by_send(client, binding.chat_id, thread_id)
     if exists is False:
         logger.info("webui probe: topic %d is gone, detaching", thread_id)
         await _unbind_deleted_topic(
-            client, _owner_user_id(), binding.chat_id, thread_id, binding.window_id
+            client,
+            _owner_user_id(),
+            binding.chat_id,
+            thread_id,
+            binding.window_id,
+            _adapter(),
         )
     return {"exists": exists}
 
@@ -611,7 +616,7 @@ def valid_cwd(path: str | None) -> str | None:
 async def make_worktree(repo: str, title: str) -> str:
     """New git worktree next to ``repo`` (ccgram's naming); returns its path."""
     # Lazy: worktree helpers shell out to git.
-    from ..handlers.topics import worktree as wt
+    from .. import worktrees as wt
     from .service import WebUIError
 
     repo_path = valid_cwd(repo)

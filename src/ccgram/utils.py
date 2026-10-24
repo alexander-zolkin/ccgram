@@ -7,7 +7,7 @@ Provides:
   - read_cwd_from_jsonl(): extract the cwd field from the first JSONL entry.
   - read_session_metadata_from_jsonl(): single-pass extraction of (cwd, summary).
   - task_done_callback(): log unhandled exceptions from background asyncio tasks.
-  - log_throttled(): suppress repeated identical debug messages per key.
+  - log_throttled(): suppress repeated identical messages per key.
   - detect_tmux_context(): auto-detect tmux session name and own window ID.
   - check_duplicate_ccgram(): check if another ccgram is running in the session.
   - is_general_topic(): check if a message is in the General (default) forum topic.
@@ -23,7 +23,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from telegram import Bot, Message
@@ -42,9 +42,10 @@ def log_throttled(
     msg: str,
     *args: object,
     cooldown: float = 300.0,
+    level: Literal["debug", "info", "warning", "error"] = "debug",
     _clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Log at debug level, suppressing repeated identical messages per key.
+    """Log at *level* (debug by default), suppressing repeated messages per key.
 
     First occurrence always logs. Subsequent calls with the same *key* and
     identical formatted message are suppressed until *cooldown* seconds elapse.
@@ -61,7 +62,7 @@ def log_throttled(
     if prev and prev[1] == formatted and (now - prev[0]) < cooldown:
         return
     _throttle_state[key] = (now, formatted)
-    log.debug(msg, *args)
+    getattr(log, level)(msg, *args)
 
 
 def log_throttle_reset(prefix: str) -> None:
@@ -377,17 +378,25 @@ def is_general_topic(message: Message) -> bool:
 async def handle_general_topic_message(
     bot: Bot, message: Message, chat_id: int
 ) -> None:
-    """Handle messages in General topic: pin hint once, then react only.
-
-    On first General-topic message per chat, sends a warning and pins it.
-    Subsequent messages get a silent 🤔 reaction instead.
-    """
+    """Pin the General command panel once; react silently to later messages."""
     # Check cache first to avoid unnecessary API calls
     if not _general_topic_pin_cache.get(chat_id):
         try:
             chat_info = await bot.get_chat(chat_id)
             pinned = chat_info.pinned_message
-            if pinned and pinned.from_user and pinned.from_user.id == bot.id:
+            if (
+                pinned
+                and pinned.from_user
+                and pinned.from_user.id == bot.id
+                and pinned.message_thread_id in (None, 1)
+                and pinned.reply_markup
+                and any(
+                    isinstance(button.callback_data, str)
+                    and button.callback_data.startswith("cmdpanel:")
+                    for row in pinned.reply_markup.inline_keyboard
+                    for button in row
+                )
+            ):
                 _general_topic_pin_cache[chat_id] = True
         except TelegramError:
             pass
@@ -400,9 +409,29 @@ async def handle_general_topic_message(
         # Set cache before attempt to guarantee one-shot behavior even if pin fails
         _general_topic_pin_cache[chat_id] = True
         try:
-            hint = await message.reply_text(
-                "🤖 Please use a named topic. Create a new topic to start a session."
-            )
-            await hint.pin(disable_notification=True)
+            user = message.from_user
+            if user is not None:
+                # Lazy: the panel imports the callback registry and this utility module.
+                from .handlers.commands.panel import send_command_panel
+
+                pinned = None
+                try:
+                    chat_info = await bot.get_chat(chat_id)
+                    pinned = chat_info.pinned_message
+                except TelegramError:
+                    pass
+                replace_message = (
+                    pinned
+                    if pinned
+                    and pinned.from_user
+                    and pinned.from_user.id == bot.id
+                    and "named topic" in (pinned.text or "").lower()
+                    else None
+                )
+                if pinned and pinned.from_user and pinned.from_user.id == bot.id:
+                    _general_topic_pin_cache[chat_id] = True
+                await send_command_panel(
+                    message, user.id, replace_message=replace_message
+                )
         except TelegramError:
             pass

@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from ccgram.config import Config
+from ccgram.config import (
+    Config,
+    _delivery_watch_gap_bytes,
+    _skip_barrier_deadline_s,
+)
 
 
 @pytest.fixture
@@ -18,6 +22,7 @@ class TestConfigValid:
         cfg = Config()
         assert cfg.telegram_bot_token == "test:token"
         assert cfg.allowed_users == {12345}
+        assert cfg.unbound_window_ttl_minutes == 30
 
     def test_custom_tmux_session_name(self, monkeypatch):
         monkeypatch.setenv("TMUX_SESSION_NAME", "mysession")
@@ -28,6 +33,15 @@ class TestConfigValid:
         monkeypatch.setenv("MONITOR_POLL_INTERVAL", "5.0")
         cfg = Config()
         assert cfg.monitor_poll_interval == 5.0
+
+    def test_yolo_confirmation_timeout_default_and_override(self, monkeypatch):
+        assert Config().yolo_confirmation_timeout == 30.0
+        monkeypatch.setenv("CCGRAM_YOLO_CONFIRMATION_TIMEOUT", "45.5")
+        assert Config().yolo_confirmation_timeout == 45.5
+
+    def test_yolo_confirmation_timeout_clamps_to_one(self, monkeypatch):
+        monkeypatch.setenv("CCGRAM_YOLO_CONFIRMATION_TIMEOUT", "0")
+        assert Config().yolo_confirmation_timeout == 1.0
 
     def test_is_user_allowed_true(self):
         cfg = Config()
@@ -109,6 +123,28 @@ class TestShowHiddenDirs:
         monkeypatch.setenv("CCGRAM_SHOW_HIDDEN_DIRS", value)
         cfg = Config()
         assert cfg.show_hidden_dirs is True
+
+
+@pytest.mark.usefixtures("_base_env")
+class TestAutodeleteDeadTopics:
+    def test_autodelete_dead_topics_default_false(self, monkeypatch):
+        # CCGRAM-HOTFIX:autoresume — the fork keeps dead (hibernated) topics
+        # by default; upstream deletes them.
+        monkeypatch.delenv("CCGRAM_AUTODELETE_DEAD_TOPICS", raising=False)
+        cfg = Config()
+        assert cfg.autodelete_dead_topics is False
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "False", "OFF"])
+    def test_autodelete_dead_topics_disabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_AUTODELETE_DEAD_TOPICS", value)
+        cfg = Config()
+        assert cfg.autodelete_dead_topics is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "True", "anything-else"])
+    def test_autodelete_dead_topics_enabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_AUTODELETE_DEAD_TOPICS", value)
+        cfg = Config()
+        assert cfg.autodelete_dead_topics is True
 
 
 @pytest.mark.usefixtures("_base_env")
@@ -271,3 +307,41 @@ class TestPollingConfig:
         assert getattr(Config(), attr) == expected
         monkeypatch.setenv(env_var, clamp_str)
         assert getattr(Config(), attr) == clamped
+
+
+class TestSkipBarrierDeadline:
+    def test_default_when_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv("CCGRAM_SKIP_BARRIER_DEADLINE_S", raising=False)
+        assert _skip_barrier_deadline_s() == 600.0
+
+    def test_override_honored_above_floor(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_SKIP_BARRIER_DEADLINE_S", "1200")
+        assert _skip_barrier_deadline_s() == 1200.0
+
+    @pytest.mark.parametrize("raw", ["", "abc", "10m", "inf", "-inf", "nan"])
+    def test_invalid_values_fall_back(self, monkeypatch, raw) -> None:
+        monkeypatch.setenv("CCGRAM_SKIP_BARRIER_DEADLINE_S", raw)
+        assert _skip_barrier_deadline_s() == 600.0
+
+    def test_below_floor_clamped(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_SKIP_BARRIER_DEADLINE_S", "5")
+        assert _skip_barrier_deadline_s() == 60.0
+
+
+class TestDeliveryWatchGap:
+    def test_default_when_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv("CCGRAM_DELIVERY_WATCH_GAP_KB", raising=False)
+        assert _delivery_watch_gap_bytes() == 256 * 1024
+
+    def test_override_honored(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_DELIVERY_WATCH_GAP_KB", "64")
+        assert _delivery_watch_gap_bytes() == 64 * 1024
+
+    def test_zero_disables(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_DELIVERY_WATCH_GAP_KB", "0")
+        assert _delivery_watch_gap_bytes() == 0
+
+    @pytest.mark.parametrize("raw", ["", "abc", "10mb", "inf", "nan", "1e308"])
+    def test_invalid_values_fall_back(self, monkeypatch, raw) -> None:
+        monkeypatch.setenv("CCGRAM_DELIVERY_WATCH_GAP_KB", raw)
+        assert _delivery_watch_gap_bytes() == 256 * 1024

@@ -5,7 +5,9 @@ ships Claude-compatible lifecycle hooks, a structured JSONL transcript, and
 ``--resume`` / ``--continue`` recovery — so it maps cleanly onto ccgram's
 existing provider machinery.
 
-Message relay reads ``chat_history.jsonl`` incrementally (see ``grok_format``);
+Message relay reads the whole ``chat_history.jsonl`` and diffs it by entry
+index (``read_transcript_file``); the lines are interpreted by the shared
+protocol parser (``session_protocol.messages``, using ``grok_format``'s rules);
 idle/working transitions come from the installed hooks (SessionStart / Stop /
 …).  Discovery under ``$GROK_HOME/sessions`` (see ``grok_discovery``) is the
 fallback when a session is adopted without a hook firing first.
@@ -17,13 +19,13 @@ switching goes through the ``/model`` builtin.
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
 from ccgram.providers._jsonl import JsonlProvider
 from ccgram.providers.base import (
     RESUME_ID_RE,
-    AgentMessage,
     DiscoveredCommand,
     ProviderCapabilities,
     SessionStartEvent,
@@ -33,12 +35,6 @@ from ccgram.providers.grok_discovery import (
     GROK_TUI_PICKERS,
     discover_grok_commands,
     discover_session_for_cwd,
-)
-from ccgram.providers.grok_format import (
-    Pending,
-    extract_text,
-    normalize_pending,
-    parse_chat_entry,
 )
 
 # Cap transcript age when adopting a dead pane — guards against binding an
@@ -89,15 +85,17 @@ class GrokProvider(JsonlProvider):
         uses ``errors="replace"`` so a transient partial write never crashes the
         poll loop. Returns ``(new_entries, total_entry_count)``.
         """
-        # Lazy: parse_jsonl_line lives in the shared JSONL helpers.
-        from ccgram.providers._jsonl import parse_jsonl_line
-
         entries: list[dict[str, Any]] = []
         try:
             with open(file_path, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    parsed = parse_jsonl_line(line)
-                    if parsed is not None:
+                    if not line.strip():
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(parsed, dict):
                         entries.append(parsed)
         except OSError:
             return [], last_offset
@@ -126,66 +124,8 @@ class GrokProvider(JsonlProvider):
             return "--continue"
         return ""
 
-    # ── Transcript parsing ───────────────────────────────────────────────
-
-    def parse_transcript_entries(
-        self,
-        entries: list[dict[str, Any]],
-        pending_tools: dict[str, Any],
-        cwd: str | None = None,  # noqa: ARG002 — kept for protocol compat
-    ) -> tuple[list[AgentMessage], dict[str, Any]]:
-        messages: list[AgentMessage] = []
-        pending: Pending = normalize_pending(pending_tools)
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            timestamp = entry.get("timestamp")
-            batch, pending = parse_chat_entry(
-                entry, pending, timestamp if isinstance(timestamp, str) else None
-            )
-            messages.extend(batch)
-        return messages, dict(pending)
-
-    def is_user_transcript_entry(self, entry: dict[str, Any]) -> bool:
-        """A human turn is a ``user`` line that is not a synthetic setup blob."""
-        if entry.get("type") != "user":
-            return False
-        if entry.get("synthetic_reason"):
-            return False
-        text = extract_text(entry.get("content", ""))
-        head = text.lstrip().lower()
-        if head.startswith(("<user_info", "<system-reminder", "<environment")):
-            return False
-        return bool(text.strip())
-
-    def parse_history_entry(self, entry: dict[str, Any]) -> AgentMessage | None:
-        """Parse a single transcript line for history display (text only)."""
-        etype = entry.get("type")
-        if etype not in ("user", "assistant"):
-            return None
-        if etype == "user" and (
-            entry.get("synthetic_reason")
-            or extract_text(entry.get("content", ""))
-            .lstrip()
-            .lower()
-            .startswith(("<user_info", "<system-reminder", "<environment"))
-        ):
-            return None
-        text = extract_text(entry.get("content", "")).strip()
-        if etype == "user" and text.startswith("<user_query>"):
-            text = text[len("<user_query>") :]
-            if text.endswith("</user_query>"):
-                text = text[: -len("</user_query>")]
-            text = text.strip()
-        if not text:
-            return None
-        timestamp = entry.get("timestamp")
-        return AgentMessage(
-            text=text,
-            role="user" if etype == "user" else "assistant",
-            content_type="text",
-            timestamp=timestamp if isinstance(timestamp, str) else None,
-        )
+    # Transcript interpretation lives in ``session_protocol.messages``
+    # (``_grok``), the one normalization path for live relay and history.
 
     # ── Discovery ────────────────────────────────────────────────────────
 

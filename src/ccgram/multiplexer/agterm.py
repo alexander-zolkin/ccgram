@@ -6,10 +6,10 @@ JSON shape (``tree`` / ``workspaces[]`` / ``sessions[]`` / ``surfaces[]``) and
 every ``surface:<uuid>:<role>`` locator stays **private** to this module;
 callers see only the neutral value types from ``multiplexer.base``.
 
-Identity: an agterm *session* is the unit that carries one agent, so its UUID is
-the neutral ``window_id``. agterm persists that UUID in its per-window state file
-and restores it, so unlike herdr the id survives a restart and no alias
-reconciliation is needed (``ids_stable_across_restart`` is True).
+Identity: the primary pane retains the session UUID as its ``window_id``.
+A split peer gets a separate guarded target derived from its foreground argv.
+Hidden splits are included. The peer target is refused after closure, promotion
+or a change to its argv; it never falls back to the primary pane.
 
 The backend shells out to ``agtermctl`` (the seam explicitly allows a CLI in
 place of speaking the socket directly); the socket path is passed through
@@ -22,12 +22,13 @@ Two agterm behaviours drive the shape of this adapter:
   ``--pane`` reads the visible or focused pane, while ``session type`` with no
   ``--pane`` injects into the main pane. Every capture and injection below
   therefore passes an explicit role and never relies on a default. The agent
-  ccgram drives lives in the main pane, so that role is ``left`` throughout.
-* **A split pane has no durable handle.** agterm promotes the split survivor
-  into the main pane when the primary exits, so the ``right`` role is not a
-  stable identity. ``split_window`` returns None and ``list_panes`` returns [],
-  exactly as the Protocol prescribes for a backend that cannot expose a safe
-  sibling handle.
+  target carries the explicit role for both reads and writes.
+* **A split pane has no atomically guarded input API.** Split targets are
+  checked against live argv before each operation, including the separate
+  Return injection. A topology change between that check and the RPC remains
+  a race; native token-addressed input is the upgrade path. An identical argv
+  restart is the same target. Split targets cannot close or rename the shared
+  session. ``split_window`` and raw sibling handles remain unsupported.
 
 Capabilities: agterm reports native agent status and supports workspace selection.
 It does not use the guarded topic-target flow because its session UUID is already
@@ -40,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -48,6 +50,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
 import structlog
 
+from .agterm_panes import pane_sessions, split_session_id
 from .base import (
     AgentStatus,
     CaptureResult,
@@ -82,6 +85,12 @@ _RC_NO_BINARY = 127
 # The agent ccgram drives runs in the session's main pane. Passed explicitly on
 # every read and write because agterm's two defaults disagree (see module docs).
 _AGENT_PANE = "left"
+
+# agterm's refusal for a target it does not know. Matched rather than compared
+# so a trailing id or punctuation change does not silently turn a proof of
+# absence into "unknown", which would only make the guards more cautious, and
+# so an unrelated refusal is never read as absence, which would not.
+_NO_SUCH_SESSION_RE = re.compile(r"\bno such session\b", re.IGNORECASE)
 
 # ``C-x``: a control chord is exactly the prefix plus one character.
 _CONTROL_CHORD_LEN = 3
@@ -166,6 +175,26 @@ def _validated_work_dir(work_dir: str) -> tuple[Path | None, str]:
     if not path.is_dir():
         return None, f"Not a directory: {work_dir}"
     return path, ""
+
+
+def _runs_a_known_agent(foreground: object) -> bool:
+    """Whether this session's foreground argv is an agent ccgram can drive.
+
+    Classified from the whole argv, never from its first token: agterm reports
+    what is actually running, so codex arrives as ``["node", ".../codex", …]``
+    and a check on ``argv[0]`` would reject it while accepting ``vim``, ``less``
+    or a build. ``classify_provider_from_argv`` is the codebase's own
+    wrapper-skipping matcher. A shell is not an adopted agent, and an absent
+    foreground is an idle prompt.
+    """
+    if not isinstance(foreground, list) or not foreground:
+        return False
+    # Lazy: providers reach back into the multiplexer seam, so a module-level
+    # import here would close the loop.
+    from ..providers.process_detection import classify_provider_from_argv
+
+    provider = classify_provider_from_argv([str(part) for part in foreground])
+    return bool(provider) and provider != "shell"
 
 
 def _key_to_bytes(token: str) -> str | None:
@@ -306,6 +335,80 @@ class AgtermManager:
         result = payload.get("result")
         return result if isinstance(result, dict) else {}
 
+    async def window_exists(self, window_id: str) -> bool | None:
+        """Ask agterm about one session: True, False, or None if it could not say.
+
+        The authoritative answer, and the only one this backend can give.
+        ``tree`` is per-window, so a merged listing is a sequence of RPCs with
+        no isolation: a session that stays ahead of the sweep is read in no
+        window at all, and two passes can agree on the same incomplete result.
+        No number of passes fixes that, because an atomic snapshot cannot be
+        assembled from non-atomic reads.
+
+        A targeted call can, because agterm answers it differently. An unknown
+        target returns a well-formed ``{"ok": false, "error": "no such session:
+        <id>"}`` envelope, while an unreachable socket fails before any
+        envelope exists. So a parsed refusal naming this session is proof of
+        absence, and everything else is unknown.
+        """
+        owner = split_session_id(window_id)
+        if owner is not None:
+            return await self._split_window_presence(window_id, owner)
+        rc, out, _err = await self._run(
+            self._with_socket(
+                ["session", "text", "--pane", _AGENT_PANE, "--target", window_id]
+            ),
+            None,
+        )
+        try:
+            payload = json.loads(out)
+        except json.JSONDecodeError, ValueError:
+            # No envelope at all: the CLI could not reach agterm, or answered
+            # something this code does not understand. Not an absence.
+            return None
+        if not isinstance(payload, dict):
+            return None
+        ok = payload.get("ok")
+        if ok is True:
+            return True
+        error = payload.get("error")
+        # Absence needs the whole shape: an explicit refusal, a string reason,
+        # and this session named in it. Anything looser lets a malformed or
+        # unrelated payload authorise a deletion.
+        if (
+            ok is False
+            and isinstance(error, str)
+            and _NO_SUCH_SESSION_RE.search(error)
+            and window_id.casefold() in error.casefold()
+        ):
+            return False
+        # A refusal for some other reason (a busy pane, a schema change) says
+        # nothing about whether the session is there.
+        logger.debug(
+            "agterm refused an existence probe", window_id=window_id, error=error, rc=rc
+        )
+        return None
+
+    async def _split_window_presence(self, window_id: str, owner: str) -> bool | None:
+        tree = await self._tree()
+        if tree is None:
+            return None
+        for _workspace, session in self._sessions(tree):
+            if str(session["id"]).casefold() != owner.casefold():
+                continue
+            panes = pane_sessions(session)
+            if any(
+                str(pane["id"]).casefold() == window_id.casefold() for pane in panes
+            ):
+                return True
+            foreground = session.get("splitForeground")
+            if len(panes) > 1 and (not isinstance(foreground, list) or not foreground):
+                # A protected process may hide argv without closing the pane.
+                return None
+            return False
+        # A sweep miss alone is not authoritative absence of the session.
+        return False if await self.window_exists(owner) is False else None
+
     async def _call_ok(
         self, args: Sequence[str], stdin_text: str | None = None
     ) -> bool:
@@ -345,6 +448,20 @@ class AgtermManager:
         Fails closed. A failure anywhere returns None, never a partial tree,
         because a partial answer here is indistinguishable from sessions
         having gone away.
+
+        The sweep is a sequence of RPCs, so in principle a session could evade
+        it by moving between windows between two reads. It cannot: agterm has
+        no operation that moves a session across windows. Both relocation
+        paths refuse (``session move <workspace>`` answers "no such workspace"
+        for a workspace in another window, and ``move --after <anchor>``
+        answers "no such session" for an anchor in one), because session and
+        workspace addressing is window-scoped. A session is created in a window
+        and stays there until it closes. What can still appear mid-sweep is a
+        newly opened window, whose sessions are new and therefore cannot be
+        ones ccgram is already bound to.
+
+        ``window_exists`` covers the remainder for the destructive paths, which
+        ask about one target rather than trusting this listing.
         """
         window_ids = await self._open_window_ids()
         if window_ids is None:
@@ -376,13 +493,18 @@ class AgtermManager:
                     pairs.append((workspace, session))
         return pairs
 
-    @staticmethod
-    def _to_window(session: dict) -> WindowRef:
+    def _to_window(self, session: dict, workspace: dict | None = None) -> WindowRef:
         """Map one agterm session node onto the neutral ``WindowRef``."""
         foreground = session.get("foreground")
         command = ""
         if isinstance(foreground, list) and foreground:
             command = str(foreground[0])
+        elif isinstance(shell := session.get("foregroundShell"), str):
+            # Lazy: the providers registry imports the multiplexer during setup.
+            from ..providers.shell_infra import KNOWN_SHELLS
+
+            if shell in KNOWN_SHELLS:
+                command = shell
         return WindowRef(
             window_id=str(session.get("id", "")),
             window_name=str(session.get("name") or ""),
@@ -393,6 +515,11 @@ class AgtermManager:
             pane_tty="",
             pane_width=0,
             pane_height=0,
+            # Discovery consumes the reconciliation listing, which stays
+            # complete on purpose, so adoptability travels on the window.
+            topic_eligible=self._is_adoptable(session)
+            and (workspace is None or self._in_scope(workspace))
+            and _runs_a_known_agent(foreground),
         )
 
     async def _find_session(self, window_id: str) -> dict | None:
@@ -408,8 +535,9 @@ class AgtermManager:
             return None
         wanted = window_id.casefold()
         for _workspace, session in self._sessions(tree):
-            if str(session.get("id", "")).casefold() == wanted:
-                return session
+            for pane in pane_sessions(session):
+                if str(pane["id"]).casefold() == wanted:
+                    return pane
         return None
 
     def _in_scope(self, workspace: dict) -> bool:
@@ -439,7 +567,13 @@ class AgtermManager:
         included, and starts typing into terminals nobody pointed it at.
         """
         own = self._own_session_id
-        if own and str(session.get("id", "")).casefold() == own:
+        if (
+            own
+            and str(
+                session.get("_agterm_session_id") or session.get("id", "")
+            ).casefold()
+            == own
+        ):
             return False
         return not str(session.get("name") or "").startswith("_")
 
@@ -457,19 +591,24 @@ class AgtermManager:
             )
 
     async def list_windows(self) -> list[WindowRef]:
-        """List the sessions discovery may adopt (best-effort, [] on failure).
+        """List the sessions offered for explicit selection ([] on failure).
 
-        Narrower than ``list_windows_for_reconciliation`` on purpose: this is
-        the listing discovery turns into topics, so it carries the workspace
-        scope and the self/hidden exclusions.
+        The pickers. Narrower than ``list_windows_for_reconciliation``, which
+        returns every session so cleanup can tell absent from excluded, but
+        narrowed only by *visibility*: the workspace scope, ccgram's own
+        session and the ``_`` prefix. Not by adoptability — an in-scope session
+        sitting at a shell is listed here, carrying ``topic_eligible=False``,
+        so a user can bind it by hand while unattended discovery leaves it
+        alone. Discovery reads the reconciliation listing and never this one.
         """
         tree = await self._tree()
         if tree is None:
             return []
         return [
-            self._to_window(session)
+            self._to_window(pane, workspace)
             for workspace, session in self._sessions(tree)
             if self._in_scope(workspace) and self._is_adoptable(session)
+            for pane in pane_sessions(session)
         ]
 
     async def list_windows_for_reconciliation(self) -> list[WindowRef] | None:
@@ -489,7 +628,9 @@ class AgtermManager:
         if tree is None:
             return None
         return [
-            self._to_window(session) for _workspace, session in self._sessions(tree)
+            self._to_window(pane, workspace)
+            for workspace, session in self._sessions(tree)
+            for pane in pane_sessions(session)
         ]
 
     async def list_workspaces(self) -> list[WorkspaceRef]:
@@ -518,6 +659,8 @@ class AgtermManager:
     async def find_window_by_id(self, window_id: str) -> WindowRef | None:
         """Find a session by its UUID; None when it no longer exists."""
         session = await self._find_session(window_id)
+        # No workspace passed: addressing a known id is not discovery, so an
+        # out-of-scope window is still findable and drivable.
         return None if session is None else self._to_window(session)
 
     async def _read_text(self, window_id: str, *, lines: int | None) -> str | None:
@@ -527,7 +670,17 @@ class AgtermManager:
         target, so a probe would double every call on the polling path and
         still leave a window between the check and the read.
         """
-        args = ["session", "text", "--pane", _AGENT_PANE, "--target", window_id]
+        owner = split_session_id(window_id)
+        if owner is not None and await self._find_session(window_id) is None:
+            return None
+        args = [
+            "session",
+            "text",
+            "--pane",
+            "right" if owner else _AGENT_PANE,
+            "--target",
+            owner or window_id,
+        ]
         if lines is not None and lines > 0:
             args += ["--lines", str(lines)]
         result = await self._call(args)
@@ -588,15 +741,18 @@ class AgtermManager:
         ``--stdin`` keeps arbitrary control bytes out of argv, where the
         argument parser could mangle them.
         """
+        owner = split_session_id(window_id)
+        if owner is not None and await self._find_session(window_id) is None:
+            return False
         return await self._call_ok(
             [
                 "session",
                 "type",
                 "--stdin",
                 "--pane",
-                _AGENT_PANE,
+                "right" if owner else _AGENT_PANE,
                 "--target",
-                window_id,
+                owner or window_id,
             ],
             payload,
         )
@@ -685,12 +841,13 @@ class AgtermManager:
         enter: bool = True,
         literal: bool = True,
         window_id: str | None = None,
+        raw: bool = True,
     ) -> bool:
         """Reject raw pane locators; only a session id may authorise a write."""
         if window_id is None or pane_id != window_id:
             logger.warning("Rejected raw agterm pane write")
             return False
-        return await self.send(window_id, text, enter=enter, literal=literal)
+        return await self.send(window_id, text, enter=enter, literal=literal, raw=raw)
 
     async def send_keys_to_pane(
         self,
@@ -708,10 +865,14 @@ class AgtermManager:
 
     async def kill_window(self, window_id: str) -> bool:
         """Close the session. True on success."""
+        if split_session_id(window_id) is not None:
+            return False
         return await self._call_ok(["session", "close", "--target", window_id])
 
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename the session's sidebar label. True on success."""
+        if split_session_id(window_id) is not None:
+            return False
         return await self._call_ok(
             ["session", "rename", new_name, "--target", window_id]
         )
@@ -883,15 +1044,19 @@ class AgtermManager:
         agterm reports the argv but no pid, pgid or tty, so those are zero and
         empty.
 
-        None at an idle shell prompt, and that is agterm's answer rather than a
-        failure: it omits ``foreground`` from the node exactly when the pane
-        sits at a prompt. The shell provider needs a shell *name* to install
-        its prompt marker, and agterm reports none, so that provider does not
-        work on this backend. The adapter does not guess one: ``shell_infra``
-        matches ``argv[0]`` against ``KNOWN_SHELLS`` and then sends that
-        shell's syntax, so a wrong guess types zsh into a fish prompt in a
-        terminal somebody is using. Lifting this needs agterm to report the
-        shell on an idle node.
+        None whenever agterm cannot report an argv, which is several states and
+        not one: a shell holds the pane, there is no foreground pid, the
+        foreground group is an unreadable setuid or setgid one such as ``top``
+        or ``sudo``, or a lookup failed. So None means "unknown", never "at a
+        prompt" (confirmed by agterm's author, umputun/agterm#508; their godoc
+        named only the shell case and has been corrected).
+
+        ``_to_window`` exposes ``foregroundShell`` for provider classification,
+        but this method must not fabricate argv from that hint. A shell builtin
+        such as ``read`` or ``vared``, and a shell loop, run inside the shell
+        process: a pane blocked on input is indistinguishable from one at a
+        prompt. Synthetic bare-shell argv would let prompt setup send C-c and
+        inject commands into that running builtin.
 
         The provider detector classifies this argv directly because agterm cannot
         provide a process-group ID. This preserves provider detection behind

@@ -3,7 +3,7 @@
 All Telegram, tmux, and singleton mutations live here. Functions accept
 the inputs gathered by ``observe`` and the decision returned by
 ``decide``, and apply the resulting effects: emoji updates, status
-enqueuing, typing indicators, autoclose timers, dead-window
+enqueuing, typing indicators, dead-window
 notifications, multi-pane scans, passive shell relay.
 """
 
@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, TelegramError
+from telegram.error import TelegramError
 
 from .... import window_query
 from ....claude_task_state import (
@@ -31,6 +31,8 @@ from ....telegram_client import PTBTelegramClient
 from ....thread_router import thread_router
 from ....multiplexer import agent_status_cache
 from ....multiplexer import multiplexer as tmux_manager
+from ....multiplexer.base import canonical_window_id
+from ....multiplexer.reconciliation import window_presence
 from ....window_state_ports.pane_state import (
     get_pane_lifecycle_notify,
     get_pane_projection,
@@ -51,6 +53,8 @@ from ...messaging_pipeline.message_queue import (
 from ...messaging_pipeline.message_sender import rate_limit_send_message, safe_send
 from ...recovery.recovery_banner import RecoveryBanner, render_banner
 from ...status.topic_emoji import update_topic_emoji
+from ...topics.topic_deletion import retire_topic_binding
+from ...topics.topic_orchestration import is_pending_creation
 from ..polling_state import (
     lifecycle_strategy,
     pane_status_strategy,
@@ -66,7 +70,6 @@ if TYPE_CHECKING:
     from ....providers.base import AgentProvider
     from ....multiplexer.base import WindowRef as TmuxWindow
     from ..polling_runtime import PollingRuntime
-    from ..polling_state import TerminalPollState
 
 logger = structlog.get_logger()
 
@@ -136,12 +139,16 @@ async def _transition_to_idle(
         ps.mark_startup_quietly_settled(window_id)
     client = PTBTelegramClient(bot)
     await update_topic_emoji(client, chat_id, thread_id, "idle", display)
-    lc.clear_autoclose_timer(user_id, thread_id)
     lc.clear_typing_state(user_id, thread_id)
     if not send_status:
         return
     await enqueue_status_update(
-        client, user_id, window_id, IDLE_STATUS_TEXT, thread_id=thread_id
+        client,
+        user_id,
+        window_id,
+        IDLE_STATUS_TEXT,
+        thread_id=thread_id,
+        transient=True,
     )
 
 
@@ -283,11 +290,15 @@ async def _check_interactive_only(
     status = await _resolve_status(window_id, pane_text, w, runtime=runtime)
 
     if status is not None and status.is_interactive:
-        set_interactive_mode(user_id, window_id, thread_id)
+        # Advisory detections never pre-latch blocking mode: the latch
+        # decision belongs to handle_interactive_ui (named pattern or
+        # transcript tool_use only).
+        if not status.ui_advisory:
+            set_interactive_mode(user_id, window_id, thread_id)
         handled = await handle_interactive_ui(
             PTBTelegramClient(bot), user_id, window_id, thread_id
         )
-        if not handled:
+        if not handled and not status.ui_advisory:
             clear_interactive_mode(user_id, thread_id)
 
 
@@ -334,33 +345,71 @@ async def _handle_dead_window_notification(
 ) -> None:
     lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
     ps = runtime.poll_state if runtime is not None else terminal_poll_state
-    if lc.is_dead_notified(user_id, thread_id, wid):
+    if lc.is_dead_notified(user_id, thread_id, wid) or is_pending_creation(wid):
         return
     # Mark notified before the first await: the push (event-stream) and poll
     # paths both call this for the same window and could otherwise both pass the
-    # guard above before either marks, sending two banners + two autoclose timers.
+    # guard above before either marks, sending two notifications.
     lc.mark_dead_notified(user_id, thread_id, wid)
-    # Evict any push-cached status so a dead/replaced window (herdr reuses tab
-    # ids across restart) can't serve a stale "working" to the status poll.
-    agent_status_cache.clear(wid)
-    ps.clear_seen_status(wid)
+    retained = False
+    try:
+        chat_ids = _exact_dead_topic_chat_ids(user_id, thread_id, wid)
+        if chat_ids is None:
+            return
+        presence = await window_presence(wid, tmux_manager)
+        if presence is not False or is_pending_creation(wid):
+            return
+        # Evict any push-cached status so a dead/replaced window (herdr reuses
+        # tab ids across restart) can't serve stale status to a later bind.
+        agent_status_cache.clear(wid)
+        ps.clear_seen_status(wid)
+        clear_tool_msg_ids_for_topic(user_id, thread_id)
+        if not config.autodelete_dead_topics:
+            logger.info(
+                "dead_session_topic_retained",
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=wid,
+            )
+            # Keep the marker sticky ONLY for this confirmed-dead retain:
+            # the retained binding keeps this topic in the tick set, and a
+            # cleared marker would re-run the presence probe and this log
+            # line every poll cycle. Not-dead exits below clear it, so a
+            # live or unverifiable window keeps its retry semantics.
+            retained = True
+            await _mark_retained_topic_dead(bot, user_id, thread_id, wid)
+            return
+        for chat_id in chat_ids:
+            if is_pending_creation(wid):
+                break
+            outcome = await _delete_dead_topic_immediately(
+                bot, user_id, thread_id, wid, chat_id, runtime=runtime
+            )
+            if outcome == "rate_limited":
+                break
+    finally:
+        if not retained:
+            lc.clear_dead_notification(user_id, thread_id)
 
-    clear_tool_msg_ids_for_topic(user_id, thread_id)
+
+async def _mark_retained_topic_dead(
+    bot: "Bot", user_id: int, thread_id: int, wid: str
+) -> None:
+    """Show a retained (hibernated) topic as dead, without a banner.
+
+    CCGRAM-HOTFIX:quiet-dead-banner — on this host a window death is routine
+    (the idle hibernator kills idle windows; ``autoresume`` wakes them on the
+    next message), so the topic only gets the 💀 emoji. The unsolicited
+    "Session … ended." banner comes back only with ``CCGRAM_DEAD_BANNER=1``.
+    A topic deleted while its window died is caught by the periodic
+    ``probe_topic_existence``.
+    """
     chat_id = thread_router.resolve_chat_id(user_id, thread_id)
     display = thread_router.get_display_name(wid)
-    await update_topic_emoji(
-        PTBTelegramClient(bot), chat_id, thread_id, "dead", display
-    )
-    lc.start_autoclose_timer(user_id, thread_id, "dead", time.monotonic())
-
-    # CCGRAM-HOTFIX:quiet-dead-banner — skip the unsolicited banner but keep the
-    # whole rest of the transition (dead emoji, autoclose timer, cache eviction
-    # above). The send doubled as a topic-existence probe, so run that probe
-    # directly instead; a topic deleted while its window died is still detected.
+    client = PTBTelegramClient(bot)
+    await update_topic_emoji(client, chat_id, thread_id, "dead", display)
     if not config.dead_banner_notify:
-        await _probe_topic_after_death(bot, user_id, thread_id, wid, ps)
         return
-
     view = window_query.view_window(wid)
     cwd = view.cwd if view else ""
     try:
@@ -381,68 +430,69 @@ async def _handle_dead_window_notification(
     else:
         text = f"⚠ Session `{display}` ended."
         keyboard = None
-    sent = await rate_limit_send_message(
-        PTBTelegramClient(bot),
-        chat_id,
-        text,
-        message_thread_id=thread_id,
-        reply_markup=keyboard,
+    await rate_limit_send_message(
+        client, chat_id, text, message_thread_id=thread_id, reply_markup=keyboard
     )
-    if sent is None:
-        await _probe_topic_after_death(bot, user_id, thread_id, wid, ps)
 
 
-async def _probe_topic_after_death(
+def _exact_dead_topic_chat_ids(
+    user_id: int, thread_id: int, wid: str
+) -> list[int] | None:
+    """Return all known chat bindings for a dead window."""
+    candidates = [
+        chat_id
+        for bound_user, chat_id, bound_thread, bound_wid in thread_router.iter_thread_bindings_with_chat()
+        if bound_user == user_id
+        and bound_thread == thread_id
+        and canonical_window_id(bound_wid) == canonical_window_id(wid)
+    ]
+    if not candidates or any(chat_id is None for chat_id in candidates):
+        return None
+    return [chat_id for chat_id in candidates if chat_id is not None]
+
+
+async def _delete_dead_topic_immediately(
     bot: "Bot",
     user_id: int,
     thread_id: int,
     wid: str,
-    ps: "TerminalPollState",
-) -> None:
-    """Detect a topic deleted while its window was dying, and unbind it.
-
-    Uses the same unpin probe as ``probe_topic_existence``: it is a no-op on a
-    live topic and raises ``Topic_id_invalid`` / "thread not found" on a deleted
-    one. Called when the dead-window banner could not be delivered, and (with
-    CCGRAM-HOTFIX:quiet-dead-banner) instead of sending it at all.
-    """
-    chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+    chat_id: int,
+    *,
+    runtime: "PollingRuntime | None" = None,
+) -> str:
+    """Retire and delete a confirmed-dead session topic without recovery UI."""
+    lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
     client = PTBTelegramClient(bot)
-    try:
-        await client.unpin_all_forum_topic_messages(
-            chat_id=chat_id, message_thread_id=thread_id
-        )
-    except BadRequest as probe_err:
-        if (
-            "thread not found" in probe_err.message.lower()
-            or "topic_id_invalid" in probe_err.message.lower()
-        ):
-            ps.reset_probe_failures(wid)
-            # CCGRAM-HOTFIX:webui — keep the (hibernated) session wakeable on the web.
-            # Lazy: webui is an optional surface; keep it off the polling path.
-            from ....webui.registry import detach_from_topic
 
-            detach_from_topic(user_id, chat_id, thread_id, wid)
-            await clear_topic_state(
-                user_id,
-                thread_id,
-                client,
-                window_id=wid,
-                window_dead=True,
-            )
-            thread_router.unbind_thread(
-                user_id,
-                thread_id,
-                retirement_reason="remote_deleted",
-            )
-            logger.info(
-                "Topic deleted: unbound window %s for thread %d, user %d",
-                wid,
-                thread_id,
-                user_id,
-            )
-    except TelegramError:
-        pass
+    async def clear_state_before_delete() -> None:
+        await clear_topic_state(
+            user_id,
+            thread_id,
+            client,
+            window_id=wid,
+            chat_id=chat_id,
+            window_dead=True,
+        )
+        lc.mark_dead_notified(user_id, thread_id, wid)
+
+    outcome = await retire_topic_binding(
+        client,
+        user_id,
+        thread_id,
+        wid,
+        router=thread_router,
+        chat_id=chat_id,
+        before_delete=clear_state_before_delete,
+        retirement_reason="dead_session",
+    )
+    logger.info(
+        "dead_session_topic_cleanup",
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=wid,
+        outcome=outcome,
+    )
+    return outcome
 
 
 # ── Decision-application transitions ───────────────────────────────────
@@ -457,7 +507,6 @@ async def _apply_active_transition(
     runtime: "PollingRuntime | None" = None,
 ) -> None:
     ps = runtime.poll_state if runtime is not None else terminal_poll_state
-    lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
     if decision.send_status:
         claude_task_state.clear_wait_header(window_id)
         claude_task_state.set_last_status(window_id, decision.status_text or "")
@@ -474,6 +523,7 @@ async def _apply_active_transition(
             window_id,
             display_status,
             thread_id=thread_id,
+            transient=True,
         )
     else:
         claude_task_state.clear_wait_header(window_id)
@@ -484,7 +534,6 @@ async def _apply_active_transition(
         await update_topic_emoji(
             PTBTelegramClient(bot), chat_id, thread_id, "active", display
         )
-        lc.clear_autoclose_timer(user_id, thread_id)
 
 
 async def _apply_done_transition(
@@ -508,9 +557,15 @@ async def _apply_done_transition(
     ps.mark_seen_status(window_id)
     client = PTBTelegramClient(bot)
     await update_topic_emoji(client, chat_id, thread_id, "done", display)
-    lc.start_autoclose_timer(user_id, thread_id, "done", time.monotonic())
     lc.clear_typing_state(user_id, thread_id)
-    await enqueue_status_update(client, user_id, window_id, None, thread_id=thread_id)
+    await enqueue_status_update(
+        client,
+        user_id,
+        window_id,
+        None,
+        thread_id=thread_id,
+        transient=True,
+    )
 
 
 async def _apply_starting_transition(
@@ -521,7 +576,6 @@ async def _apply_starting_transition(
     runtime: "PollingRuntime | None" = None,
 ) -> None:
     ps = runtime.poll_state if runtime is not None else terminal_poll_state
-    lc = runtime.lifecycle if runtime is not None else lifecycle_strategy
     ws = ps.peek_state(window_id)
     if ws is None or ws.startup_time is None:
         ps.begin_startup_timer(window_id, time.monotonic())
@@ -532,7 +586,6 @@ async def _apply_starting_transition(
         await update_topic_emoji(
             PTBTelegramClient(bot), chat_id, thread_id, "active", display
         )
-        lc.clear_autoclose_timer(user_id, thread_id)
 
 
 async def _apply_tick_decision(
@@ -587,7 +640,12 @@ async def _update_status(
     w = _window or await tmux_manager.find_window_by_id(window_id)
     if not w:
         await enqueue_status_update(
-            PTBTelegramClient(bot), user_id, window_id, None, thread_id=thread_id
+            PTBTelegramClient(bot),
+            user_id,
+            window_id,
+            None,
+            thread_id=thread_id,
+            transient=True,
         )
         return
 
@@ -606,6 +664,7 @@ async def _update_status(
         if status is not None and status.is_interactive:
             return
         await clear_interactive_msg(user_id, client, thread_id)
+        clear_interactive_mode(user_id, thread_id)
         should_check_new_ui = False
     elif interactive_window is not None:
         await clear_interactive_msg(user_id, client, thread_id)

@@ -33,8 +33,11 @@ from ...telegram_rate_limiter import retry_after_seconds
 from ...thread_router import thread_router
 from ...topic_state_registry import topic_state
 from ...window_query import get_approval_mode
+from ..provider_display import strip_provider_prefix
 
 logger = structlog.get_logger()
+
+_TOPIC_NAME_LIMIT = 128
 
 # Color circles used for the active/idle state prefix.
 # Which color maps to which state depends on ``config.status_mode`` (see
@@ -294,18 +297,24 @@ def _resolve_topic_name(key: tuple[int, int], display_name: str) -> tuple[str, b
     """Return the sticky clean topic name and whether it changed.
 
     CCGRAM-HOTFIX:sticky-topic-name — first sight of a topic seeds the base name
-    from the current title and persists it. Thereafter the tmux-derived
+    from the current title; it is stored (and persisted) once Telegram accepts
+    that title, so a paced-out first paint is retried. Thereafter the tmux-derived
     ``display_name`` is IGNORED: ccgram never re-imposes the window name onto the
     topic. Only ``update_stored_topic_name`` (a genuine Telegram rename) mutates
-    the stored text.
+    the stored text. Upstream's provider label ("Claude · …") is not added
+    either: the title text stays exactly what the user typed.
     """
     cached = _topic_names.get(key)
     if cached is None:
-        clean = strip_emoji_prefix(display_name)
-        _topic_names[key] = clean
-        _persist_topic_names()
-        return clean, True
+        return strip_emoji_prefix(display_name), True
     return cached, False
+
+
+def _remember_topic_name(key: tuple[int, int], clean_name: str) -> None:
+    """Store the confirmed base name; persist only a real change."""
+    if _topic_names.get(key) != clean_name:
+        _topic_names[key] = clean_name
+        _persist_topic_names()  # CCGRAM-HOTFIX:sticky-topic-name
 
 
 def _should_apply_update(
@@ -358,7 +367,12 @@ def _compose_topic_name(
     # if approval_mode == "yolo":
     #     parts.append(EMOJI_YOLO)
     parts.append(clean_name)
-    return " ".join(parts)
+    title = " ".join(parts)
+    return (
+        title
+        if len(title) <= _TOPIC_NAME_LIMIT
+        else title[: _TOPIC_NAME_LIMIT - 1].rstrip() + "…"
+    )
 
 
 async def _edit_topic_name(
@@ -368,6 +382,7 @@ async def _edit_topic_name(
     key: tuple[int, int],
     new_name: str,
     *,
+    clean_name: str,
     state_token: tuple[str, str, bool] | None = None,
     state: str = "",
 ) -> None:
@@ -378,6 +393,7 @@ async def _edit_topic_name(
             message_thread_id=thread_id,
             name=new_name,
         )
+        _remember_topic_name(key, clean_name)
         if state_token is not None:
             _topic_states[key] = state_token
             _persist_topic_states()
@@ -411,6 +427,7 @@ async def _edit_topic_name(
         elif (
             "topic_not_modified" in e.message.lower() or "Topic_id_invalid" in e.message
         ):
+            _remember_topic_name(key, clean_name)
             if state_token is not None:
                 _topic_states[key] = state_token
                 _persist_topic_states()
@@ -505,6 +522,7 @@ async def sync_topic_name(
             thread_id,
             key,
             new_name,
+            clean_name=clean_name,
             state_token=state_token,
             state=state,
         )
@@ -534,7 +552,6 @@ async def update_topic_emoji(
         return
 
     key = (chat_id, thread_id)
-    prev_name = _topic_names.get(key)
     clean_name, name_changed = _resolve_topic_name(key, display_name)
 
     approval_mode = _resolve_approval_mode(chat_id, thread_id)
@@ -557,22 +574,12 @@ async def update_topic_emoji(
     ):
         return
     if _paced_out(chat_id, key, now):
-        # A different topic of this chat was renamed moments ago: defer to
-        # the next poll cycle instead of bursting (#199). Two things must
-        # survive the deferral. The pending state transition is re-armed
-        # as if its debounce had just elapsed (fires next cycle). A name
-        # change must have its write-through cache update rolled back,
-        # else the next cycle would see name_changed=False and drop the
-        # rename entirely (the token-match branch consults name_changed).
+        # Defer instead of bursting (#199). Re-arm the state transition;
+        # the unconfirmed name remains dirty without a cache rollback.
         _pending_transitions[key] = (
             state,
             now - _DEBOUNCE_BY_STATE.get(state, DEBOUNCE_TO_IDLE_SECONDS),
         )
-        if name_changed:
-            if prev_name is None:
-                _topic_names.pop(key, None)
-            else:
-                _topic_names[key] = prev_name
         return
     _last_chat_edit[chat_id] = (now, key)
 
@@ -588,6 +595,7 @@ async def update_topic_emoji(
         thread_id,
         key,
         new_name,
+        clean_name=clean_name,
         state_token=state_token,
         state=state,
     )
@@ -605,7 +613,7 @@ def strip_emoji_prefix(name: str) -> str:
         badge_prefix = f"{badge} "
         if name.startswith(badge_prefix):
             name = name[len(badge_prefix) :]
-    return name
+    return strip_provider_prefix(name)
 
 
 def update_stored_topic_name(chat_id: int, thread_id: int, new_clean_name: str) -> None:

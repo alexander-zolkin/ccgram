@@ -17,41 +17,47 @@ because it is pure logic over the neutral value types.
 
 from __future__ import annotations
 
-from ..herdr_targets import is_herdr_session_target
 from .base import MultiplexerCapabilities, WindowRef
 
 # Separates workspace, tab, and optional pane parts in a Herdr topic title.
 TOPIC_PREFIX_SEPARATOR = " ▸ "
 
 
-def format_agent_topic_prefix(workspace: str, tab: str, pane: str = "") -> str:
-    """Render a Herdr topic label, adding a pane when needed.
+def format_agent_topic_prefix(
+    workspace: str, tab: str, pane: str = "", *, provider: str = ""
+) -> str:
+    """Render a Herdr topic label with an easy-to-search provider prefix.
 
-    Produces ``"<workspace> ▸ <tab>"`` when pane is omitted and
-    ``"<workspace> ▸ <tab> ▸ <pane>"`` for Herdr agent topics. The status emoji is prepended later by
-    the topic-emoji machinery.
+    Produces ``"<Provider> ▸ <workspace> ▸ <tab> ▸ <pane>"`` when *provider*
+    is present. Without a provider, the legacy workspace/tab label is kept.
+    The status emoji is prepended later by the topic-emoji machinery.
 
     Empty parts degrade gracefully so a half-populated tab never renders a
     stray separator.
     """
-    parts = [part.strip() for part in (workspace, tab, pane) if part.strip()]
+    provider_label = provider.strip().capitalize()
+    parts = [
+        part.strip() for part in (provider_label, workspace, tab, pane) if part.strip()
+    ]
     return TOPIC_PREFIX_SEPARATOR.join(parts)
 
 
 def is_agent_topic_window(window: WindowRef, caps: MultiplexerCapabilities) -> bool:
     """Return True when a discovered window should surface as its own topic.
 
-    Gated on ``caps.native_agent_status`` — a capability flag, never a backend
-    name (architecture rule: gate on capabilities, not ``name == "herdr"``):
+    The backend decides, in ``WindowRef.topic_eligible``. No capability flag
+    gates discovery: keying it on one is what produced two bugs in a row. It
+    was first keyed on ``native_agent_status``, which made every agterm session
+    permanently ineligible the moment agterm began reporting status natively;
+    keying it on ``native_topic_targets`` instead only moved the overload onto
+    a flag whose documented meaning is which creation flow to use.
 
-    * Backends without native agent status (tmux): every window is eligible,
-      so the historical auto-topic behavior is unchanged.
-    * Backends with native agent status (herdr): every detected agent record
-      qualifies. The adapter exposes each with a versioned opaque target and an
-      agent label; a raw tab/pane locator or bare shell record is rejected.
+    Only the backend can answer this. herdr knows a record carries a guarded
+    target and an agent label, agterm knows its workspace scope and how to read
+    a wrapped argv, and tmux excludes only the placeholder main window, its
+    own, and the ``_``-prefixed ones its complete listing marks ineligible
+    instead of dropping. ``caps`` stays in the signature
+    because it is the seam's shape and callers pass it.
     """
-    if not caps.native_agent_status:
-        return True
-    return is_herdr_session_target(window.window_id) and bool(
-        window.pane_current_command.strip()
-    )
+    del caps
+    return window.topic_eligible

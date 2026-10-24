@@ -44,11 +44,19 @@ async def _run_launch(
 ):
     """Drive launch_window with a fully mocked backend.
 
-    Returns ``(create_window_mock, send_to_window_mock)``.
+    Returns ``(session_create_mock, send_to_window_mock)``: creation goes
+    through the session core's adapter, which receives the fork's launch
+    extras as trusted ``agent_args`` / ``command_prefix``.
     """
     query = _make_query()
     context = _make_context()
+    adapter = MagicMock()
+    adapter.create = AsyncMock(return_value=MagicMock(target_id="@5", title="win"))
     with (
+        patch(
+            "ccgram.handlers.topics.window_launch_service.adapter_for",
+            return_value=adapter,
+        ),
         patch("ccgram.handlers.topics.window_launch_service.tmux_manager") as mock_mux,
         patch("ccgram.handlers.topics.window_launch_service.session_manager"),
         patch("ccgram.handlers.topics.window_launch_service.thread_router") as mock_tr,
@@ -75,13 +83,13 @@ async def _run_launch(
         mock_mux.capabilities.native_worktrees = False
         mock_tr.get_window_for_thread.return_value = None
         mock_tr.resolve_chat_id.return_value = -100999
-        mock_sms.wait_for_session_map_entry = AsyncMock()
+        mock_sms.wait_for_session_map_entry = AsyncMock(return_value=True)
         mock_send.return_value = (True, "")
 
         caps = MagicMock()
         caps.chat_first_command_path = False
         caps.has_yolo_confirmation = False
-        caps.supports_hook = False
+        caps.supports_hook = True
         caps.supports_model_picker = supports_model
         caps.launch_accepts_initial_prompt = accepts_prompt
         provider = MagicMock()
@@ -90,11 +98,14 @@ async def _run_launch(
         mock_reg.get.return_value = provider
 
         await launch_window(query, context, request)
-    return mock_mux.create_window, mock_send
+    return adapter.create, mock_send
 
 
-def _launch_command(create_window_mock) -> str:
-    return create_window_mock.call_args.kwargs["launch_command"]
+def _launch_command(create_mock) -> str:
+    """The pane command the backend composes: prefix, CLI, agent args."""
+    kwargs = create_mock.call_args.kwargs
+    parts = (kwargs.get("command_prefix", ""), "grok", kwargs.get("agent_args") or "")
+    return " ".join(part for part in parts if part)
 
 
 @pytest.mark.asyncio

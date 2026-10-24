@@ -10,9 +10,12 @@ handler modules (no intra-package imports — safe from circular dependencies):
     that identifies the same window now.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import structlog
+
+from .multiplexer.base import canonical_window_id
 
 logger = structlog.get_logger()
 
@@ -188,10 +191,12 @@ def _alias_is_referenced(
     chat_thread_bindings: dict,
     user_window_offsets: dict,
     window_display_names: dict,
+    pinned_display_names: set[str],
 ) -> bool:
     return (
         alias_id in window_states
         or alias_id in window_display_names
+        or alias_id in pinned_display_names
         or alias_id in chat_thread_bindings.values()
         or any(alias_id in bindings.values() for bindings in thread_bindings.values())
         or any(alias_id in offsets for offsets in user_window_offsets.values())
@@ -253,6 +258,7 @@ def _repoint_alias_references(
     chat_thread_bindings: dict,
     user_window_offsets: dict,
     window_display_names: dict,
+    pinned_display_names: set[str],
 ) -> None:
     """Point every binding, offset, and display name at the canonical id.
 
@@ -271,8 +277,15 @@ def _repoint_alias_references(
         if offset is not None:
             offsets.setdefault(canonical_id, offset)
     display_name = window_display_names.pop(alias_id, "")
-    if display_name and not window_display_names.get(canonical_id):
+    adopted_display_name = bool(
+        display_name and not window_display_names.get(canonical_id)
+    )
+    if adopted_display_name:
         window_display_names[canonical_id] = display_name
+    alias_name_was_pinned = alias_id in pinned_display_names
+    pinned_display_names.discard(alias_id)
+    if adopted_display_name and alias_name_was_pinned:
+        pinned_display_names.add(canonical_id)
 
 
 def migrate_window_aliases(
@@ -283,6 +296,7 @@ def migrate_window_aliases(
     user_window_offsets: dict,
     window_display_names: dict,
     *,
+    pinned_display_names: set[str] | None = None,
     record_redirects: bool = True,
 ) -> list[AliasMigration]:
     """Fold state persisted under superseded window ids onto the current ones.
@@ -301,9 +315,13 @@ def migrate_window_aliases(
     can mirror them into ``session_map.json`` (whose hook-written entry would
     otherwise recreate the alias state on the next sync). ``record_redirects``
     may be disabled for a pure preflight over cloned maps; redirects then remain
-    unchanged until the persisted migration commits.
+    unchanged until the persisted migration commits. A display-name pin follows
+    an adopted alias name; a canonical name and its pin state win unchanged.
     """
     migrations: list[AliasMigration] = []
+    display_name_pins = (
+        pinned_display_names if pinned_display_names is not None else set()
+    )
     active_aliases = {
         alias_id
         for alias_id, canonical_id in aliases.items()
@@ -325,6 +343,7 @@ def migrate_window_aliases(
             chat_thread_bindings,
             user_window_offsets,
             window_display_names,
+            display_name_pins,
         ):
             continue
 
@@ -336,6 +355,7 @@ def migrate_window_aliases(
             chat_thread_bindings,
             user_window_offsets,
             window_display_names,
+            display_name_pins,
         )
         migrations.append(AliasMigration(alias_id=alias_id, canonical_id=canonical_id))
         logger.info("Reconciled superseded window id %s -> %s", alias_id, canonical_id)
@@ -349,15 +369,17 @@ def _resolve_window_states(
     window_display_names: dict,
     live_by_name: dict[str, str],
     live_ids: set[str],
+    window_id_predicate: Callable[[str], bool],
+    recover_stale_ids_by_name: bool,
 ) -> bool:
     """Re-resolve window_states dict in-place. Returns True if changed."""
     changed = False
     new_states: dict = {}
     for key, ws in window_states.items():
-        if is_window_id(key):
-            if key in live_ids:
+        if window_id_predicate(key):
+            if canonical_window_id(key) in live_ids:
                 new_states[key] = ws
-            else:
+            elif recover_stale_ids_by_name:
                 display = window_display_names.get(
                     key, getattr(ws, "window_name", "") or key
                 )
@@ -372,6 +394,9 @@ def _resolve_window_states(
                 else:
                     # Keep dead window state — recovery needs cwd/provider
                     new_states[key] = ws
+            else:
+                # Stable IDs never rebind by name, but recovery still needs state.
+                new_states[key] = ws
         else:
             new_id = live_by_name.get(key)
             if new_id:
@@ -394,16 +419,20 @@ def _resolve_thread_bindings(
     display_lookup: dict,
     live_by_name: dict[str, str],
     live_ids: set[str],
+    window_id_predicate: Callable[[str], bool],
+    recover_stale_ids_by_name: bool,
 ) -> bool:
     """Re-resolve thread_bindings dict in-place. Returns True if changed."""
     changed = False
     for uid, bindings in thread_bindings.items():
         new_bindings: dict[int, str] = {}
         for tid, val in bindings.items():
-            if is_window_id(val):
-                if val in live_ids:
+            if window_id_predicate(val):
+                if canonical_window_id(val) in live_ids:
                     new_bindings[tid] = val
-                elif new_id := live_by_name.get(display_lookup.get(val, val)):
+                elif recover_stale_ids_by_name and (
+                    new_id := live_by_name.get(display_lookup.get(val, val))
+                ):
                     logger.debug("Re-resolved thread binding %s -> %s", val, new_id)
                     new_bindings[tid] = new_id
                     window_display_names[new_id] = display_lookup.get(val, val)
@@ -460,16 +489,20 @@ def _resolve_offsets(
     display_lookup: dict,
     live_by_name: dict[str, str],
     live_ids: set[str],
+    window_id_predicate: Callable[[str], bool],
+    recover_stale_ids_by_name: bool,
 ) -> bool:
     """Re-resolve user_window_offsets dict in-place. Returns True if changed."""
     changed = False
     for _uid, offsets in user_window_offsets.items():
         new_offsets: dict[str, int] = {}
         for key, offset in offsets.items():
-            if is_window_id(key):
-                if key in live_ids:
+            if window_id_predicate(key):
+                if canonical_window_id(key) in live_ids:
                     new_offsets[key] = offset
-                elif new_id := live_by_name.get(display_lookup.get(key, key)):
+                elif recover_stale_ids_by_name and (
+                    new_id := live_by_name.get(display_lookup.get(key, key))
+                ):
                     new_offsets[new_id] = offset
                     changed = True
                 else:
@@ -492,6 +525,8 @@ def resolve_stale_ids(
     window_display_names: dict,
     *,
     ids_stable: bool = True,
+    window_id_predicate: Callable[[str], bool],
+    recover_stale_ids_by_name: bool,
 ) -> bool:
     """Re-resolve persisted window IDs against live multiplexer windows.
 
@@ -500,10 +535,10 @@ def resolve_stale_ids(
     ``ids_stable`` gates the strategy on the backend capability
     ``ids_stable_across_restart`` (never the backend name):
 
-    - True (tmux): window IDs survive a restart, so re-resolution matches a
-      stale ID's display name against a live window. Handles two cases —
-      old-format migration (window_name keys -> window_id keys) and stale IDs
-      (window_id gone but display name matches a live window).
+    - True (tmux and agterm): window IDs survive a ccgram restart. Old-format
+      window-name keys are migrated. Missing IDs are remapped by display name
+      only when ``recover_stale_ids_by_name`` is true. The bundled backends do
+      not opt in, so a new same-named session cannot inherit a missing ID.
     - False: bindings are durable opaque targets. A missing target can be
       temporarily unresolved and multiple live records can be ambiguous, so it
       is intentionally retained without any name, locator, or session-map
@@ -513,14 +548,19 @@ def resolve_stale_ids(
         return False
 
     live_by_name: dict[str, str] = {w.window_name: w.window_id for w in live_windows}
-    live_ids: set[str] = {w.window_id for w in live_windows}
+    live_ids: set[str] = {canonical_window_id(w.window_id) for w in live_windows}
     # Resolve every persisted map against one pre-mutation name snapshot.
     # _resolve_window_states rewrites display names first; using that mutated
     # map for bindings/offsets used to leave them pointing at stale IDs.
     display_lookup = dict(window_display_names)
 
     changed = _resolve_window_states(
-        window_states, window_display_names, live_by_name, live_ids
+        window_states,
+        window_display_names,
+        live_by_name,
+        live_ids,
+        window_id_predicate,
+        recover_stale_ids_by_name,
     )
     changed |= _resolve_thread_bindings(
         thread_bindings,
@@ -528,8 +568,15 @@ def resolve_stale_ids(
         display_lookup,
         live_by_name,
         live_ids,
+        window_id_predicate,
+        recover_stale_ids_by_name,
     )
     changed |= _resolve_offsets(
-        user_window_offsets, display_lookup, live_by_name, live_ids
+        user_window_offsets,
+        display_lookup,
+        live_by_name,
+        live_ids,
+        window_id_predicate,
+        recover_stale_ids_by_name,
     )
     return changed

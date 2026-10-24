@@ -34,6 +34,7 @@ from pathlib import Path
 
 import libtmux
 from libtmux.exc import LibTmuxException
+from libtmux.neo import fetch_objs
 
 from ..config import config
 from .base import (
@@ -98,8 +99,10 @@ _TMUX_CAPABILITIES = MultiplexerCapabilities(
     self_identify_env="TMUX_PANE",
     supports_event_stream=False,
     native_worktrees=False,
+    recovers_stale_ids_by_name=False,
     supports_workspace_selection=False,
     native_topic_targets=False,
+    supports_shell_prompt_markers=True,
 )
 
 
@@ -163,16 +166,24 @@ class TmuxManager:
         return session
 
     @staticmethod
-    def _window_ref_for_reconciliation(window: libtmux.Window) -> TmuxWindow | None:
-        """Build a window ref while treating pane metadata as optional."""
+    def _window_ref_for_reconciliation(window: libtmux.Window) -> TmuxWindow:
+        """Build a window ref while treating pane metadata as optional.
+
+        Every window in the session comes back, including the ones
+        ``list_windows`` hides: the placeholder main window, ccgram's own
+        window, and the ``_``-prefixed hidden ones. Omitting them here made a
+        bound window vanish from liveness the moment it was renamed to start
+        with an underscore, and a window absent from this listing is a ghost
+        binding that /sync Fix offers to close. They come back stamped
+        ``topic_eligible=False`` so discovery still refuses to adopt them.
+        """
         name = window.window_name or ""
         window_id = window.window_id or ""
-        if name == config.tmux_main_window_name:
-            return None
-        if config.own_window_id and window_id == config.own_window_id:
-            return None
-        if name.startswith("_"):
-            return None
+        adoptable = not (
+            name == config.tmux_main_window_name
+            or (config.own_window_id and window_id == config.own_window_id)
+            or name.startswith("_")
+        )
 
         cwd = ""
         pane_cmd = ""
@@ -198,6 +209,7 @@ class TmuxManager:
             pane_tty=pane_tty,
             pane_width=pw,
             pane_height=ph,
+            topic_eligible=bool(adoptable),
         )
 
     async def list_windows(self) -> list[TmuxWindow]:
@@ -257,20 +269,37 @@ class TmuxManager:
 
         return await asyncio.to_thread(_sync_list_windows)
 
+    def _fetch_session(self) -> libtmux.Session | None:
+        """Find the configured session, letting a failed listing raise.
+
+        ``Server.sessions`` wraps its listing in ``except Exception: pass`` and
+        hands back an empty ``QueryList``, so an unreachable or broken tmux is
+        indistinguishable from a server with no sessions. Every caller that
+        needs the difference would read "no such session", and the
+        reconciliation listing would answer ``[]`` - a confirmed empty listing,
+        on which the audit closes topics and prunes state.
+
+        Going to ``fetch_objs`` directly keeps the failure visible. A listing
+        that succeeds without the configured session still means ``[]``: the
+        server answered, the session is genuinely not there.
+        """
+        objs = fetch_objs(list_cmd="list-sessions", server=self.server)
+        for obj in objs:
+            if obj.get("session_name") == self.session_name:
+                return libtmux.Session(server=self.server, **obj)
+        return None
+
     async def list_windows_for_reconciliation(self) -> list[TmuxWindow] | None:
         """List windows, or return None when tmux cannot confirm the session."""
 
         def _sync_list_windows() -> list[TmuxWindow] | None:
             try:
-                session = self.server.sessions.get(
-                    session_name=self.session_name, default=None
-                )
+                session = self._fetch_session()
                 if session is None:
                     return []
                 windows = [
-                    ref
+                    self._window_ref_for_reconciliation(window)
                     for window in session.windows
-                    if (ref := self._window_ref_for_reconciliation(window)) is not None
                 ]
             except _TmuxError:
                 self._reset_server()
@@ -297,14 +326,21 @@ class TmuxManager:
     async def find_window_by_id(self, window_id: str) -> TmuxWindow | None:
         """Find a window by its tmux window ID (e.g. '@0', '@12').
 
+        Resolves against the complete listing, as agterm and herdr do:
+        addressing a known id is not discovery. Every handler routes an
+        already-bound window through here, so filtering by adoptability made a
+        window unreachable — no text delivered, no screenshot, no toolbar — the
+        moment it was renamed to start with an underscore.
+
         Args:
             window_id: The tmux window ID to match
 
         Returns:
-            TmuxWindow if found, None otherwise
+            TmuxWindow if found, None otherwise (including when tmux could not
+            confirm the listing).
         """
-        windows = await self.list_windows()
-        for window in windows:
+        windows = await self.list_windows_for_reconciliation()
+        for window in windows or []:
             if window.window_id == window_id:
                 return window
         return None
@@ -552,9 +588,15 @@ class TmuxManager:
         return await asyncio.to_thread(_sync_capture)
 
     def _pane_send(
-        self, window_id: str, chars: str, *, enter: bool, literal: bool
+        self,
+        window_id: str,
+        chars: str,
+        *,
+        enter: bool,
+        literal: bool,
+        pane_id: str | None = None,
     ) -> bool:
-        """Synchronous helper: send keys to the active pane of a window."""
+        """Send keys to the specified pane, or the active pane when omitted."""
         session = self.get_session()
         if not session:
             logger.debug("No tmux session found")
@@ -564,7 +606,11 @@ class TmuxManager:
             if not window:
                 logger.debug("Window %s not found", window_id)
                 return False
-            pane = window.active_pane
+            pane = (
+                self._find_pane(pane_id, session, window_id=window_id)
+                if pane_id
+                else window.active_pane
+            )
             if not pane:
                 logger.debug("No active pane in window %s", window_id)
                 return False
@@ -574,7 +620,9 @@ class TmuxManager:
             logger.exception("Failed to send keys to window %s", window_id)
             return False
 
-    async def _ensure_vim_insert_mode(self, window_id: str) -> None:
+    async def _ensure_vim_insert_mode(
+        self, window_id: str, *, pane_id: str | None = None
+    ) -> None:
         """Enter vim INSERT mode before sending text — only when vim is known on.
 
         Vim state is observed by status polling: notify_vim_insert_seen sets the
@@ -602,7 +650,11 @@ class TmuxManager:
         if _vim_state.get(window_id) is not True:
             return
 
-        pane_text = await self.capture_pane(window_id)
+        pane_text = (
+            await self.capture_pane_by_id(pane_id, window_id=window_id)
+            if pane_id
+            else await self.capture_pane(window_id)
+        )
         if not pane_text:
             return
 
@@ -611,10 +663,17 @@ class TmuxManager:
 
         # vim on, no INSERT indicator → NORMAL mode; enter INSERT.
         await asyncio.to_thread(
-            self._pane_send, window_id, "i", enter=False, literal=True
+            self._pane_send,
+            window_id,
+            "i",
+            enter=False,
+            literal=True,
+            **({"pane_id": pane_id} if pane_id else {}),
         )
 
-    async def _send_literal_then_enter(self, window_id: str, text: str) -> bool:
+    async def _send_literal_then_enter(
+        self, window_id: str, text: str, *, pane_id: str | None = None
+    ) -> bool:
         """Send literal text followed by Enter with a delay.
 
         Claude Code's TUI sometimes interprets a rapid-fire Enter
@@ -630,32 +689,42 @@ class TmuxManager:
         """
         lock = _vim_locks.setdefault(window_id, asyncio.Lock())
         async with lock:
-            return await self._send_literal_then_enter_locked(window_id, text)
+            return await self._send_literal_then_enter_locked(
+                window_id, text, **({"pane_id": pane_id} if pane_id else {})
+            )
 
-    async def _send_literal_then_enter_locked(self, window_id: str, text: str) -> bool:
+    async def _send_literal_then_enter_locked(
+        self, window_id: str, text: str, *, pane_id: str | None = None
+    ) -> bool:
         """Inner send implementation (must be called under per-window lock)."""
-        await self._ensure_vim_insert_mode(window_id)
+        pane_args = {"pane_id": pane_id} if pane_id else {}
+        await self._ensure_vim_insert_mode(window_id, **pane_args)
 
         if text.startswith("!"):
             if not await asyncio.to_thread(
-                self._pane_send, window_id, "!", enter=False, literal=True
+                self._pane_send, window_id, "!", enter=False, literal=True, **pane_args
             ):
                 return False
             rest = text[1:]
             if rest:
                 await asyncio.sleep(1.0)
                 if not await asyncio.to_thread(
-                    self._pane_send, window_id, rest, enter=False, literal=True
+                    self._pane_send,
+                    window_id,
+                    rest,
+                    enter=False,
+                    literal=True,
+                    **pane_args,
                 ):
                     return False
         else:
             if not await asyncio.to_thread(
-                self._pane_send, window_id, text, enter=False, literal=True
+                self._pane_send, window_id, text, enter=False, literal=True, **pane_args
             ):
                 return False
         await asyncio.sleep(0.5)
         return await asyncio.to_thread(
-            self._pane_send, window_id, "", enter=True, literal=False
+            self._pane_send, window_id, "", enter=True, literal=False, **pane_args
         )
 
     async def send_keys(
@@ -961,8 +1030,8 @@ class TmuxManager:
 
         # Create window in thread
         def _create_and_start() -> tuple[bool, str, str, str]:
-            session = self.get_or_create_session()
             try:
+                session = self.get_or_create_session()
                 # Create new window
                 window = session.new_window(
                     window_name=final_window_name,
@@ -1117,8 +1186,24 @@ class TmuxManager:
         enter: bool = True,
         literal: bool = True,
         window_id: str | None = None,
+        raw: bool = True,
     ) -> bool:
-        """Send text to a specific pane (alias of ``send_keys_to_pane``)."""
+        """Send to a pinned pane, preserving safe TUI submission for messages."""
+        if literal and enter and not raw:
+            # Resolve ownership once, then pin every capture/key in the sequence.
+            def owner() -> str | None:
+                session = self.get_session()
+                pane = (
+                    self._find_pane(pane_id, session, window_id=window_id)
+                    if session
+                    else None
+                )
+                return pane.window_id if pane else None
+
+            owner_id = window_id or await asyncio.to_thread(owner)
+            if owner_id is None:
+                return False
+            return await self._send_literal_then_enter(owner_id, text, pane_id=pane_id)
         return await self.send_keys_to_pane(
             pane_id, text, enter=enter, literal=literal, window_id=window_id
         )
@@ -1248,6 +1333,3 @@ class TmuxManager:
 
 # Global instance with default session name
 tmux_manager = TmuxManager()
-
-# ``send_to_window`` / ``send_followup_to_window`` moved to
-# ``multiplexer.window_ops`` (backend-neutral; they route through the proxy).

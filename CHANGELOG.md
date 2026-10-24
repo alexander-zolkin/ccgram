@@ -5,285 +5,529 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.17.0] - 2026-10-21
+
+### Shared session core for Telegram and mobile
+
+Telegram and the optional mobile API now control the same terminal agents through
+one session core ([#330](https://github.com/alexei-led/ccgram/pull/330)). Agents keep
+running in their existing terminals, with no SDK wrapper or second agent process.
+
+### Added
+- Add the authenticated `ccgram/1` HTTP/WebSocket API with device pairing and revocation, structured history, agent requests, uploads, terminal controls, and bounded event replay. See the [API setup guide](https://github.com/alexei-led/ccgram/blob/v4.17.0/docs/protocol/operations.md).
+- Publish versioned schemas and shared server/client fixtures in `protocol/v1/`. The native iOS app, APNs, and a Telegram-free process remain future work.
+
+### Changed
+- Route Telegram input and session controls through the shared executor, including atomic shell submission and prompt setup. Binding checks, input locks, and durable action IDs also protect mobile input.
+- Normalize provider transcripts once for both clients. Telegram keeps its rendering, delivery receipts, and restart-safe checkpoints.
+
+### Upgrade
+1. Stop existing ccgram processes before upgrading. Only one core per backend is allowed for each OS user, even across configuration directories and tmux session names. For multiple Telegram groups, use the [single-core setup](https://github.com/alexei-led/ccgram/blob/v4.17.0/docs/guides.md#multi-instance-setup). A second process with the same backend cannot start.
+2. Upgrade with your installation method, then restart ccgram:
+
+   ```console
+   uv tool upgrade ccgram
+   # Or, for Homebrew installations:
+   brew upgrade ccgram
+   ```
+
+3. Keep `protocol.sqlite3` and `uploads/` with the ccgram state after first startup. Removing the database loses action deduplication records. The mobile listener stays disabled until `CCGRAM_API_PORT` is set. Existing Telegram credentials are still required.
+
+[Full Changelog](https://github.com/alexei-led/ccgram/compare/v4.16.0...v4.17.0)
+
+## [4.16.0] - 2026-10-08
+
+### Added
+- Add a topic-scoped `/dashboard` command and panel action that send a signed Mini App link privately; use `/start` first if the bot has not started a private chat ([#320](https://github.com/alexei-led/ccgram/pull/320)).
+
+### Fixed
+- Make `CCGRAM_WHISPER_TIMEOUT` configurable while keeping the 60-second default, and report timeout failures clearly ([#303](https://github.com/alexei-led/ccgram/pull/303)).
+- Keep advisory terminal selections usable without blocking ordinary text forwarding ([#313](https://github.com/alexei-led/ccgram/pull/313)).
+- Match provider command errors to the exact dispatched command, including custom names and punctuation, so stale or unrelated errors do not produce false notices ([#316](https://github.com/alexei-led/ccgram/pull/316)).
+- Reject echoed numbered transcript text as a live selection while preserving wrapped live menus ([#317](https://github.com/alexei-led/ccgram/pull/317)).
+- Preserve user-chosen topic names through backend listing refreshes, alias consolidation, and topic rebinding ([#318](https://github.com/alexei-led/ccgram/pull/318)).
+- Keep native agent status fresh for probe-only backends and bound stale cache entries ([#319](https://github.com/alexei-led/ccgram/pull/319)).
+
+### Upgrade
+- No configuration migration is required. To use `/dashboard`, set the existing `CCGRAM_MINIAPP_BASE_URL` and start a private chat with the bot using `/start`. Set `CCGRAM_WHISPER_TIMEOUT` only if you need a different transcription deadline; the default remains 60 seconds.
+
+### Thanks
+- Thanks to [@paoloantinori](https://github.com/paoloantinori) for the Whisper timeout fix, the Mini App entry-point report, and for surfacing several regressions addressed in this release.
+
+[Full Changelog](https://github.com/alexei-led/ccgram/compare/v4.15.1...v4.16.0)
+
+## [4.15.1] - 2026-10-08
+
+### Fixed
+- Keep `/sync` quiet by removing its scan of every bound Telegram topic; it no longer posts temporary probe messages and still cleans up topics for confirmed-closed sessions.
+- Verify abandoned topic-creation records by editing the recorded topic title instead of posting a probe message. A changed title can generate a Telegram rename notice; status badges may return on a later refresh.
+
+## [4.15.0] - 2026-10-08
+
+### Added
+- Add topic-aware `/commands` panels with session-specific CCGram actions and provider-native command names. General shows only shared controls; destructive actions require confirmation.
+- Keep `/commands`, `/sessions`, `/sync`, and `/upgrade` in Telegram’s shared slash-command suggestions, with `/commands` opening the current topic’s panel.
+
+### Fixed
+- Forward panel callbacks as the clicking Telegram user so native provider commands reach the bound session.
+- Reuse the topic’s cached panel on `/commands` and restore it after confirming an agent action.
+- Refresh owner-validated panels when their callback token expires, without dispatching the stale button.
+- Stop logging the same agent-to-shell recovery state on every polling cycle.
+
+### Upgrade
+- Restart ccgram after upgrading to register the shared slash-command menu. Send `/commands` once to refresh panels from an older version if their buttons report expiration. No configuration migration is required.
+
+## [4.14.1] - 2026-10-03
+
+### Fixed
+- Notify the agent with the absolute upload path ([#296](https://github.com/alexei-led/ccgram/pull/296))
+
+## [4.14.0] - 2026-10-01
+
+### Fixed
+- Stop treating structural selection guesses as blocking prompts: the keyboard is still shown and its taps still work, but only a named pattern or a transcript `tool_use` detection latches blocking mode, and a numbered list far above the pane tail is no longer mistaken for a live selection footer ([#293](https://github.com/alexei-led/ccgram/pull/293))
+
+## [4.13.0] - 2026-10-01
+
+### Added
+- Interactive UI edits get a priority lane inside the group flood budget: they are served before queued background deliveries without spending extra tokens, and a burst of taps cannot starve background messages ([#282](https://github.com/alexei-led/ccgram/pull/282))
+- Warn once per affected topic when the delivered watermark stays frozen while the transcript keeps growing; `CCGRAM_DELIVERY_WATCH_GAP_KB` tunes the gap (default 256 KB, `0` disables the watch) ([#287](https://github.com/alexei-led/ccgram/pull/287))
+- Force exit when graceful shutdown wedges: a watchdog armed on signals and on the polling-conflict and `/upgrade` stop paths exits with the stop's own code after 600 seconds ([#294](https://github.com/alexei-led/ccgram/pull/294))
+
+### Fixed
+- Stop herdr topic creation from minting a target out of the rotating terminal-fallback id; fallback records are excluded from adoption and the created pane is pinned by the terminal id from the create response ([#286](https://github.com/alexei-led/ccgram/pull/286))
+- Stop killing a new hookless window before its CLI starts: the launch waits for the pane to leave its shell, and a timed-out wait quarantines the target instead of binding it ([#285](https://github.com/alexei-led/ccgram/pull/285))
+- Dismiss a stuck prompt on its owning pane and forward the user's text only after the dismissal is confirmed, so it can no longer be swallowed by the modal ([#266](https://github.com/alexei-led/ccgram/pull/266))
+- Read provider evidence from the executable basename and, for wrapper commands, the script argument only; helper data paths, `-e` code strings, and flag values no longer misreport the provider ([#294](https://github.com/alexei-led/ccgram/pull/294))
+- Keep a hookless claim quarantined while its pane still runs the launch shell, bounded by a 180-second grace before the normal commit lets the window lifecycle settle a CLI that never started ([#294](https://github.com/alexei-led/ccgram/pull/294))
+- Report a complete assistant message that finds no routed topic as a warning instead of dropping it at debug level ([#288](https://github.com/alexei-led/ccgram/pull/288))
+
+### Improved
+- `wait_for_session_map_entry` allows up to 15 seconds for a slow SessionStart hook write before giving up, covering slow boots after creation already found the session-backed record ([#286](https://github.com/alexei-led/ccgram/pull/286))
+- Document `CCGRAM_DELIVERY_WATCH_GAP_KB` in `.env.example` and `docs/guides.md`.
+
+## [4.12.3] - 2026-09-24
+
+### Fixed
+- Reconcile guarded agterm split IDs during liveness checks so `/sync` can retire confirmed-closed split topics while preserving topics when the backend is unavailable or the pane state is unknown.
+- Preserve primary sessions across same-provider hooks, defer session-map snapshots invalidated by provider selection, and keep queued transcript tails for same-provider `/new` or `/clear` while rejecting other-provider content.
+- Avoid sending Ctrl+C to agterm shells when prompt markers are unsupported and the shell may be running a builtin or waiting for input.
+- Retry OpenAI-compatible requests once without `temperature` only when the API explicitly rejects that parameter; include safe error type, code, and parameter details otherwise.
+- Resolve Pi `AskUserQuestion` menus into Telegram choices and recognize agterm foreground shell metadata without offering unsupported prompt setup.
+
+### Improved
+- Show compact provider labels in Telegram topics and the `/agent` picker, with one quiet notice after a stable automatic provider change.
+
+## [4.12.2] - 2026-09-23
+
+### Fixed
+- Discover agterm split peers as separate Telegram topics, including hidden splits, with pane-specific provider, cwd, status and terminal I/O.
+- Resolve agterm hooks against the live agent and explicit CLI session ID so Pi and Claude peer-chat sessions cannot overwrite each other's transcript bindings. Recover already-running agents on a later hook without restarting them.
+- Recognize Pi hook-runner's environment marker when the bash-only Pi marker is absent.
+- Reject stale split targets after peer closure, promotion or command changes; prevent split topics from closing or renaming the shared session. Input uses a non-atomic foreground guard; identical-command restarts reuse the target.
+
+## [4.12.1] - 2026-09-23
+
+### Fixed
+- Recognize Pi hook-runner events without provider metadata in agterm, restoring transcript registration and message forwarding.
+- Ignore background Pi subagent hooks so they cannot replace the parent session's topic binding or publish lifecycle events into it.
+- Honor an explicit `hook --provider claude` even when the hook inherits a Pi environment.
+
+## [4.12.0] - 2026-09-23
+
+### Added
+- CCGRAM_AUTODELETE_DEAD_TOPICS keeps dead topics and their bindings ([#273](https://github.com/alexei-led/ccgram/pull/273))
+
+
+### Fixed
+- Bound the interactive queue join so monitor dispatch never freezes ([#263](https://github.com/alexei-led/ccgram/pull/263))
+- Expire backlog skip barriers whose notice never delivers ([#265](https://github.com/alexei-led/ccgram/pull/265))
+- Retain Codex approval choices after earlier chat prompts ([#254](https://github.com/alexei-led/ccgram/pull/254))
+
+## [4.11.4] - 2026-09-23
+
+### Fixed
+- Hook config import, update-notice status, typing-action message loss ([#278](https://github.com/alexei-led/ccgram/pull/278))
+
+## [4.11.3] - 2026-09-23
+
+### Added
+- Auto-detect terminal multiplexer from environment variables
+
+## [4.11.2] - 2026-09-14
+
+### Fixed
+- Expire topic probe suspension ([#240](https://github.com/alexei-led/ccgram/pull/240))
+
+## [4.11.0] - 2026-09-14
+
+### Added
+- Mirror terminal session lifecycle in Telegram topics ([#249](https://github.com/alexei-led/ccgram/pull/249))
+
+## [4.10.5] - 2026-09-13
+
+### Documentation
+- Update CHANGELOG.md for v4.10.5
+- Preserve Python module name in changelog
+
+
+### Fixed
+- Delete topics for closed terminal sessions
+- Protect legacy topic identity during cleanup ([#247](https://github.com/alexei-led/ccgram/pull/247))
+
+## [4.10.4] - 2026-09-13
+
+### Documentation
+- Update CHANGELOG.md for v4.10.4
+
+
+### Fixed
+- Pyright-clean the new text handler and tmux tests
+- Key session_map by ccgram's session for grouped tmux sessions
+
+## [4.10.3] - 2026-09-05
+
+### Documentation
+- Describe stale ID recovery capability
+- Describe gated startup remapping
+- Document herdr event translation shape
+
+
+### Fixed
+- Resolve issue #228
+- Address review findings
+- Tighten YOLO prompt detection
+- Exit promptly on YOLO footer
+- Resolve issue #225
+- Preserve opaque lifecycle IDs
+- Address review findings
+- Preserve prefixed lifecycle lookup
+- Canonicalize session map read boundaries
+- Prevent duplicate case-variant adoption
+- Serialize case-variant topic creation
+- Canonicalize pending creation guards
+- Canonicalize session map wait keys
+- Preserve canonical creation guard on aliases
+- Preserve stable opaque IDs at startup ([#234](https://github.com/alexei-led/ccgram/pull/234))
+- Resolve issue #222 ([#230](https://github.com/alexei-led/ccgram/pull/230))
+- Canonicalize IDs during state maintenance ([#231](https://github.com/alexei-led/ccgram/pull/231))
+- Canonicalize IDs at live-listing boundaries ([#232](https://github.com/alexei-led/ccgram/pull/232))
+- Protect state during auto-topic creation
+- Release creation guard on Telegram errors
+- Back off repeated topic timeouts
+- Isolate topic failures and preserve variant state
+- Avoid backoff for definitive topic errors
+- Resolve issue #227
+- Address review findings
+
+## [4.10.2] - 2026-09-05
+
+### Fixed
+- Migrate Codex hooks feature flag ([#237](https://github.com/alexei-led/ccgram/pull/237))
+
+## [4.10.1] - 2026-09-04
+
+### Documentation
+- Describe current multiplexer contracts
+
+
+### Fixed
+- Distinguish tmux outage from empty session
+- Make topic eligibility a backend verdict
+- Separate selection listing from confirmed liveness
+- Guard destructive actions with tri-state presence
+- Recover dead windows across provider changes ([#229](https://github.com/alexei-led/ccgram/pull/229))
+
+## [4.10.0] - 2026-09-03
+
+### Fixed
+- Harden live agent delivery ([#218](https://github.com/alexei-led/ccgram/pull/218))
+
+## [4.9.8] - 2026-09-02
+
+### Fixed
+- Preserve status coalescing state
+
+## [4.9.7] - 2026-09-02
+
+### Fixed
+- Bound queued status refreshes
+
+## [4.9.6] - 2026-09-02
+
+### Fixed
+- Harden live hook and callback delivery
+
+## [4.9.5] - 2026-09-02
+
+### Fixed
+- Drop queued messages for closed sessions
+
 ## [4.9.4] - 2026-08-31
 
 ### Added
-
-- Support Telegram topics in private bot chats. Topic 1 remains the General/control topic.
-- Add direct Telegram buttons for supported numbered and yes/no agent prompts.
-
-### Fixed
-
-- Prevent one chat window from remaining bound to topics owned by different users.
-- Reject hook events with a backend or session prefix that does not match the active session.
-
-### Contributors
-
-- Thanks to [@bjesuiter](https://github.com/bjesuiter) for the private-chat topic request in #156.
-- Thanks to [@Akash-Saini-ai](https://github.com/Akash-Saini-ai) for the direct-choice request in #193.
-- Thanks to [@paoloantinori](https://github.com/paoloantinori) for the production reports in #196 and #202.
+- Harden topic routing and support private topics
 
 ## [4.9.3] - 2026-08-31
 
+### Documentation
+- Add v4.9.3 release notes
+
+
 ### Fixed
-
-- Persist the longest settled delivery prefix during sustained output, preventing restart replay backlogs from starving live topics.
-- Preserve at-least-once replay for pending or failed deliveries and protect watermark commits with checkpoint, pending-tool, and pending-skip fences.
-
-### Contributors
-
-- Thanks to [@paoloantinori](https://github.com/paoloantinori) for the production-driven PR #207.
+- Commit settled receipt prefixes incrementally ([#207](https://github.com/alexei-led/ccgram/pull/207))
 
 ## [4.9.2] - 2026-08-31
 
 ### Fixed
-
-- Prevent topic-rename flood control from rearming indefinitely after `RetryAfter`.
-- Pace topic renames across restart bursts without dropping pending names.
-- Keep Telegram `RetryAfter` sleeps local to the limited request instead of stalling unrelated chats.
-- Serialize `/sync` renames per chat and consolidate retry-delay handling across request paths.
-
-### Documentation
-
-- Document tmux, Herdr, and agterm backends, including agterm setup and macOS limits.
-- Document shared-token rate-limit considerations for multi-instance deployments.
-
-### Contributors
-
-- Thanks to [@paoloantinori](https://github.com/paoloantinori) for PR #206 and the topic-rename flood-control fix.
+- Pause chat renames on flood control, pace the rename burst ([#206](https://github.com/alexei-led/ccgram/pull/206))
+- Harden topic rename flood control and document backends
 
 ## [4.9.1] - 2026-08-31
 
+### Added
+- Complete agterm workspace and status support
+
+
 ### Fixed
-
-- Let `ccgram doctor` and `ccgram status` load the agterm backend without Telegram credentials.
-- Expand `~` before CCGram passes a work directory to `agtermctl`.
-- Keep workspace selection separate from native agent status and guarded topic targets.
-- Report native agterm session status and classify providers when the process-group ID is unavailable.
-- Declare the asynchronous test cleanup fixture with the pytest asyncio plugin.
-
-### Contributors
-
-- Thanks to [@paskal](https://github.com/paskal) for the agterm backend and focused tests.
+- Gate workspace picker on explicit capability
 
 ## [4.9.0] - 2026-08-31
 
-### Added
-
-- Add an agterm multiplexer backend for session discovery, transcript reads, input, lifecycle actions, and reconciliation.
-- Add agterm workspace filtering through `CCGRAM_AGTERM_WORKSPACES`.
-
 ### Fixed
-
-- Detect the foreground provider when a multiplexer cannot provide a process-group ID.
-- Keep provider detection independent from stale process-group cache entries in this case.
-
-### Contributors
-
-- Thanks to [@paskal](https://github.com/paskal) for the agterm backend, focused tests, and design notes.
+- Classify providers without a foreground pgid ([#209](https://github.com/alexei-led/ccgram/pull/209))
 
 ## [4.8.0] - 2026-08-30
 
-### Added
+### Documentation
+- Document queue delivery and sync cleanup
 
-- Add lossless queued text batching and source-scoped backlog telemetry for large transcript backlogs.
-- Add `/sync` cleanup for locally known retired Telegram topics.
-- Add a confirmed, retry-safe **Jump to live** action with visible skipped-range notices while retaining raw transcripts.
 
 ### Fixed
-
-- Revalidate topic ownership at backlog purge, notice delivery, and watermark commit boundaries.
-- Preserve backlog skip barriers, receipts, and retired counts across retries, restarts, session re-keying, and topic rebounds.
-- Honor Telegram UTF-16 message limits without truncating batched text or entity offsets.
+- Batch eligible queued text messages
+- Clean up known retired topics from sync
+- Guard live jump for severe transcript backlogs
+- Make backlog skips retry safely
+- Close backlog skip race conditions
+- Close remaining backlog skip lifecycle races
+- Revalidate backlog notices at delivery and commit
+- Report skip notice enqueue failures
 
 ## [4.7.1] - 2026-08-30
 
 ### Fixed
-
-- Stop stale Herdr sessions from relaying retained transcripts while preserving durable session identity.
-- Handle Telegram flood control with quiet, bounded retries and durable queue backoff without advancing undelivered transcript offsets.
-- Prevent topic-existence probes from retrying flood-limited administrative requests.
+- Stabilize Telegram delivery and stale Herdr monitoring
 
 ## [4.7.0] - 2026-08-30
 
 ### Added
-
-- Support one Telegram topic per Herdr agent pane, including multiple agents in one tab.
-
-### Fixed
-
-- Prevent Telegram flood-control retries from overwhelming outbound delivery.
-- Preserve guarded Herdr identity across restarts, renames, and shared tabs.
-- Accept Herdr protocols 14–20 and continue best-effort with later protocol versions.
+- Support pane-scoped Herdr topics
 
 ## [4.6.8] - 2026-08-26
 
 ### Fixed
-
-- Preserve transcript messages across shutdowns and Telegram delivery failures. Offsets now advance only after confirmed delivery, with bounded queue draining and safe replay ([#179](https://github.com/alexei-led/ccgram/issues/179)).
-- Avoid repeated `Ready` notifications after restart while preserving genuine hookless provider completion signals ([#180](https://github.com/alexei-led/ccgram/issues/180)).
-- Recover legacy Herdr identity bindings through safe alias migration without destructive pruning or cross-session routing ([#187](https://github.com/alexei-led/ccgram/issues/187)).
+- Suppress restart-only Ready notifications ([#192](https://github.com/alexei-led/ccgram/pull/192))
+- Persist transcript offsets only after delivery ([#191](https://github.com/alexei-led/ccgram/pull/191))
+- Recover legacy Herdr identity bindings ([#190](https://github.com/alexei-led/ccgram/pull/190))
 
 ## [4.6.7] - 2026-08-26
 
 ### Fixed
-
-- Send prompt text and Enter as separate Herdr calls so agent TUIs process the text before receiving Enter. Bundling both into one `pane run` call caused prompts to sit unsent in the input line ([#177](https://github.com/alexei-led/ccgram/issues/177)).
-- Hide the 🪟 Dashboard button from status-bubble keyboards in group chats and forum topics. Telegram rejects `web_app` buttons outside private chats, so every status-bubble edit in a supergroup raised a `TelegramError` and the bubble stopped updating ([#178](https://github.com/alexei-led/ccgram/issues/178)).
-- Close expired topics instead of deleting them. Autoclose now calls `close_forum_topic`; deleting a topic is irreversible and destroyed topic history when the 4.6 upgrade orphaned bindings and the autoclose timer fired ([#187](https://github.com/alexei-led/ccgram/issues/187)).
+- Split herdr Enter, hide web_app in groups, close instead of delete on autoclose ([#189](https://github.com/alexei-led/ccgram/pull/189))
 
 ## [4.6.6] - 2026-08-26
 
-### Fixed
+### Documentation
+- Update CHANGELOG.md for v4.6.6
 
-- Report a missing session state correctly. The recovery buttons answered `Directory no longer exists.` for a directory that was present ([#176](https://github.com/alexei-led/ccgram/issues/176)).
-- Keep the window state of a bound topic after its session ends. The recovery banner reads the directory from this state, and its buttons need it.
-- Keep the state of windows bound to a chat-scoped topic. In a forum group, the stale-state sweep deleted this state on each poll cycle.
-- List sessions from the correct agent. `/resume`, `/restore` and the Browse button showed sessions of the default agent for a topic with an unknown agent.
-- Start the agent that owns the selected session. A resume from the recovery banner started the default agent with the arguments of a different agent.
-- Read the working directory of a Herdr agent from its own record. The value was empty, and transcript discovery used the wrong directory.
-- Detect Pi in a Herdr pane. Pi renames its process, and the pane looked like a `node` process.
-- Create the window state of a live window that has none. This repair keeps the session map of the hook intact.
+
+### Fixed
+- Use agent cwd and argv0 for herdr pane identity
+- Bootstrap window state for untracked live windows
+- Keep chat-scoped bindings out of the stale window sweep
+- Keep window state for bound windows when pruning dead session-map entries
+- Separate missing window state from a missing directory in recovery
+- Address code review findings on the recovery changes
+- Close two gaps in the merged resume scan
+- Normalise the unknown-provider rule inside scan_all_sessions
+- Give the unknown-provider rule one owner, and stop a test leaking bindings
+- Keep the herdr argv0 fallback from faking an idle shell
+- Undo two defects introduced by the previous round
+- Stop _bootstrap_identity destroying a live hook session_map entry
+- Treat an unreadable session map as unknown, not absent
+- Launch the picked session's own provider on a recovery resume
+- Close the bootstrap TOCTOU and align the resume gate with the scan
 
 ## [4.6.5] - 2026-08-23
 
 ### Added
+- Add voice and status visibility controls
 
-- Add opt-in voice auto-send and transient status-bubble visibility controls ([#175](https://github.com/alexei-led/ccgram/issues/175)).
+
+### Documentation
+- Update CHANGELOG.md for v4.6.5
+
 
 ### Fixed
-
-- Prevent agent-origin windows from falling back to unsafe shell input after an agent exits ([#174](https://github.com/alexei-led/ccgram/issues/174)).
-- Filter internal multi-agent messages from Telegram transcript relays ([#173](https://github.com/alexei-led/ccgram/issues/173)).
+- Prevent agent exits from becoming shell sessions
+- Filter internal multi-agent transcript messages
 
 ## [4.6.4] - 2026-08-20
 
-### Fixed
+### Documentation
+- Update CHANGELOG.md for v4.6.4
 
-- Support Herdr protocol 20 and continue startup with a warning when the protocol is newer, older, or otherwise marked incompatible; individual command failures still surface cleanly.
+
+### Fixed
+- Support forward-compatible Herdr protocols
 
 ## [4.6.3] - 2026-08-20
 
-### Fixed
+### Documentation
+- Update CHANGELOG.md for v4.6.3
 
-- Limit proactive topic checks to one request per Telegram chat per polling cycle, keep flood-control backoff chat-scoped, and retry failed checks without delaying unrelated chats.
-- Extend the `getUpdates` read timeout beyond Telegram's long-poll window to avoid needless HTTP client resets.
+
+### Fixed
+- Prevent Telegram topic probe bursts
 
 ## [4.6.2] - 2026-08-19
 
+### Documentation
+- Trim the session-lineage docstring to the file's house style
+
+
 ### Fixed
-
-- Prevent metadata-only transcript changes and concurrent appends from rewinding readers and replaying already delivered assistant messages ([#172](https://github.com/alexei-led/ccgram/pull/172)).
-- Preserve Telegram topic bindings when a Herdr agent re-keys its session during `/clear` or resume ([#170](https://github.com/alexei-led/ccgram/pull/170)).
-- Keep the default test suite runnable without the optional `edge-tts` dependency ([#167](https://github.com/alexei-led/ccgram/pull/167)).
-
-### Contributors
-
-- Thanks to @winternewt for preserving topics across Herdr session re-keys.
-- Thanks to @UN-9BOT for keeping the default test environment independent of optional TTS packages.
+- Fold a topic forward when an agent re-keys its session
+- Don't read two sessions on one terminal as a re-key
+- Fold a re-keyed identity before reading the map delta
+- Stop replaying whole transcripts on false replacement signals
+- Validate consumed transcript prefix on rewrites
 
 ## [4.6.1] - 2026-08-19
 
-### Fixed
+### Documentation
+- Update CHANGELOG.md for v4.6.1
 
-- Budget topic-existence probing so it no longer trips Telegram flood control, which paused all outbound Bot API traffic while it retried ([#171](https://github.com/alexei-led/ccgram/pull/171)).
-- Stop flood control from suspending deleted-topic detection for a topic that is still alive.
-- Probe topics normally when the machine has been up for less than the probe interval.
-- Log an isolated Telegram HTTP client reset at info; warn only when resets repeat without a successful request in between.
+
+### Fixed
+- Stop topic probe from tripping Telegram flood control
+- Treat never-probed topics as due at any uptime
 
 ## [4.6.0] - 2026-08-16
 
 ### Added
-
-- Stream Codex assistant replies to Telegram while the agent generates them ([#155](https://github.com/alexei-led/ccgram/issues/155)).
-- Show a temporary Telegram draft before the complete reply is saved.
-
-### Fixed
-
-- Keep message queue order when a streamed reply ends.
-- Retry draft updates after Telegram rate limits.
-- Retry failed final tool-batch sends.
-- Expire stalled assistant drafts and clean up their state.
-
-### Contributors
-
-- Thanks to @osovv for the feature request in [#155](https://github.com/alexei-led/ccgram/issues/155).
+- Stream assistant replies to Telegram
 
 ## [4.5.3] - 2026-08-16
 
+### Changed
+- Keep bootstrap imports explicit
+
+
 ### Fixed
-
-- Avoid transcript races when files are rewritten during reads.
-- Preserve canonical Herdr IDs through recovery and resume flows.
-- Retain active Herdr aliases during resolver pruning.
-
-### Contributors
-
-- Thanks to @paskal for preserving non-Latin upload filenames.
+- Bound Unicode upload filenames by bytes
+- Settle status correctly after restart
+- Process replaced whole-file transcripts
+- Preserve Herdr window identity across refreshes
+- Harden identity and transcript recovery flows
+- Detect transcript rewrites during reads
 
 ## [4.5.2] - 2026-08-15
 
 ### Fixed
-
-- Recover Telegram polling clients after concurrent timeouts without closing replacements.
-- Keep nested Herdr agent hooks from overwriting the live session mapping.
-- Support commands and replies in the General chat area.
-- Make `/sync` audits non-mutating and bounded when Telegram topic checks stall.
+- Harden Telegram commands and sync recovery
 
 ## [4.5.1] - 2026-08-08
 
 ### Fixed
-
-- Create and reconcile Telegram topics for detected Herdr agents that do not publish an `agent_session`.
+- Create topics for sessionless Herdr agents
 
 ## [4.5.0] - 2026-08-08
 
 ### Added
+- Add Google Antigravity CLI (agy) provider
+- Bind antigravity sessions
 
-- Add support for Google Antigravity CLI (`agy`) sessions.
-- Add Antigravity session binding for Herdr protocol 19.
-- Add Antigravity resume support from the Telegram session picker.
+
+### Documentation
+- Update CHANGELOG.md for v4.5.0
+
 
 ### Fixed
+- Address review feedback with platform discovery, CWD matching, and capability remediation
+- Address follow-up review feedback for launch wiring, CWD identity, recovery discovery, and tool IDs
+- Scope resumable sessions to providers
+- Harden antigravity transcripts
+- Scope antigravity detection
+- Guard topic creation lifecycle
+- Harden creation transaction cleanup
 
-- Prevent a topic-creation race when a new Herdr target starts.
-- Read a workspace path from a Herdr pane when the workspace record has no path.
+## [4.4.3] - 2026-08-06
 
-### Contributors
+### Fixed
+- Use configured group for unbound topics
 
-- Thanks to @ChakshuGrover for the Google Antigravity provider.
+## [4.4.2] - 2026-08-06
+
+### Documentation
+- Add CONTRIBUTING.md and PR template
+
+
+### Fixed
+- Treat a shell-wrapped claude as primary, not nested
+- Key session_map under the session readers resolve against
+
+## [4.4.1] - 2026-08-06
+
+### Fixed
+- Harden Telegram topic, polling, relay, and multi-chat session boundaries
+
+## [4.4.0] - 2026-08-05
+
+### Added
+- Add guarded session target seam
+
+
+### Fixed
+- Fix guarded Herdr target validation and creation
+- Fix herdr guarded session regressions
+- Fix launch target cleanup timeout
+- Fix legacy rollback and callback token cleanup
+- Preserve Fusion callback targets
+- Harden Herdr target boundaries
+- Harden Herdr target boundaries
+- Harden herdr protocol 17 integration
+- Subscribe to pane close events
 
 ## [4.3.12] - 2026-08-02
 
 ### Fixed
-
-- Detect Claude hooks when `CLAUDE_CONFIG_DIR` changes the transcript path ([#133](https://github.com/alexei-led/ccgram/issues/133))
-- Skip status polling when a multiplexer cannot provide a reliable window list ([#130](https://github.com/alexei-led/ccgram/issues/130))
-- Add `CCGRAM_HIDE_THINKING` and `--hide-thinking` to suppress thinking messages ([#139](https://github.com/alexei-led/ccgram/issues/139))
-
-### Documentation
-
-- State Linux, macOS, and WSL2 support. State that native Windows is unsupported. ([#136](https://github.com/alexei-led/ccgram/issues/136))
+- Harden provider and status relays
 
 ## [4.3.11] - 2026-07-11
 
 ### Fixed
-
-- Continue in best-effort mode when Herdr reports an unverified protocol version
-- Support Herdr protocols 14, 15, and 16 without a startup warning
+- Support unverified protocol versions
 
 ## [4.3.10] - 2026-07-10
 
 ### Fixed
-- Preserve routing state when a multiplexer window listing is unavailable
-- Thanks to @NatBrian for reporting this issue in [#128](https://github.com/alexei-led/ccgram/pull/128).
+- Preserve routing state on listing failure (thanks @NatBrian)
 
 ## [4.3.9] - 2026-07-10
 
+### Documentation
+- Update CHANGELOG.md for v4.3.9
+
+
 ### Fixed
-- Render status blocks for Herdr's opaque pane IDs
+- Support opaque pane IDs
 
 ## [4.3.8] - 2026-07-09
+
+### Documentation
+- Update CHANGELOG.md for v4.3.8
+
 
 ### Fixed
 - Force posix_spawn path to stop MallocStackLogging spam

@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 from dataclasses import asdict
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,7 +23,9 @@ from ccgram.multiplexer.base import (
     PaneDims,
     WindowRef,
 )
+from ccgram.config import config
 from ccgram.multiplexer.tmux import TmuxManager
+from ccgram.window_resolver import LiveWindow, is_window_id, resolve_stale_ids
 
 
 @pytest.fixture
@@ -47,9 +50,48 @@ def test_capabilities_full_snapshot(mgr: TmuxManager) -> None:
         "supports_event_stream": False,
         "native_worktrees": False,
         "supports_display_name_rebind": True,
+        "recovers_stale_ids_by_name": False,
         "supports_workspace_selection": False,
         "native_topic_targets": False,
+        "supports_shell_prompt_markers": True,
     }
+
+
+def test_tmux_does_not_rebind_a_missing_id_by_display_name(
+    mgr: TmuxManager,
+) -> None:
+    old_id = "@0"
+    new_id = "@1"
+    state = SimpleNamespace(window_name="project")
+    window_states = {old_id: state}
+    thread_bindings = {100: {42: old_id}}
+    display_names = {old_id: "project"}
+
+    changed = resolve_stale_ids(
+        [LiveWindow(new_id, "project")],
+        window_states,
+        thread_bindings,
+        {},
+        display_names,
+        ids_stable=mgr.capabilities.ids_stable_across_restart,
+        window_id_predicate=is_window_id,
+        recover_stale_ids_by_name=mgr.capabilities.recovers_stale_ids_by_name,
+    )
+
+    assert changed is False
+    assert window_states == {old_id: state}
+    assert thread_bindings == {100: {42: old_id}}
+    assert display_names == {old_id: "project"}
+
+
+class _FakeWindow:
+    def __init__(self, window_id: str, window_name: str) -> None:
+        self.window_id = window_id
+        self.window_name = window_name
+
+    @property
+    def active_pane(self):
+        return None
 
 
 # ── Protocol conformance ───────────────────────────────────────────────
@@ -70,18 +112,64 @@ async def test_ensure_session_calls_get_or_create(mgr: TmuxManager) -> None:
         create.assert_called_once_with()
 
 
-async def test_reconciliation_listing_returns_none_without_session(
+async def test_reconciliation_listing_returns_empty_without_session(
     mgr: TmuxManager,
 ) -> None:
-    server = MagicMock()
-    server.sessions.get.return_value = None
-    mgr._server = server
+    """tmux answered, and the configured session is genuinely not there."""
+    with patch("ccgram.multiplexer.tmux.fetch_objs", return_value=[]):
+        assert await mgr.list_windows_for_reconciliation() == []
 
-    assert await mgr.list_windows_for_reconciliation() == []
 
-    server.sessions.get.side_effect = OSError("tmux unavailable")
-    assert await mgr.list_windows_for_reconciliation() is None
+async def test_reconciliation_listing_is_unknown_when_tmux_cannot_be_listed(
+    mgr: TmuxManager,
+) -> None:
+    """Through the real libtmux Server, because the stub cannot show this.
+
+    ``Server.sessions`` wraps its listing in ``except Exception: pass`` and
+    returns an empty QueryList, so a broken tmux looks exactly like a server
+    with no sessions. A test that patches ``sessions.get`` to raise is testing
+    a stub of the dependency, not the dependency: it passes either way. This
+    one fails the listing where libtmux actually performs it, which is the
+    shape a real outage has, and the answer must be unknown - the audit closes
+    topics and prunes state on a confirmed empty listing.
+    """
+    import libtmux.server
+
+    mgr._server = libtmux.server.Server()
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("tmux unavailable")
+
+    with (
+        patch("libtmux.server.fetch_objs", _boom),
+        patch("ccgram.multiplexer.tmux.fetch_objs", _boom),
+    ):
+        assert await mgr.list_windows_for_reconciliation() is None
+
     assert mgr._server is None
+
+
+async def test_reconciliation_listing_is_complete(mgr: TmuxManager) -> None:
+    """Every window in the session is listed, adoptable or not.
+
+    The listing answers "which windows exist", and absence from it is what
+    marks a binding a ghost for /sync Fix to close. The UI listing narrows to
+    what discovery may adopt; this one must not, or renaming a bound window to
+    the hidden ``_`` form silently makes it a closure candidate.
+    """
+    session = MagicMock()
+    session.windows = [
+        _FakeWindow("@0", config.tmux_main_window_name),
+        _FakeWindow("@4", "_paused"),
+        _FakeWindow("@5", "my-project"),
+    ]
+
+    with patch.object(mgr, "_fetch_session", return_value=session):
+        windows = await mgr.list_windows_for_reconciliation()
+
+    assert windows is not None
+    assert [w.window_id for w in windows] == ["@0", "@4", "@5"]
+    assert [w.topic_eligible for w in windows] == [False, False, True]
 
 
 def test_reconciliation_window_keeps_identity_when_pane_query_fails() -> None:
@@ -100,17 +188,88 @@ def test_reconciliation_window_keeps_identity_when_pane_query_fails() -> None:
     assert window.cwd == ""
 
 
+@pytest.mark.parametrize(
+    ("window_name", "window_id"),
+    [
+        ("_paused", "@4"),
+        (config.tmux_main_window_name, "@0"),
+    ],
+)
+def test_reconciliation_keeps_windows_list_windows_hides(
+    window_name: str, window_id: str
+) -> None:
+    """A window the UI listing hides is still live, and must still be listed.
+
+    Dropping it made a bound window vanish from liveness the moment it was
+    renamed to the hidden form — and a binding whose window is absent from
+    this listing is a ghost that /sync Fix offers to close. It comes back
+    ineligible so discovery still refuses it.
+    """
+    window = TmuxManager._window_ref_for_reconciliation(  # type: ignore[arg-type]
+        _FakeWindow(window_id, window_name)  # pyright: ignore[reportArgumentType]
+    )
+
+    assert window.window_id == window_id
+    assert window.topic_eligible is False
+
+
+def test_reconciliation_keeps_ccgram_own_window() -> None:
+    with patch.object(config, "own_window_id", "@9"):
+        window = TmuxManager._window_ref_for_reconciliation(  # type: ignore[arg-type]
+            _FakeWindow("@9", "ccgram")  # pyright: ignore[reportArgumentType]
+        )
+
+    assert window.window_id == "@9"
+    assert window.topic_eligible is False
+
+
+def test_reconciliation_marks_an_ordinary_window_adoptable() -> None:
+    window = TmuxManager._window_ref_for_reconciliation(  # type: ignore[arg-type]
+        _FakeWindow("@5", "my-project")  # pyright: ignore[reportArgumentType]
+    )
+
+    assert window.topic_eligible is True
+
+
 async def test_find_window_by_id_returns_windowref(mgr: TmuxManager) -> None:
     win = WindowRef(window_id="@3", window_name="proj", cwd="/tmp")
-    mgr.list_windows = AsyncMock(return_value=[win])  # type: ignore[method-assign]
+    mgr.list_windows_for_reconciliation = AsyncMock(return_value=[win])  # type: ignore[method-assign]
     result = await mgr.find_window_by_id("@3")
     assert result is win
     assert isinstance(result, WindowRef)
 
 
 async def test_find_window_by_id_missing_returns_none(mgr: TmuxManager) -> None:
-    mgr.list_windows = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    mgr.list_windows_for_reconciliation = AsyncMock(return_value=[])  # type: ignore[method-assign]
     assert await mgr.find_window_by_id("@99") is None
+
+
+async def test_find_window_by_id_resolves_a_window_list_windows_hides(
+    mgr: TmuxManager,
+) -> None:
+    """Addressing a known id is not discovery.
+
+    Every handler resolves an already-bound window through here. When this
+    read the adoption-filtered listing, renaming a bound window to the hidden
+    ``_`` form made it unreachable: no text delivered, no screenshot, no
+    toolbar, and nothing in the logs pointing at the rename.
+    """
+    hidden = WindowRef(
+        window_id="@3", window_name="_paused", cwd="/tmp", topic_eligible=False
+    )
+    mgr.list_windows = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    mgr.list_windows_for_reconciliation = AsyncMock(return_value=[hidden])  # type: ignore[method-assign]
+
+    assert await mgr.find_window_by_id("@3") is hidden
+
+
+async def test_find_window_by_id_none_listing_is_not_a_match(
+    mgr: TmuxManager,
+) -> None:
+    """An unconfirmed listing is not proof the window is gone, but it is also
+    not a window to drive: callers get None and retry on the next tick."""
+    mgr.list_windows_for_reconciliation = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    assert await mgr.find_window_by_id("@3") is None
 
 
 async def test_capture_pane_plain_returns_text(mgr: TmuxManager) -> None:
@@ -169,10 +328,10 @@ async def test_send_forwards_to_send_keys(mgr: TmuxManager) -> None:
 
 async def test_send_to_pane_forwards(mgr: TmuxManager) -> None:
     mgr.send_keys_to_pane = AsyncMock(return_value=True)  # type: ignore[method-assign]
-    ok = await mgr.send_to_pane("%2", "hi", enter=True, literal=True, window_id="@0")
+    ok = await mgr.send_to_pane("%2", "hi", enter=False, literal=True, window_id="@0")
     assert ok is True
     mgr.send_keys_to_pane.assert_awaited_once_with(
-        "%2", "hi", enter=True, literal=True, window_id="@0"
+        "%2", "hi", enter=False, literal=True, window_id="@0"
     )
 
 

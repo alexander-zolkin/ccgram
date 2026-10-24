@@ -238,6 +238,7 @@ async def test_whole_file_rewrite_bypasses_unchanged_mtime(tmp_path) -> None:
     reader = TranscriptReader(state, IdleTracker())
     provider = SimpleNamespace(
         capabilities=SimpleNamespace(
+            name="gemini",
             supports_incremental_read=False,
             supports_task_tracking=False,
         )
@@ -277,6 +278,7 @@ async def test_whole_file_replacement_bypasses_unchanged_mtime(tmp_path) -> None
     reader = TranscriptReader(state, IdleTracker())
     provider = SimpleNamespace(
         capabilities=SimpleNamespace(
+            name="gemini",
             supports_incremental_read=False,
             supports_task_tracking=False,
         )
@@ -521,3 +523,113 @@ async def test_bookkeeping_lines_on_idle_session_are_not_activity(tmp_path) -> N
         )
     await reader._process_session_file("sess", session_file, [], window_id="@1")
     assert idle.get_last_activity("sess") is not None
+
+
+def _assistant(blocks, stop=None) -> str:
+    import json
+
+    return (
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": blocks, "stop_reason": stop},
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+
+
+async def test_turn_end_marks_only_the_closing_text(tmp_path) -> None:
+    """CCGRAM-HOTFIX:webui-extras — the reply whose API message ended the turn
+    carries ``turn_end`` ("notify when done" rings on it only)."""
+    session_file = tmp_path / "transcript.jsonl"
+    session_file.write_text(
+        _assistant([{"type": "text", "text": "смотрю"}], "tool_use")
+        + _assistant(
+            [{"type": "tool_use", "id": "T1", "name": "Bash", "input": {}}],
+            "tool_use",
+        )
+        + _assistant([{"type": "thinking", "thinking": "ok" * 20}], "end_turn")
+        + _assistant([{"type": "text", "text": "готово"}], "end_turn"),
+        encoding="utf-8",
+    )
+    state = MonitorState(state_file=tmp_path / "monitor_state.json")
+    state.update_session(
+        TrackedSession("sess", str(session_file), last_byte_offset=0)
+    )
+    reader = TranscriptReader(state, IdleTracker())
+
+    messages = []
+    await reader._process_session_file("sess", session_file, messages, window_id="@1")
+
+    assert [(m.content_type, m.text) for m in messages if m.turn_end] == [
+        ("text", "готово")
+    ]
+
+
+async def test_non_utf8_line_is_decoded_instead_of_stalling(tmp_path) -> None:
+    """CCGRAM-HOTFIX:transcript-decode-guard — a stray non-UTF-8 byte inside a
+    JSON string is replaced, so the line (and everything after it) relays."""
+    bad = b'{"type":"assistant","message":{"content":[{"type":"text","text":"a\xff"}]}}\n'
+    good = _assistant([{"type": "text", "text": "b"}]).encode()
+    session_file = tmp_path / "transcript.jsonl"
+    session_file.write_bytes(bad + good)
+    state = MonitorState(state_file=tmp_path / "monitor_state.json")
+    state.update_session(
+        TrackedSession("sess", str(session_file), last_byte_offset=0)
+    )
+    reader = TranscriptReader(state, IdleTracker())
+
+    messages = []
+    await reader._process_session_file("sess", session_file, messages, window_id="@1")
+
+    assert [m.text for m in messages] == ["a�", "b"]
+    tracked = state.get_session("sess")
+    assert tracked is not None
+    assert tracked.parsed_offset == session_file.stat().st_size
+
+
+async def test_grok_rewrite_relays_only_new_entries(tmp_path) -> None:
+    """The fork's grok provider rewrites chat_history.jsonl in place; the
+    whole-file read diffs by entry index, so earlier lines rewritten with
+    different bytes are neither replayed nor mistaken for a replacement."""
+    import json
+
+    from ccgram.providers.grok import GrokProvider
+
+    def line(entry: dict) -> str:
+        return json.dumps(entry, ensure_ascii=False) + "\n"
+
+    first = [
+        {"type": "user", "content": "<user_query>\nпривет\n</user_query>"},
+        {"type": "reasoning", "summary": [], "status": "in_progress"},
+    ]
+    session_file = tmp_path / "chat_history.jsonl"
+    session_file.write_text("".join(line(e) for e in first), encoding="utf-8")
+    state = MonitorState(state_file=tmp_path / "monitor_state.json")
+    reader = TranscriptReader(state, IdleTracker())
+    provider = GrokProvider()
+
+    with patch(
+        "ccgram.transcript_reader._resolve_provider_for_file", return_value=provider
+    ):
+        messages = []
+        await reader._process_session_file(
+            "g1", session_file, messages, window_id="@1"
+        )
+        assert messages == []  # existing entries are history
+
+        first[1]["status"] = "completed"  # earlier line rewritten, new bytes
+        rewritten = first + [{"type": "assistant", "content": "Готово."}]
+        session_file.write_text(
+            "".join(line(e) for e in rewritten), encoding="utf-8"
+        )
+        await reader._process_session_file(
+            "g1", session_file, messages, window_id="@1"
+        )
+
+    assert [(m.role, m.text) for m in messages] == [("assistant", "Готово.")]
+    tracked = state.get_session("g1")
+    assert tracked is not None
+    assert tracked.parsed_offset == 3

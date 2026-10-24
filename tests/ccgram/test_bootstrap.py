@@ -1,8 +1,11 @@
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from ccgram import bootstrap
+from ccgram.session_protocol.models import ProtocolError
 
 
 @pytest.fixture(autouse=True)
@@ -15,8 +18,19 @@ def _reset_bootstrap_state():
 def _make_app() -> MagicMock:
     app = MagicMock()
     app.bot = AsyncMock()
+    app.bot_data = {}
     app.job_queue = None
     return app
+
+
+@pytest.mark.asyncio
+async def test_reset_clears_bound_session_resolver_service() -> None:
+    bootstrap.session_resolver.bind_session_service(cast(Any, object()))
+
+    bootstrap.reset_for_testing()
+
+    with pytest.raises(ProtocolError, match="Session service is not initialized"):
+        await bootstrap.session_resolver.get_recent_messages("@1")
 
 
 class TestBootstrapApplicationOrdering:
@@ -39,6 +53,9 @@ class TestBootstrapApplicationOrdering:
 
         assert result is instance
         instance.start.assert_called_once()
+        instance.register_delivery_consumer.assert_called_once()
+        assert instance.register_delivery_consumer.call_args.args[0] == "telegram"
+        instance.set_message_callback.assert_not_called()
         assert bootstrap.session_monitor is instance
 
 
@@ -162,6 +179,12 @@ class TestBootstrapApplication:
             ),
             patch("ccgram.bootstrap.session_manager") as sm,
             patch(
+                "ccgram.bootstrap.recover_topic_provisioning",
+                new=AsyncMock(
+                    side_effect=lambda _bot, **_kwargs: order.append("recover_creation")
+                ),
+            ),
+            patch(
                 "ccgram.bootstrap._adopt_unbound_windows",
                 new=AsyncMock(side_effect=lambda _bot: order.append("adopt")),
             ),
@@ -170,13 +193,37 @@ class TestBootstrapApplication:
                 side_effect=lambda: order.append("hooks"),
             ),
             patch(
+                "ccgram.session_protocol.runtime.start_runtime",
+                new=AsyncMock(
+                    side_effect=lambda *_args, **_kwargs: (
+                        order.append("protocol")
+                        or SimpleNamespace(
+                            service=SimpleNamespace(hub="shared-hub"),
+                            store="shared-store",
+                            set_listener_cleanup=MagicMock(),
+                            close=AsyncMock(),
+                        )
+                    )
+                ),
+            ),
+            patch(
+                "ccgram.bootstrap.adapter_for",
+                return_value="telegram-adapter",
+            ),
+            patch(
+                "ccgram.api.runtime.start_if_enabled",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
                 "ccgram.bootstrap.wire_runtime_callbacks",
                 side_effect=lambda: order.append("wire"),
             ),
             patch(
                 "ccgram.bootstrap.start_session_monitor",
-                new=AsyncMock(side_effect=lambda _app: order.append("monitor")),
-            ),
+                new=AsyncMock(
+                    side_effect=lambda *_args, **_kwargs: order.append("monitor")
+                ),
+            ) as start_monitor,
             patch(
                 "ccgram.bootstrap.start_status_polling",
                 side_effect=lambda _app: order.append("polling"),
@@ -195,14 +242,18 @@ class TestBootstrapApplication:
             "exc_handler",
             "ensure_session",
             "commands",
+            "wire",
             "stale_ids",
             "adopt",
             "hooks",
-            "wire",
+            "protocol",
+            "recover_creation",
             "monitor",
             "polling",
             "miniapp",
         ]
+        assert app.bot_data["session_service"].hub == "shared-hub"
+        start_monitor.assert_awaited_once_with(app, event_hub="shared-hub")
 
 
 class TestShutdownRuntime:
@@ -390,3 +441,55 @@ class TestVerifyHooksInstalled:
 
         logger.info.assert_not_called()
         logger.warning.assert_not_called()
+
+
+class TestNewWindowCallbackChecksEligibility:
+    """The monitor's automatic creation sink re-reads the verdict per window.
+
+    Discovery emits a batch and this callback awaits each topic creation in
+    turn, so without a fresh read the last window in a batch is judged on a
+    listing taken before the first one's topic existed. Explicit binds go
+    straight to handle_new_window and are not affected.
+    """
+
+    @staticmethod
+    async def _callback(app):
+        with patch("ccgram.bootstrap.SessionMonitor") as monitor_cls:
+            instance = MagicMock()
+            instance.start = MagicMock()
+            monitor_cls.return_value = instance
+            await bootstrap.start_session_monitor(app)
+        return instance.set_new_window_callback.call_args[0][0]
+
+    async def _run(self, *, adoptable: bool):
+        from ccgram.session_monitor import NewWindowEvent
+
+        app = _make_app()
+        bootstrap.wire_runtime_callbacks()
+        callback = await self._callback(app)
+
+        with (
+            patch(
+                "ccgram.bootstrap._still_adoptable",
+                new_callable=AsyncMock,
+                return_value=adoptable,
+            ),
+            patch(
+                "ccgram.bootstrap._handle_new_window",
+                new_callable=AsyncMock,
+            ) as handle,
+        ):
+            await callback(
+                NewWindowEvent(
+                    window_id="@5", session_id="s", window_name="proj", cwd="/proj"
+                )
+            )
+        return handle
+
+    async def test_adoptable_window_gets_a_topic(self):
+        handle = await self._run(adoptable=True)
+        handle.assert_awaited_once()
+
+    async def test_window_that_is_no_longer_adoptable_gets_none(self):
+        handle = await self._run(adoptable=False)
+        handle.assert_not_awaited()

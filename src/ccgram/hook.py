@@ -24,14 +24,16 @@ import structlog
 import sys
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from ccgram.hooks.adapters import (
     detect_provider_from_payload,
     get_hook_adapter,
 )
-from ccgram.hooks.model import NormalizedHookEvent, ProviderName
+from ccgram.hooks.model import HookAdapter, NormalizedHookEvent, ProviderName
 from ccgram.multiplexer import get_multiplexer
+from ccgram.multiplexer import herdr_socket
+from ccgram.multiplexer.agterm_panes import hook_pane
 from ccgram.multiplexer.self_identify import resolve_self_identity
 
 logger = structlog.get_logger()
@@ -73,6 +75,8 @@ _HOOK_EVENT_TYPES: tuple[str, ...] = (
     "SubagentStop",
     "TeammateIdle",
     "TaskCompleted",
+    "PermissionRequest",
+    "PreToolUse",
 )
 
 # Events that should not block the agent (async: true)
@@ -86,6 +90,7 @@ _ASYNC_EVENTS: frozenset[str] = frozenset(
         "TaskCompleted",
     }
 )
+_KNOWN_HOOK_PROVIDERS: frozenset[str] = frozenset({"claude", "pi", "codex", "gemini"})
 
 
 def _installable_events_for(provider_name: str) -> tuple[str, ...]:
@@ -267,6 +272,7 @@ def _install_json_hooks(
     installed_count = 0
     already_count = 0
     predicate = _json_hook_command_predicate(provider_name)
+    hook_command = _current_hook_command(provider_name)
     for event_type in events:
         event_hooks = hooks.setdefault(event_type, [])
         if not isinstance(event_hooks, list):
@@ -276,6 +282,7 @@ def _install_json_hooks(
             )
             return 1
         if _has_matching_hook(settings, event_type, predicate):
+            _replace_hook_commands(settings, event_type, predicate, hook_command)
             already_count += 1
             continue
         event_hooks.append({"hooks": [_hook_entry(provider_name, timeout_value)]})
@@ -298,21 +305,91 @@ def _install_json_hooks(
     return 0
 
 
-_CODEX_HOOKS_KEY_RE = re.compile(r"^\s*codex_hooks\s*=\s*(\S+)", re.MULTILINE)
+_CODEX_HOOKS_KEY_RE = re.compile(
+    r"^\s*(?P<key>\"(?:hooks|codex_hooks)\"|'(?:hooks|codex_hooks)'|hooks|codex_hooks)"
+    r"\s*=\s*(?P<value>[^,\s#]+)"
+)
+_TOML_TABLE_HEADER_RE = re.compile(
+    r"^\s*(\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])\s*(?:#.*)?(?:\r?\n)?$"
+)
+
+
+def _find_codex_hook_feature_entries(
+    lines: list[str],
+) -> tuple[int | None, tuple[int, str] | None, list[tuple[int, str]]]:
+    features_header_index: int | None = None
+    current_entry: tuple[int, str] | None = None
+    legacy_entries: list[tuple[int, str]] = []
+    in_top_level_features = False
+
+    for index, line in enumerate(lines):
+        header_match = _TOML_TABLE_HEADER_RE.match(line)
+        if header_match:
+            in_top_level_features = header_match.group(1) == "[features]"
+            if in_top_level_features and features_header_index is None:
+                features_header_index = index
+            continue
+        if not in_top_level_features:
+            continue
+        key_match = _CODEX_HOOKS_KEY_RE.match(line)
+        if not key_match:
+            continue
+        key = key_match.group("key").strip("\"'")
+        entry = (index, key_match.group("value"))
+        if key == "hooks" and current_entry is None:
+            current_entry = entry
+        elif key == "codex_hooks":
+            legacy_entries.append(entry)
+
+    return features_header_index, current_entry, legacy_entries
+
+
+def _codex_config_with_hooks(text: str) -> tuple[str, str]:
+    lines = text.splitlines(keepends=True)
+    features_header_index, current_entry, legacy_entries = (
+        _find_codex_hook_feature_entries(lines)
+    )
+
+    if current_entry:
+        value = current_entry[1]
+        remove_indexes = [index for index, _ in legacy_entries]
+    elif legacy_entries:
+        legacy_index, value = legacy_entries[0]
+        lines[legacy_index] = re.sub(
+            r"^(?P<indent>\s*)(?P<quote>[\"']?)codex_hooks(?P=quote)(?P<equals>\s*=)",
+            lambda match: (
+                f"{match.group('indent')}{match.group('quote')}hooks"
+                f"{match.group('quote')}{match.group('equals')}"
+            ),
+            lines[legacy_index],
+            count=1,
+        )
+        remove_indexes = [index for index, _ in legacy_entries[1:]]
+    else:
+        value = "true"
+        remove_indexes = []
+        newline = "\r\n" if "\r\n" in text else "\n"
+        if features_header_index is not None:
+            if not lines[features_header_index].endswith(("\n", "\r")):
+                lines[features_header_index] += newline
+            lines.insert(features_header_index + 1, f"hooks = true{newline}")
+        else:
+            prefix = text.rstrip("\r\n")
+            separator = newline * 2 if prefix else ""
+            lines = [f"{prefix}{separator}[features]{newline}hooks = true{newline}"]
+
+    for index in reversed(remove_indexes):
+        lines.pop(index)
+    return "".join(lines), value
 
 
 def _ensure_codex_feature_flag() -> int:
-    """Ensure user Codex config enables the hooks feature flag.
-
-    Detects any existing ``codex_hooks =`` line (spacing-tolerant). If it's
-    already truthy, no-op. If it's explicitly false, warn and refuse to
-    overwrite — the user opted out. Otherwise insert under ``[features]``.
-    """
+    """Enable Codex hooks and migrate the deprecated feature key."""
     config_file = _codex_config_file()
     if not config_file.exists():
         try:
             config_file.parent.mkdir(parents=True, exist_ok=True)
-            config_file.write_text("[features]\ncodex_hooks = true\n")
+            config_file.write_text("[features]\nhooks = true\n")
         except OSError as e:
             print(f"Error creating {config_file}: {e}", file=sys.stderr)
             return 1
@@ -322,26 +399,22 @@ def _ensure_codex_feature_flag() -> int:
     except OSError as e:
         print(f"Error reading {config_file}: {e}", file=sys.stderr)
         return 1
-    match = _CODEX_HOOKS_KEY_RE.search(text)
-    if match:
-        value = match.group(1).rstrip(",")
-        if value == "true":
-            return 0
-        print(
-            f"{config_file} has codex_hooks = {value}; set it to true and rerun.",
-            file=sys.stderr,
-        )
-        return 1
-    if "[features]" in text:
-        text = text.replace("[features]", "[features]\ncodex_hooks = true", 1)
-    else:
-        text = text.rstrip() + "\n\n[features]\ncodex_hooks = true\n"
-    try:
-        config_file.write_text(text)
-    except OSError as e:
-        print(f"Error writing {config_file}: {e}", file=sys.stderr)
-        return 1
-    return 0
+
+    updated_text, value = _codex_config_with_hooks(text)
+    if updated_text != text:
+        try:
+            config_file.write_text(updated_text)
+        except OSError as e:
+            print(f"Error writing {config_file}: {e}", file=sys.stderr)
+            return 1
+
+    if value == "true":
+        return 0
+    print(
+        f"{config_file} has hooks = {value}; set it to true and rerun.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 _CODEX_HOOK_TIMEOUT_SECONDS = 5
@@ -697,18 +770,9 @@ def _resolve_herdr_target_id(
     ``(workspace_id, pane_id)`` pair. Hooks from a nested agent are rejected
     when their provider differs from the live agent occupying that pane.
     """
-    try:
-        result = subprocess.run(
-            ["herdr", "agent", "list"], capture_output=True, text=True, timeout=5
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.warning("herdr agent list failed for pane %s: %s", pane_id, exc)
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        agents = json.loads(result.stdout).get("result", {}).get("agents", [])
-    except (json.JSONDecodeError, AttributeError):
+    agents = _herdr_agent_list_snapshot()
+    if agents is None:
+        logger.warning("herdr agent list failed for pane %s", pane_id)
         return None
     matches: list[dict[str, object]] = []
     for record in agents if isinstance(agents, list) else []:
@@ -723,14 +787,16 @@ def _resolve_herdr_target_id(
         return None
 
     record = matches[0]
-    live_agent = record.get("agent")
     agent_session = record.get("agent_session")
-    if not isinstance(live_agent, str) and isinstance(agent_session, dict):
-        live_agent = agent_session.get("agent")
-    known_hook_agents = {"claude", "pi", "codex", "gemini"}
+    session_agent = (
+        agent_session.get("agent") if isinstance(agent_session, dict) else None
+    )
+    live_agent = (
+        session_agent if isinstance(session_agent, str) else record.get("agent")
+    )
     if (
         provider_name is not None
-        and live_agent in known_hook_agents
+        and live_agent in _KNOWN_HOOK_PROVIDERS
         and live_agent != provider_name
     ):
         logger.info(
@@ -741,15 +807,93 @@ def _resolve_herdr_target_id(
         )
         return None
 
-    # Keep record parsing and canonical target construction in the adapter;
-    # this hook only establishes the unique live locator match.
-    target_for_record = getattr(
-        get_multiplexer("herdr"), "target_id_for_live_record", None
-    )
-    if not callable(target_for_record):
-        return None
-    target_id = target_for_record(record)
+    return _target_id_from_herdr_snapshot(record, agents)
+
+
+def _target_id_from_herdr_snapshot(
+    record: dict[str, Any], records: list[object]
+) -> str | None:
+    """Derive a target only after applying whole-snapshot quarantine."""
+    manager = get_multiplexer("herdr")
+    target_for_snapshot = getattr(manager, "target_id_for_live_snapshot", None)
+    if callable(target_for_snapshot):
+        target_id = target_for_snapshot(record, records)
+    else:
+        target_for_record = getattr(manager, "target_id_for_live_record", None)
+        target_id = target_for_record(record) if callable(target_for_record) else None
     return target_id if isinstance(target_id, str) else None
+
+
+_HERDR_HOOK_TIMEOUT_SECONDS = 5.0
+
+
+def _herdr_socket_path_for_hook() -> str | None:
+    """Return the Herdr socket path, discovering it through the safe CLI status.
+
+    The ``agent.list`` hook path must use the public socket API. The installed
+    CLI may speak a different private protocol than the running server, so it
+    is only used for the documented ``status --json`` socket discovery when
+    ``HERDR_SOCKET_PATH`` is not already available.
+    """
+    socket_path = os.environ.get("HERDR_SOCKET_PATH")
+    if socket_path:
+        return socket_path
+    try:
+        status = subprocess.run(
+            ["herdr", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=_HERDR_HOOK_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("herdr socket discovery failed: %s", exc)
+        return None
+    if status.returncode != 0:
+        logger.warning(
+            "herdr socket discovery failed with exit code %s", status.returncode
+        )
+        return None
+    try:
+        payload = json.loads(status.stdout)
+    except json.JSONDecodeError:
+        logger.warning("herdr status returned invalid JSON during socket discovery")
+        return None
+    if not isinstance(payload, dict):
+        return None
+    server = payload.get("server")
+    socket_path = server.get("socket") if isinstance(server, dict) else None
+    return socket_path if isinstance(socket_path, str) and socket_path else None
+
+
+def _herdr_agent_list_snapshot() -> list[object] | None:
+    """Read one Herdr ``agent.list`` snapshot over the public socket.
+
+    ``None`` means transport, discovery, or response-shape failure. An empty
+    list is a valid snapshot and remains distinct so callers can preserve
+    their existing zero-match and quarantine behavior.
+    """
+    socket_path = _herdr_socket_path_for_hook()
+    if socket_path is None:
+        return None
+    try:
+        envelope = herdr_socket.request_sync(
+            socket_path,
+            "agent.list",
+            {},
+            timeout=_HERDR_HOOK_TIMEOUT_SECONDS,
+        )
+    except (herdr_socket.HerdrSocketError, OSError, TimeoutError) as exc:
+        logger.warning("herdr agent list request failed: %s", exc)
+        return None
+    result = envelope.get("result")
+    if not isinstance(result, dict):
+        logger.warning("herdr agent list returned an invalid result")
+        return None
+    agents = result.get("agents")
+    if not isinstance(agents, list):
+        logger.warning("herdr agent list returned no agents list")
+        return None
+    return agents
 
 
 def _resolve_window_id(pane_id: str) -> tuple[str, str, str, str] | None:
@@ -789,12 +933,38 @@ def _resolve_window_id(pane_id: str) -> tuple[str, str, str, str] | None:
 
     tmux_session_name, window_id, window_name = parts[0], parts[1], parts[2]
     pane_tty = parts[3] if len(parts) >= _TMUX_FORMAT_PARTS_WITH_TTY else ""
-    linked = parts[4] if len(parts) >= _TMUX_FORMAT_PARTS_WITH_LINKS else ""
-    key_session = tmux_session_name
-    if linked not in ("", "0", "1"):
-        key_session = _session_map_session_for(window_id, tmux_session_name)
+    # ``window_linked_sessions`` is not the signal for "needs remapping": a
+    # session *grouped* with ccgram's (``tmux new-session -t <session>``) shares
+    # its window list without linking the windows, so tmux reports 1 while the
+    # pane's session name still differs. ``_session_map_session_for``
+    # early-returns when the pane already sits in ccgram's session, so the tmux
+    # probe this once guarded is only paid when it is actually needed.
+    key_session = _session_map_session_for(window_id, tmux_session_name)
     session_window_key = f"{key_session}:{window_id}"
     return session_window_key, window_id, window_name, pane_tty
+
+
+def _ccgram_tmux_session_name() -> str:
+    """Return ``TMUX_SESSION_NAME`` as the bot resolves it, without ``Config``.
+
+    ``Config`` loads the cwd ``.env`` first, and the hook's cwd is the agent's
+    project: an empty ``TELEGRAM_BOT_TOKEN=`` there made it raise and kill the
+    hook (#252). Read only the exported env and ``$CCGRAM_DIR/.env``.
+    """
+    # Lazy: utils brings in subprocess + structlog at import time; dotenv is
+    # only needed when the name is not exported.
+    from .utils import ccgram_dir, tmux_session_name
+
+    if "TMUX_SESSION_NAME" not in os.environ:
+        env_file = ccgram_dir() / ".env"
+        if env_file.is_file():
+            # Lazy: see above.
+            from dotenv import dotenv_values
+
+            value = dotenv_values(env_file).get("TMUX_SESSION_NAME")
+            if value:
+                return value
+    return tmux_session_name()
 
 
 def _session_map_session_for(window_id: str, pane_session: str) -> str:
@@ -810,11 +980,7 @@ def _session_map_session_for(window_id: str, pane_session: str) -> str:
     Falls back to the pane's own session whenever the window is not linked into
     ccgram's session, which is the single-session case and today's behaviour.
     """
-    # Lazy: config reads the environment at import time; the hook path should
-    # not pay that cost, nor fail, when the window cannot be resolved at all.
-    from .config import config
-
-    target = getattr(config, "tmux_session_name", "")
+    target = _ccgram_tmux_session_name()
     if not target or target == pane_session:
         return pane_session
     try:
@@ -994,6 +1160,9 @@ def _update_session_map(
     transcript_path: str,
     tmux_session_name: str,
     provider_name: str = "claude",
+    *,
+    replay_from_start: bool = False,
+    consume_pending_replay: bool = True,
 ) -> None:
     """Update session_map.json for a SessionStart event."""
     # Lazy: same hook fast-path rationale as ``_write_event``.
@@ -1007,7 +1176,7 @@ def _update_session_map(
         with open(lock_path, "w") as lock_f:
             fcntl.flock(lock_f, fcntl.LOCK_EX)
             try:
-                session_map: dict[str, dict[str, str]] = {}
+                session_map: dict[str, Any] = {}
                 if map_file.exists():
                     try:
                         raw = map_file.read_text()
@@ -1039,11 +1208,21 @@ def _update_session_map(
                         logger.warning("Failed to read session_map.json")
 
                 # Lazy: same hook fast-path rationale as _write_event.
-                from .hooks.state_files import serialize_session_map_entry
+                from .hooks.state_files import (
+                    pending_pi_replay_key,
+                    serialize_session_map_entry,
+                )
 
                 session_map[session_window_key] = serialize_session_map_entry(
-                    session_id, cwd, window_name, transcript_path, provider_name
+                    session_id,
+                    cwd,
+                    window_name,
+                    transcript_path,
+                    provider_name,
+                    replay_from_start=replay_from_start,
                 )
+                if consume_pending_replay:
+                    session_map.pop(pending_pi_replay_key(session_id), None)
 
                 # Clean up old-format key ("session:window_name") if it exists
                 old_key = f"{tmux_session_name}:{window_name}"
@@ -1062,6 +1241,25 @@ def _update_session_map(
                 fcntl.flock(lock_f, fcntl.LOCK_UN)
     except OSError:
         logger.exception("Failed to write session_map")
+
+
+def _record_pending_pi_replay(session_id: str) -> None:
+    """Persist recovery intent without binding a stale Herdr target."""
+    # Lazy: hooks.state_files stays off the hook CLI import fast path.
+    from .hooks.state_files import pending_pi_replay_key
+
+    pending_key = pending_pi_replay_key(session_id)
+    _update_session_map(
+        pending_key,
+        session_id,
+        "",
+        "",
+        "",
+        pending_key,
+        "pi",
+        replay_from_start=True,
+        consume_pending_replay=False,
+    )
 
 
 def _encode_pi_cwd_dirname(cwd: str) -> str:
@@ -1095,6 +1293,11 @@ def _resolve_pi_transcript_path(session_id: str, cwd: str) -> str:
     for _mtime, path in candidates:
         if session_id and session_id in path.name:
             return str(path)
+    # SessionStart can run before Pi creates its transcript. Never bind that
+    # new session to another live pane's newest transcript; Stop will refresh
+    # the empty path once the exact session file exists.
+    if session_id:
+        return ""
     return str(candidates[0][1]) if candidates else ""
 
 
@@ -1188,27 +1391,25 @@ def _refresh_session_map_if_stale(
     window_name: str,
     payload_cwd: str,
     payload_transcript_path: str,
+    *,
+    recover_missing: bool = False,
 ) -> None:
-    """Refresh ``session_map.json`` when a non-SessionStart event reports a
-    different session_id or provider than the stored entry.
+    """Refresh stale entries and recover a dropped or newly pane-qualified start.
 
-    Some installs (notably Pi via cc-thingz hook-runner) deliver Stop/Subagent
-    hooks without a matching SessionStart through this hook path, so the map
-    can keep pointing at the previous provider's session. We use values the
-    hook payload already carries — no external scanning — to avoid the
-    recovery anti-pattern called out in PR #51.
+    A stale Herdr snapshot can make the one-shot Pi SessionStart unsafe to
+    bind. A later matching Pi hook may therefore create the missing entry once
+    its exact transcript exists. The replay marker tells SessionMonitor to
+    reserve offset zero before consuming the marker.
     """
     existing = _read_session_map_entry(session_window_key)
-    if not existing:
-        # SessionStart owns initial creation; never extend the map from a
-        # non-SessionStart event. Missing entry means no prior session was
-        # tracked here — leave the fallback (cwd-based discovery in
-        # SessionMonitor) to handle it.
+    if not existing and provider_name != "pi" and not recover_missing:
         return
     cwd = payload_cwd or existing.get("cwd", "")
     transcript_path = _resolve_transcript_path(
         provider_name, session_id, cwd, payload_transcript_path
     )
+    if not existing and not transcript_path:
+        return
     if (
         existing.get("session_id") == session_id
         and existing.get("provider_name") == provider_name
@@ -1218,7 +1419,14 @@ def _refresh_session_map_if_stale(
         )
     ):
         return
-    # Backend prefix token: split on the FIRST colon so herdr keys
+    replay_from_start = (recover_missing and not existing) or (
+        provider_name == "pi"
+        and (
+            not existing
+            or existing.get("session_id") != session_id
+            or not existing.get("transcript_path")
+        )
+    )
     # Split only the backend prefix; Herdr target IDs may contain colons.
     tmux_session_name = session_window_key.split(":", 1)[0]
     _update_session_map(
@@ -1229,7 +1437,16 @@ def _refresh_session_map_if_stale(
         transcript_path,
         tmux_session_name,
         provider_name,
+        replay_from_start=replay_from_start,
     )
+    if not existing:
+        logger.info(
+            "Recovered %s session_map from later hook for %s: %s",
+            provider_name,
+            session_window_key,
+            session_id[:8],
+        )
+        return
     logger.info(
         "Refreshed stale session_map for %s: %s/%s -> %s/%s",
         session_window_key,
@@ -1240,14 +1457,64 @@ def _refresh_session_map_if_stale(
     )
 
 
+# grok first: the fork's Grok Build provider (its ``grok`` CLI) must not be
+# read as another agent sharing the tty.
+_PROVIDER_NAME_ORDER: tuple[ProviderName, ...] = ("grok", "gemini", "codex", "claude")
+
+# Runtimes that commonly wrap a provider CLI (npm-installed packages run as
+# ``node .../codex.js``), and flags whose value is not a script path.
+_PROVIDER_RUNTIMES = frozenset(
+    {"node", "nodejs", "bun", "deno", "python", "python3", "npx", "bunx"}
+)
+_RUNTIME_CODE_FLAGS = frozenset(
+    {"-e", "--eval", "-c", "--command", "-p", "--print", "-m", "--module"}
+)
+_RUNTIME_VALUE_FLAGS = frozenset(
+    {"-r", "--require", "--import", "--loader", "--experimental-loader"}
+)
+
+
+def _runtime_script_argument(tokens: list[str]) -> str | None:
+    """The script path an interpreter wraps, or None for flags and code strings."""
+    skip_next = False
+    for token in tokens[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in _RUNTIME_CODE_FLAGS:
+            return None
+        if token in _RUNTIME_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if token.startswith("-"):
+            continue
+        return token
+    return None
+
+
+def _path_names_provider(path: str, provider: str) -> bool:
+    """Whether a script path's segments name one provider package."""
+    for segment in path.replace("\\", "/").casefold().split("/"):
+        if (
+            segment == provider
+            or segment.startswith(f"{provider}-")
+            or segment.startswith(f"{provider}.")
+        ):
+            return True
+    return False
+
+
 def _provider_from_pane_tty(pane_tty: str) -> ProviderName | None:
     """Best-effort provider detection from foreground tty process commands.
 
     This is a last-resort fallback; the primary paths are the explicit
     ``provider_name`` field and the ``/.provider/`` transcript path prefix
-    checked in ``detect_provider_from_payload``.  JS-wrapped Pi (e.g.
-    ``node ~/.pi/agent/cli.js``) is not matched here — it is caught by the
-    ``/.pi/`` transcript path check instead.
+    checked in ``detect_provider_from_payload``.  Only the executable
+    basename and, for interpreter wrappers, the script argument count as
+    evidence: a helper's data path or an ``-e`` code string must never name
+    the provider (a claude-mem helper carrying ``~/.codex`` used to beat the
+    running claude).  JS-wrapped Pi (e.g. ``node ~/.pi/agent/cli.js``) is
+    not matched here — it is caught by the ``/.pi/`` transcript path check.
     """
     if not pane_tty:
         return None
@@ -1261,22 +1528,84 @@ def _provider_from_pane_tty(pane_tty: str) -> ProviderName | None:
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
-    text = result.stdout.lower()
-    if "grok" in text:
-        return "grok"
-    if "gemini" in text:
-        return "gemini"
-    if "codex" in text:
-        return "codex"
-    if "claude" in text:
-        return "claude"
-    if any(tok == "pi" or tok.endswith("/pi") for tok in text.split()):
+    executables: set[str] = set()
+    scripts: list[str] = []
+    for line in result.stdout.splitlines():
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            # ``ps -o command=`` joins argv without quoting, so an argument
+            # with an unmatched quote (``codex what's failing``) makes shlex
+            # raise; the executable is still worth recording.
+            tokens = line.split()
+        if not tokens:
+            continue
+        executable = os.path.basename(tokens[0]).casefold()
+        executables.add(executable)
+        if executable in _PROVIDER_RUNTIMES:
+            script = _runtime_script_argument(tokens)
+            if script is not None:
+                scripts.append(script)
+    for provider in _PROVIDER_NAME_ORDER:
+        if provider in executables or any(
+            _path_names_provider(script, provider) for script in scripts
+        ):
+            return provider
+    if "pi" in executables:
         return "pi"
     return None
 
 
+def _agterm_hook_target(
+    agterm_session: str, provider_name: str, agent_session_id: str
+) -> tuple[str, str] | None:
+    """Resolve the hook's agent against one live agterm window snapshot."""
+    if os.environ.get("AGTERM_PANE", "left") not in {"left", "right"}:
+        return None
+    args = ["agtermctl", "tree", "--json"]
+    for env_key, option in (
+        ("AGTERM_SOCKET", "--socket"),
+        ("AGTERM_WINDOW_ID", "--window"),
+    ):
+        if value := os.environ.get(env_key):
+            args.extend([option, value])
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=3, check=False
+        )
+        payload = json.loads(result.stdout)
+        if result.returncode or not payload.get("ok"):
+            return None
+        tree = payload["result"]["tree"]
+        sessions = [
+            session
+            for workspace in tree["workspaces"]
+            for session in workspace.get("sessions", [])
+            if str(session.get("id", "")).casefold() == agterm_session.casefold()
+        ]
+        if len(sessions) != 1:
+            return None
+        pane = hook_pane(sessions[0], provider_name, agent_session_id)
+        return (str(pane["id"]), str(pane.get("name") or "")) if pane else None
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ):
+        logger.debug("Could not resolve agterm hook pane", exc_info=True)
+        return None
+
+
 def _locate_primary_window(
-    session_id: str, event: str, provider_name: ProviderName = "claude"
+    session_id: str,
+    event: str,
+    provider_name: ProviderName = "claude",
+    *,
+    herdr_target_id: str | None = None,
+    use_herdr_snapshot: bool = False,
 ) -> tuple[str, str, str] | None:
     """Resolve TMUX_PANE → primary window, or None to drop the hook.
 
@@ -1289,13 +1618,21 @@ def _locate_primary_window(
     panes resolve through ``_resolve_window_id`` (``display-message``), herdr
     panes resolve their exact workspace/pane locator to a session target, so
     the session_map key becomes ``herdr:<opaque-target-id>``, and an agterm
-    session is its own identity, keyed ``agterm:<session-uuid>``.
+    primary retains ``agterm:<session-uuid>`` while split peers resolve to their
+    own guarded target from the live argv snapshot.
     """
     identity = resolve_self_identity(
         os.environ,
         tmux_query=_resolve_window_id,
-        herdr_query=lambda workspace_id, pane_id: _resolve_herdr_target_id(
-            workspace_id, pane_id, provider_name
+        herdr_query=lambda workspace_id, pane_id: (
+            herdr_target_id
+            if use_herdr_snapshot
+            else _resolve_herdr_target_id(workspace_id, pane_id, provider_name)
+        ),
+        agterm_query=(
+            lambda agterm_session: _agterm_hook_target(
+                agterm_session, provider_name, session_id
+            )
         ),
     )
     if identity is None:
@@ -1337,6 +1674,160 @@ def _locate_primary_window(
     return identity.session_window_key, identity.window_id, identity.window_name
 
 
+def _provider_from_herdr_pane() -> tuple[ProviderName | None, str, str | None]:
+    """Infer provider, Pi transcript, and target from one Herdr snapshot."""
+    provider, transcript_path, target_id, _unavailable = (
+        _provider_from_herdr_pane_details()
+    )
+    return provider, transcript_path, target_id
+
+
+def _provider_from_herdr_pane_details() -> tuple[
+    ProviderName | None, str, str | None, bool
+]:
+    """Infer provider, Pi transcript, and target from one Herdr snapshot.
+
+    Pi's hook-runner emits the common CC hook envelope without provider or
+    transcript metadata. Herdr is authoritative for the exact pane and can
+    publish the future transcript path before Pi creates the file.
+
+    The final flag distinguishes an unavailable snapshot from a valid snapshot
+    with no matching or sessionful record. The former can safely defer a Pi
+    binding; the latter must retain the existing fail-closed behavior.
+    """
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID")
+    pane_id = os.environ.get("HERDR_PANE_ID")
+    if not workspace_id or not pane_id:
+        return None, "", None, False
+    records = _herdr_agent_list_snapshot()
+    if records is None:
+        return None, "", None, True
+    matches = [
+        record
+        for record in records
+        if isinstance(record, dict)
+        and record.get("workspace_id") == workspace_id
+        and record.get("pane_id") == pane_id
+    ]
+    if len(matches) != 1:
+        return None, "", None, False
+    record = matches[0]
+    session = record.get("agent_session")
+    session_agent = session.get("agent") if isinstance(session, dict) else None
+    agent = session_agent if isinstance(session_agent, str) else record.get("agent")
+    provider = cast(ProviderName, agent) if agent in _KNOWN_HOOK_PROVIDERS else None
+    transcript_path = ""
+    if (
+        provider == "pi"
+        and isinstance(session, dict)
+        and session.get("agent") == "pi"
+        and session.get("kind") == "path"
+        and isinstance(session.get("value"), str)
+    ):
+        transcript_path = session["value"]
+    target_id = _target_id_from_herdr_snapshot(record, records)
+    return provider, transcript_path, target_id, False
+
+
+def _herdr_hook_context(
+    payload: dict[str, object], detected_provider: str | None
+) -> tuple[str | None, ProviderName | None, str, str | None, bool, bool]:
+    """Resolve Herdr context needed by a hook and report snapshot failure."""
+    if payload.get("transcript_path") or detected_provider not in {None, "pi"}:
+        return detected_provider, None, "", None, False, False
+
+    use_herdr_snapshot = bool(
+        os.environ.get("HERDR_WORKSPACE_ID") and os.environ.get("HERDR_PANE_ID")
+    )
+    if not use_herdr_snapshot:
+        return detected_provider, None, "", None, False, False
+    (
+        herdr_provider,
+        transcript_path,
+        target_id,
+        snapshot_unavailable,
+    ) = _provider_from_herdr_pane_details()
+    if detected_provider is None:
+        detected_provider = herdr_provider
+    herdr_transcript_path = (
+        transcript_path if detected_provider == "pi" and herdr_provider == "pi" else ""
+    )
+    if detected_provider is None and snapshot_unavailable:
+        # An unannotated hook with Herdr context is the Pi hook shape. Keep it
+        # on the Pi adapter so a failed identity read can persist recovery
+        # intent instead of binding it as an implicit Claude hook.
+        detected_provider = "pi"
+    return (
+        detected_provider,
+        herdr_provider,
+        herdr_transcript_path,
+        target_id,
+        True,
+        snapshot_unavailable,
+    )
+
+
+def _hook_adapter_for_context(
+    provider_name: str,
+    herdr_provider: ProviderName | None,
+) -> HookAdapter | None:
+    """Return an adapter only for a primary agent matching the live identity."""
+    # Background Pi children inherit the parent's multiplexer identity.
+    if os.environ.get("PI_SUBAGENT_CHILD") == "1":
+        logger.debug("Ignoring hook from background Pi subagent")
+        return None
+    if herdr_provider is not None and herdr_provider != provider_name:
+        logger.info(
+            "Skipping %s hook from nested agent in Herdr pane; live agent is %s",
+            provider_name,
+            herdr_provider,
+        )
+        return None
+    adapter = get_hook_adapter(provider_name)
+    if adapter is None:
+        logger.debug("Ignoring hook for unsupported provider: %s", provider_name)
+    return adapter
+
+
+def _hook_event_is_actionable(
+    normalized: NormalizedHookEvent, herdr_transcript_path: str
+) -> bool:
+    """Validate event support before persisting deferred Pi recovery state."""
+    event = normalized.canonical_event_name
+    if event not in _HOOK_EVENT_TYPES and event not in {"PreCompact", "PostCompact"}:
+        logger.debug("Ignoring unhandled event: %s", event)
+        return False
+    if (
+        normalized.provider_name == "pi"
+        and herdr_transcript_path
+        and normalized.session_id not in Path(herdr_transcript_path).name
+    ):
+        # Herdr can briefly retain the preceding Pi identity while the new
+        # SessionStart hook is already running. Its target and transcript must
+        # move together; otherwise the new session binds to the old topic/file.
+        _record_pending_pi_replay(normalized.session_id)
+        logger.debug(
+            "Deferring Pi hook until Herdr publishes the matching session: %s",
+            normalized.session_id,
+        )
+        return False
+    return True
+
+
+def _defer_unavailable_herdr_snapshot(
+    normalized: NormalizedHookEvent, snapshot_unavailable: bool
+) -> bool:
+    """Persist Pi recovery intent when Herdr identity was temporarily unavailable."""
+    if not snapshot_unavailable:
+        return False
+    _record_pending_pi_replay(normalized.session_id)
+    logger.debug(
+        "Deferring Pi hook until Herdr agent.list is available: %s",
+        normalized.session_id,
+    )
+    return True
+
+
 def _process_hook_stdin(
     provider_name: str | None = None,
 ) -> NormalizedHookEvent | None:
@@ -1361,6 +1852,32 @@ def _process_hook_stdin(
             provider_name,
         )
     detected_provider = provider_name or payload_provider
+    herdr_provider: ProviderName | None = None
+    herdr_transcript_path = ""
+    herdr_target_id: str | None = None
+    use_herdr_snapshot = False
+    herdr_snapshot_unavailable = False
+    # Pi's hook-runner omits provider metadata and transcript_path. Do not use
+    # the live Herdr provider to reinterpret a nested Claude hook that carries
+    # its own Claude transcript path.
+    (
+        detected_provider,
+        herdr_provider,
+        herdr_transcript_path,
+        herdr_target_id,
+        use_herdr_snapshot,
+        herdr_snapshot_unavailable,
+    ) = _herdr_hook_context(payload, detected_provider)
+    if (
+        detected_provider is None
+        and not payload.get("transcript_path")
+        and (
+            os.environ.get("PI_CODING_AGENT") == "true"
+            or os.environ.get("PI_HOOK_TIMEOUT_SEC")
+        )
+    ):
+        # The hook-runner sets PI_HOOK_TIMEOUT_SEC, not the bash-only PI_CODING_AGENT.
+        detected_provider = "pi"
     if detected_provider is None:
         identity = resolve_self_identity(os.environ, tmux_query=_resolve_window_id)
         if identity:
@@ -1368,9 +1885,8 @@ def _process_hook_stdin(
     if detected_provider is None:
         detected_provider = "claude"
 
-    adapter = get_hook_adapter(detected_provider)
+    adapter = _hook_adapter_for_context(detected_provider, herdr_provider)
     if adapter is None:
-        logger.debug("Ignoring hook for unsupported provider: %s", detected_provider)
         return None
     normalized = adapter.normalize(payload)
     if normalized is None:
@@ -1379,13 +1895,18 @@ def _process_hook_stdin(
         )
         return None
 
-    event = normalized.canonical_event_name
-    if event not in _HOOK_EVENT_TYPES and event not in {"PreCompact", "PostCompact"}:
-        logger.debug("Ignoring unhandled event: %s", event)
+    if not _hook_event_is_actionable(
+        normalized, herdr_transcript_path
+    ) or _defer_unavailable_herdr_snapshot(normalized, herdr_snapshot_unavailable):
         return None
+    event = normalized.canonical_event_name
 
     located = _locate_primary_window(
-        normalized.session_id, event, normalized.provider_name
+        normalized.session_id,
+        event,
+        normalized.provider_name,
+        herdr_target_id=herdr_target_id,
+        use_herdr_snapshot=use_herdr_snapshot,
     )
     if located is None:
         return None
@@ -1399,7 +1920,11 @@ def _process_hook_stdin(
             detected_provider,
             normalized.session_id,
             str(normalized.cwd) if normalized.cwd else "",
-            str(normalized.transcript_path) if normalized.transcript_path else "",
+            (
+                str(normalized.transcript_path)
+                if normalized.transcript_path
+                else herdr_transcript_path
+            ),
         )
         cwd = str(normalized.cwd) if normalized.cwd else ""
         _update_session_map(
@@ -1410,6 +1935,7 @@ def _process_hook_stdin(
             transcript_path,
             tmux_session_name,
             detected_provider,
+            replay_from_start=detected_provider == "pi",
         )
         data = dict(normalized.data)
         data.update(
@@ -1428,7 +1954,12 @@ def _process_hook_stdin(
         detected_provider,
         window_name,
         str(normalized.cwd) if normalized.cwd else "",
-        str(normalized.transcript_path) if normalized.transcript_path else "",
+        (
+            str(normalized.transcript_path)
+            if normalized.transcript_path
+            else herdr_transcript_path
+        ),
+        recover_missing=session_window_key.startswith("agterm:"),
     )
     _write_event(event, normalized.session_id, session_window_key, normalized.data)
     return normalized
@@ -1459,29 +1990,22 @@ def hook_main(
     install: bool = False,
     uninstall: bool = False,
     status: bool = False,
-    provider_name: str = "claude",
+    provider_name: str | None = None,
 ) -> None:
-    """Process a Claude Code hook event from stdin, or manage hook installation."""
+    """Process an agent hook event from stdin, or manage hook installation."""
     _configure_hook_logging()
 
     if install:
         logger.info("Hook install requested")
-        sys.exit(_install_hook(provider_name))
+        sys.exit(_install_hook(provider_name or "claude"))
 
     if uninstall:
-        sys.exit(_uninstall_hook(provider_name))
+        sys.exit(_uninstall_hook(provider_name or "claude"))
 
     if status:
-        sys.exit(_hook_status(provider_name))
+        sys.exit(_hook_status(provider_name or "claude"))
 
-    # Pass None for the implicit Claude default so detect_provider_from_payload
-    # gets first say (an explicit `--provider claude` invocation deliberately
-    # keeps the explicit flag to surface the mismatch warning when payload
-    # heuristics disagree). The CLI default also resolves to "claude", so the
-    # None path covers the common case of an unannotated hook command.
-    normalized = _process_hook_stdin(
-        provider_name if provider_name != "claude" else None
-    )
+    normalized = _process_hook_stdin(provider_name)
     if (
         normalized
         and normalized.provider_name == "codex"

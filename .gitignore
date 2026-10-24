@@ -54,8 +54,8 @@ pkg/
 # Slidev local/generated files
 node_modules/
 .slidev/
-docs/presentaions/node_modules/
-docs/presentaions/.slidev/
+docs/presentations/node_modules/
+docs/presentations/.slidev/
 
 # Claude Code (keep .claude/ tracked)
 .claude/settings.local.json
@@ -67,6 +67,7 @@ docs/presentaions/.slidev/
 # ai artificats to skip
 .brainstorming/
 .archfit-cache/
+.revmux/tasks/
 AGENTS.md
 
 # Blog posts and social media drafts
