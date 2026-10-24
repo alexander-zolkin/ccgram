@@ -62,10 +62,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -167,7 +169,42 @@ def _authed(request: web.Request) -> bool:
         request.cookies.get(COOKIE_NAME),
         request.app[_TOKEN_KEY],
         security.cookie_material(request.app[_PASSWORD_KEY]),
-    )
+    ) or _hub_authed(request)
+
+
+# CCGRAM-HOTFIX:hub-api — Kara Hub (the web UI now) drives Telegram through
+# these routes only, with its own token: <ccgram dir>/hub_token, made on the
+# first start (0600), sent as X-Kara-Hub-Token. No forged login cookie, and
+# nothing else of this server is open to it.
+HUB_TOKEN_HEADER = "X-Kara-Hub-Token"
+_HUB_ROUTES = re.compile(
+    r"^(?:POST /api/sessions"
+    r"|POST /api/sessions/-?\d{1,12}/(?:send|rename|sound|probe|detach|keep|delete)"
+    r"|(?:GET|POST) /api/settings)$"
+)
+
+
+def _hub_token() -> str:
+    from ..utils import ccgram_dir
+
+    path = ccgram_dir() / "hub_token"
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    if not token:
+        token = secrets.token_urlsafe(32)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+    return token
+
+
+def _hub_authed(request: web.Request) -> bool:
+    given = request.headers.get(HUB_TOKEN_HEADER)
+    if not given or not _HUB_ROUTES.match(f"{request.method} {request.path}"):
+        return False
+    return hmac.compare_digest(given.encode(), _hub_token().encode())
 
 
 @web.middleware
@@ -1244,6 +1281,7 @@ async def start_webui(bot: Bot | Any) -> None:
             runner, host=config.webui_host, port=config.webui_port
         ).start()
         _runner = runner
+        _hub_token()  # CCGRAM-HOTFIX:hub-api — there before the hub's first call
         logger.info("web UI listening on %s:%d", config.webui_host, config.webui_port)
         # Lazy: only the running daemon names sessions.
         from . import autotitle

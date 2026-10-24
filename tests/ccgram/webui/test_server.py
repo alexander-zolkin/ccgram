@@ -426,3 +426,22 @@ async def test_settings_roundtrip(client, tmp_path, monkeypatch):
     extras.reset_for_testing()
     quiet_threads.reset_for_testing()
     prefs.reset_for_testing()
+
+
+# ── CCGRAM-HOTFIX:hub-api: Kara Hub's token, its routes only ─────────────────
+
+
+async def test_hub_token_opens_only_the_hub_routes(client, calls):
+    from ccgram.webui import server
+
+    token = server._hub_token()
+    assert token and token == server._hub_token(), "made once, then read"
+    h = {**POST_HEADERS, server.HUB_TOKEN_HEADER: token}
+    resp = await client.post("/api/sessions/7/send", json={"text": "hi"}, headers=h)
+    assert resp.status == 200 and ("send", 7, "hi") in calls
+    wrong = {**POST_HEADERS, server.HUB_TOKEN_HEADER: token + "x"}
+    assert (await client.post("/api/sessions/7/send", json={"text": "hi"}, headers=wrong)).status == 401
+    assert (await client.post("/api/sessions/7/send", json={"text": "hi"}, headers=POST_HEADERS)).status == 401
+    # Everything else of the old web stays closed to the hub's token.
+    assert (await client.get("/api/sessions", headers=h)).status == 401
+    assert (await client.get("/api/sessions/7/history", headers=h)).status == 401
