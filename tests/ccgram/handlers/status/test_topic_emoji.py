@@ -156,6 +156,24 @@ _STATE_EMOJI = [
 ]
 
 
+class TestRelayOffKeepsTopicsQuiet:
+    async def test_no_status_renames_while_nothing_goes_to_telegram(self) -> None:
+        from ccgram import quiet_threads
+
+        bot = AsyncMock()
+        quiet_threads.set_relay("off")
+        try:
+            for state in ("active", "idle", "active", "idle", "done"):
+                await _debounced_update(bot, -100, 42, state, "myproject")
+            bot.edit_forum_topic.assert_not_called()
+        finally:
+            quiet_threads.set_relay("all")
+        await _debounced_update(bot, -100, 42, "idle", "myproject")
+        bot.edit_forum_topic.assert_called_once_with(
+            chat_id=-100, message_thread_id=42, name=f"{EMOJI_IDLE} myproject"
+        )
+
+
 class TestUpdateTopicEmoji:
     async def test_first_call_starts_debounce(self) -> None:
         bot = AsyncMock()

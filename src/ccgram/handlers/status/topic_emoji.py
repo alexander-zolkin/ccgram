@@ -27,6 +27,7 @@ from weakref import WeakValueDictionary
 import structlog
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
+from ... import quiet_threads
 from ...config import config
 from ...telegram_client import TelegramClient
 from ...telegram_rate_limiter import retry_after_seconds
@@ -539,6 +540,14 @@ async def update_topic_emoji(
         display_name: Base topic name (without emoji prefix)
     """
     if chat_id in _disabled_chats:
+        return
+    # CCGRAM-HOTFIX:tg-relay-quiet-renames — with «Что слать в Telegram:
+    # ничего» (relay off) the sessions are silent there, and every status
+    # rename is a service message of its own: «Кара renamed the topic to
+    # 🟡 …» and back twice a turn, a wall of them in the group's feed
+    # (Alexander, 26.10: «Опять спам!»). The emoji stays as it is until
+    # the relay is back on; a name the person gives still applies.
+    if quiet_threads.relay() == "off":
         return
 
     key = (chat_id, thread_id)
