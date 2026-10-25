@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from .... import window_query
+from .... import claude_busy, window_query
 from ....providers import get_provider_for_window
 from ....providers.base import StatusUpdate
 from ....session_monitor import get_active_monitor
@@ -172,6 +172,16 @@ def build_context(
     resolved_status_text = build_status_line(status)
     ws = ps.peek_state(window_id)
     provider = _get_provider(window_id)
+    # CCGRAM-HOTFIX:claude-registry-busy — no spinner while a reply's text
+    # streams in: Claude Code's registry says whether the session works.
+    if (
+        not is_recently_active
+        and resolved_status_text is None
+        and provider.capabilities.name == "claude"
+        and claude_busy.is_busy(window_query.get_session_id_for_window(window_id))
+    ):
+        ps.mark_seen_status(window_id)
+        is_recently_active = True
     return TickContext(
         window_id=window_id,
         resolved_status_text=resolved_status_text,
