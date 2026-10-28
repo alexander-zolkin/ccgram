@@ -116,6 +116,8 @@ next to it", kept both. What the fork decided:
   (`claude`, `cc`, `c`, `codex`, `cx`, `pi`, `sh`, …, optionally `:yolo`/`:safe`;
   `_opens_with_agent_word` in `text_handler.py`). Any other first message gets
   the quick-start prompt as before. Grok has no alias in upstream's parser.
+  A typed plan launches on the last model picked for that agent
+  (`typed_topic._remembered_model`, `model-picker`), like quick-start and the hub.
 - **Wizard mode step kept for model-picker providers (`model-picker`).**
   Upstream dropped the mode picker (provider tap → launch in
   `CCGRAM_DEFAULT_MODE`, default yolo). In the fork, claude/grok/codex still go
