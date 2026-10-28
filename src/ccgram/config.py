@@ -29,6 +29,9 @@ DEFAULT_ENABLED_PROVIDERS: tuple[str, ...] = (
     "antigravity",
     "claude",
     "codex",
+    # Fork-only Grok Build provider: offered like the others (its CLI comes
+    # from CCGRAM_GROK_COMMAND on N100, so the PATH check still passes).
+    "grok",
     "pi",
     "shell",
 )

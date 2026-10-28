@@ -379,6 +379,11 @@ class TestTypedTopicKeywords:
         monkeypatch.delenv("CCGRAM_PROVIDERS_ENABLED", raising=False)
         assert "gemini" not in _enabled_providers_env()
 
+    def test_enabled_providers_default_includes_fork_grok(self, monkeypatch) -> None:
+        """The fork's Grok provider stays in the pickers by default."""
+        monkeypatch.delenv("CCGRAM_PROVIDERS_ENABLED", raising=False)
+        assert "grok" in _enabled_providers_env()
+
 
 class TestSkipBarrierDeadline:
     def test_default_when_unset(self, monkeypatch) -> None:
