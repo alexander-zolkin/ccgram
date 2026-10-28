@@ -98,6 +98,52 @@ mutation through the session core (`session_protocol/telegram.py` adapter);
   defaults to **false** in the fork — hibernated topics must survive.
 - The hub API (`webui/`) gets the session service through `start_webui(bot, bot_data)`.
 
+### Upstream v4.20 merge (2026-10-29) — what moved
+
+`upstream/main` at `25de090` (v4.20.0+1, 13 commits after `006a888`): native
+command menus mirrored to Telegram (#360 Pi, #361 Claude/Codex/Pi), a typed
+first line that starts a session (#359), an agent-readiness gate before the
+first input (#345), a bounded startup replay (`CCGRAM_STARTUP_REPLAY_MAX_KB`,
+256 KiB), internal provider records kept out of chats (#348), runtime/lifecycle
+refactors (#341, #350). 13 conflicted files, all "our hotfix vs upstream wrote
+next to it", kept both. What the fork decided:
+
+- **Typed plan gated (`quickstart-defaults`).** Upstream parses every first
+  message on an unbound topic as `<agent>[:mode] <project|path> [@branch] <text>`
+  and, with no agent word, launches straight into the last-used (MRU) project —
+  or answers "Ambiguous project" when the first word matches a repo name. The
+  fork runs the typed plan only when the line opens with an agent alias
+  (`claude`, `cc`, `c`, `codex`, `cx`, `pi`, `sh`, …, optionally `:yolo`/`:safe`;
+  `_opens_with_agent_word` in `text_handler.py`). Any other first message gets
+  the quick-start prompt as before. Grok has no alias in upstream's parser.
+- **Wizard mode step kept for model-picker providers (`model-picker`).**
+  Upstream dropped the mode picker (provider tap → launch in
+  `CCGRAM_DEFAULT_MODE`, default yolo). In the fork, claude/grok/codex still go
+  provider → model → mode; providers without a model step follow upstream.
+- **Wizard provider list** = upstream's `picker_provider_names()`
+  (`CCGRAM_PROVIDERS_ENABLED` ∩ installed). The fork default list adds `grok`;
+  Gemini is hidden by upstream's default (list it in the env var to get it back).
+  The quick-start Provider… picker still offers every installed CLI.
+- **Topic title on bind (`sticky-bind-name`)**: stored sticky name, then the
+  typed plan's label, then the window name; pinned as the display name
+  (upstream) before the rename.
+- **Grok transcripts**: `messages.parse_records` keeps the `_grok` branch;
+  unknown providers now parse to nothing (#348) instead of the generic fallback.
+- **Hooks**: `ccgram hook --install --provider pi` now writes Pi hooks (upstream), beside
+  the fork's Grok hooks (`hook.py`, `doctor_cmd.py`).
+
+Upstream defaults that change what Alexander sees (not overridden in the fork):
+bind-existing-window picker off (`CCGRAM_BIND_PICKER`, use `/bind`); the
+wizard's worktree step off (`CCGRAM_NEW_TOPIC_WORKTREES`); directory browser at
+a projects root lists only git checkouts + recent dirs
+(`CCGRAM_DIR_BROWSER_ALL_DIRS`); folder trust pre-seeded in `~/.claude.json` /
+`~/.codex/config.toml` for a new folder (`CCGRAM_AUTOSTART_TRUST=off` to stop).
+
+Tests after the merge: `tests/ccgram` 8934 passed, `tests/integration` 407
+passed. Adapted: fork launch tests mock the new readiness probe
+(`adapter.resolve`); upstream's unbound-topic test expects the quick-start
+prompt; registry has 11 MessageHandlers.
+
 ---
 
 ## Fork-only features (not hotfixes)
