@@ -187,7 +187,7 @@ async def launch_plan(
     except PlanError as exc:
         await safe_edit(note, f"\u274c {exc}")
         return
-    await launch_window(
+    await launch_window(  # CCGRAM-HOTFIX:model-picker — model= below
         note,
         context,
         WindowLaunchRequest(
@@ -203,6 +203,9 @@ async def launch_plan(
                 else "normal"
             ),
             pending_text=plan.instruction or None,
+            # The last model picked for this agent, as the quick-start prompt
+            # and the hub would launch it (none remembered → CLI default).
+            model=_remembered_model(plan.agent),
             chat_id=message.chat.id if message.chat else None,
             label=plan.label,
             worktree_repo=worktree.get("worktree_repo"),
@@ -212,6 +215,25 @@ async def launch_plan(
             ignore_pending_workspace=True,
         ),
     )
+
+
+def _remembered_model(agent: str) -> str | None:
+    """Last model picked for *agent* (``last_model.json``), or None.
+
+    CCGRAM-HOTFIX:model-picker — only for agents with a model picker; the
+    launch service then adds ``--model`` (and the 1M suffix for Claude).
+    """
+    # Lazy: file IO and the registry only matter on the launch path.
+    from ...last_model import recall_model
+    from ...providers import registry
+
+    try:
+        if not registry.get(agent).capabilities.supports_model_picker:
+            return None
+    except Exception:  # noqa: BLE001 — a lookup failure just means no override
+        return None
+    remembered = recall_model(agent)
+    return remembered[0] if remembered else None
 
 
 def _resolution_reply(parsed: PlanParse, candidates: list[Path]) -> str:

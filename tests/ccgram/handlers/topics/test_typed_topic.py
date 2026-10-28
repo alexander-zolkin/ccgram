@@ -304,6 +304,47 @@ class TestLaunchPlan:
         assert captured[0].provider_name == "pi"
         assert captured[0].mode == "normal"
 
+    @pytest.mark.parametrize(
+        ("line", "remembered", "expected"),
+        [
+            (
+                "claude ccgram hi",
+                ("claude-opus-5-5[1m]", "Opus 5.5"),
+                "claude-opus-5-5[1m]",
+            ),
+            ("claude ccgram hi", None, None),
+            ("pi ccgram hi", ("pi-model", "Pi model"), None),
+        ],
+    )
+    async def test_remembered_model_reaches_the_launch(
+        self, project: Path, line: str, remembered, expected
+    ) -> None:
+        """CCGRAM-HOTFIX:model-picker — a typed plan launches on the last model
+        picked for that agent, like the quick-start prompt does."""
+        captured: list = []
+
+        async def fake_launch(_target, _context, request):
+            captured.append(request)
+
+        plan = parse_topic_plan(
+            line, roots=[project.parent], default_agent="claude"
+        ).plan
+        assert plan is not None
+        with (
+            patch.object(typed_topic, "launch_window", side_effect=fake_launch),
+            patch.object(typed_topic.user_preferences, "get_user_mru", return_value=[]),
+            patch("ccgram.last_model.recall_model", return_value=remembered),
+        ):
+            await typed_topic.launch_plan(
+                plan,
+                user_id=100,
+                thread_id=42,
+                message=_message(),
+                context=_context({}),
+            )
+
+        assert captured[0].model == expected
+
     async def test_typed_launch_ignores_other_topics_pending_state(
         self, project: Path
     ) -> None:
