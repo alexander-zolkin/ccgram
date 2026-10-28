@@ -120,6 +120,15 @@ def _detect_project_badge(parent: Path, name: str) -> str:
     return ""
 
 
+def _is_projects_root(path: Path) -> bool:
+    """True when *path* is one of the configured project roots."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return any(resolved == root for root in config.projects_roots)
+
+
 def clear_browse_state(user_data: dict | None) -> None:
     """Clear directory browsing state keys from user_data."""
     if user_data is not None:
@@ -370,11 +379,15 @@ def build_wizard_model_picker(
 
 def build_window_picker(
     windows: list[tuple[str, str, str]],
+    *,
+    include_new: bool = True,
 ) -> tuple[str, InlineKeyboardMarkup, list[str]]:
     """Build window picker UI for unbound tmux windows.
 
     Args:
         windows: List of (window_id, window_name, cwd) tuples.
+        include_new: Offer the "New Session" entry (the unbound-topic flow
+            does; ``/bind`` does not, because a session line already creates one).
 
     Returns: (text, keyboard, window_ids) where window_ids is the ordered list for caching.
     """
@@ -402,12 +415,13 @@ def build_window_picker(
             )
         buttons.append(row)
 
-    buttons.append(
-        [
-            InlineKeyboardButton("➕ New Session", callback_data=CB_WIN_NEW),
-            InlineKeyboardButton("Cancel", callback_data=CB_WIN_CANCEL),
-        ]
-    )
+    action_row = []
+    if include_new:
+        action_row.append(
+            InlineKeyboardButton("➕ New Session", callback_data=CB_WIN_NEW)
+        )
+    action_row.append(InlineKeyboardButton("Cancel", callback_data=CB_WIN_CANCEL))
+    buttons.append(action_row)
 
     text = "\n".join(lines)
     return text, InlineKeyboardMarkup(buttons), window_ids
@@ -478,6 +492,11 @@ def build_directory_browser(
     if not path.exists() or not path.is_dir():
         path = Path.cwd()
 
+    # Under a projects root only git checkouts are listed, which is what a
+    # session can actually use. Deeper levels list every subdirectory so a
+    # repo's own layout stays navigable. CCGRAM_DIR_BROWSER_ALL_DIRS turns the
+    # filter off.
+    git_only = not config.dir_browser_all_dirs and _is_projects_root(path)
     try:
         subdirs = sorted(
             [
@@ -485,6 +504,7 @@ def build_directory_browser(
                 for d in path.iterdir()
                 if d.is_dir()
                 and (config.show_hidden_dirs or not d.name.startswith("."))
+                and (not git_only or (d / ".git").exists())
             ]
         )
     except (PermissionError, OSError):  # fmt: skip
@@ -572,29 +592,26 @@ def build_provider_picker(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build provider selection keyboard shown after directory confirmation.
 
-    Only providers whose launch CLI is present on this host are offered
-    (dynamic, not a static list). ``available`` overrides the detected set
-    (mainly for tests); when None it is resolved from
-    ``providers.available_provider_names()``.
+    Only enabled providers whose launch CLI is present on this host are
+    offered (``providers.picker_provider_names()``: ``CCGRAM_PROVIDERS_ENABLED``
+    ∩ installed). ``available`` overrides that set (mainly for tests).
 
     Returns: (text, keyboard).
     """
     if available is None:
-        # Lazy: providers package heavy bootstrap; only needed at picker time.
-        from ...providers import available_provider_names
+        # Lazy: the providers package pulls process detection and the registry.
+        from ...providers import picker_provider_names
 
-        available = available_provider_names()
-    available_set = set(available)
+        available = picker_provider_names()
 
     display_path = selected_path.replace(str(Path.home()), "~")
     text = (
         f"*Select Provider*\n\nDirectory: `{display_path}`\n\nWhich agent CLI to use?"
     )
     buttons: list[list[InlineKeyboardButton]] = []
-    for name, icon in _PROVIDER_ICONS.items():
-        if name not in available_set:
-            continue
-        suffix = " (default)" if name == "claude" else ""
+    for name in available:
+        icon = _PROVIDER_ICONS.get(name, "\U0001f916")
+        suffix = " (default)" if name == config.provider_name else ""
         buttons.append(
             [
                 InlineKeyboardButton(

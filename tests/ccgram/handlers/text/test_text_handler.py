@@ -144,15 +144,37 @@ class TestHandleUnboundTopic:
         unbound_env.picker.assert_not_called()
         unbound_env.browser.assert_not_called()
 
-    async def test_adoptable_windows_show_the_picker(
+    async def test_adoptable_windows_are_not_offered_by_default(
         self, unbound_env: SimpleNamespace
     ) -> None:
+        """A new topic wants a new session; /bind covers adoption instead."""
         unbound_env.mux.list_windows = AsyncMock(
             return_value=[MagicMock(window_id="@5", window_name="proj", cwd="/tmp")]
         )
-        user_data: dict = {}
 
-        result = await _handle_unbound_topic(100, 42, "my text", user_data, AsyncMock())
+        result = await _handle_unbound_topic(100, 42, "my text", {}, AsyncMock())
+
+        assert result is True
+        unbound_env.picker.assert_not_called()
+        # CCGRAM-HOTFIX:quickstart-defaults — the fork's first step is the
+        # quick-start prompt, not upstream's directory browser.
+        unbound_env.quickstart.assert_called_once()
+        unbound_env.browser.assert_not_called()
+
+    async def test_adoptable_windows_show_the_picker_when_opted_in(
+        self, unbound_env: SimpleNamespace
+    ) -> None:
+        from ccgram.config import config
+
+        with patch.object(config, "bind_picker", True):
+            unbound_env.mux.list_windows = AsyncMock(
+                return_value=[MagicMock(window_id="@5", window_name="proj", cwd="/tmp")]
+            )
+            user_data: dict = {}
+
+            result = await _handle_unbound_topic(
+                100, 42, "my text", user_data, AsyncMock()
+            )
 
         assert result is True
         unbound_env.picker.assert_called_once()
@@ -178,6 +200,36 @@ class TestHandleUnboundTopic:
         assert user_data[PENDING_THREAD_ID] == 42
         assert user_data[PENDING_THREAD_TEXT] == "my text"
         assert unbound_env.reply.call_count == 2
+
+    async def test_plain_message_skips_the_typed_plan(
+        self, unbound_env: SimpleNamespace
+    ) -> None:
+        """CCGRAM-HOTFIX:quickstart-defaults — upstream's typed plan would
+        launch a plain first message straight into the last-used project; the
+        fork keeps the quick-start prompt for it."""
+        with patch(f"{_TH}.start_from_text", new_callable=AsyncMock) as typed:
+            result = await _handle_unbound_topic(
+                100, 42, "Привет, глянь логи", {}, AsyncMock(), MagicMock()
+            )
+
+        assert result is True
+        typed.assert_not_awaited()
+        unbound_env.quickstart.assert_called_once()
+
+    @pytest.mark.parametrize("line", ["claude fix the build", "cx:safe kara-hub x"])
+    async def test_agent_word_starts_the_typed_plan(
+        self, unbound_env: SimpleNamespace, line: str
+    ) -> None:
+        with patch(
+            f"{_TH}.start_from_text", new_callable=AsyncMock, return_value=True
+        ) as typed:
+            result = await _handle_unbound_topic(
+                100, 42, line, {}, AsyncMock(), MagicMock()
+            )
+
+        assert result is True
+        typed.assert_awaited_once()
+        unbound_env.quickstart.assert_not_called()
 
 
 class TestHandleDeadWindow:

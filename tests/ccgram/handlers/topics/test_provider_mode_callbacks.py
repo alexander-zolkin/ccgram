@@ -40,6 +40,8 @@ async def test_normal_provider_callback_launches_normal_mode_without_picker() ->
         patch("ccgram.handlers.topics.provider_mode_callbacks.clear_browse_state"),
     ):
         registry.is_valid.return_value = True
+        # CCGRAM-HOTFIX:model-picker — shell has no model step in the fork.
+        registry.get.return_value.capabilities.supports_model_picker = False
         await _handle_provider_select(
             query, 99, f"{CB_PROV_SELECT}shell", update, context
         )

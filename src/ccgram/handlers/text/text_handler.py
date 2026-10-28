@@ -23,6 +23,8 @@ from ...telegram_client import PTBTelegramClient, TelegramClient
 from ...tg_markdown import entities_to_markdown
 from ..callback_helpers import get_thread_id as _get_thread_id
 from ..commands import sync_scoped_menu_for_text_context
+from ..topics.plan_parser import parse_agent
+from ..topics.typed_topic import start_from_text
 from ..topics.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
@@ -291,14 +293,30 @@ async def _handle_worktree_name_reply(
     return True
 
 
+def _opens_with_agent_word(text: str) -> bool:
+    """True when the first word is an agent alias (``claude``, ``cx:safe``…).
+
+    CCGRAM-HOTFIX:quickstart-defaults — the gate for upstream's typed plan.
+    """
+    words = text.split(maxsplit=1)
+    return bool(words) and parse_agent(words[0]) is not None
+
+
+def _browser_start_path() -> str:
+    """Directory-browser root: the first configured projects root."""
+    roots = config.projects_roots
+    return str(roots[0] if roots else Path.cwd())
+
+
 async def _handle_unbound_topic(
     user_id: int,
     thread_id: int,
     text: str,
     user_data: dict | None,
     message: Message,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> bool:
-    """Show window picker or directory browser for an unbound topic.
+    """Start a session for an unbound topic, or ask for the one missing word.
 
     Returns True if the topic is unbound (handled), False if already bound.
     """
@@ -306,7 +324,27 @@ async def _handle_unbound_topic(
     if window_id is not None:
         return False
 
-    all_windows = await tmux_manager.list_windows()
+    # Typed plan first: "<agent> <project> [@branch] <instruction>" starts the
+    # session from this one message. No picker, no follow-up taps.
+    # CCGRAM-HOTFIX:quickstart-defaults — only when the line opens with an
+    # agent word ("claude …", "codex:safe …"). A plain first message goes to
+    # the quick-start prompt below: upstream's parser would otherwise launch it
+    # straight into the last-used project (or answer "Ambiguous project" when
+    # its first word happens to match a repo name) and skip the defaults.
+    if (
+        context is not None
+        and _opens_with_agent_word(text)
+        and await start_from_text(
+            user_id=user_id,
+            thread_id=thread_id,
+            text=text,
+            message=message,
+            context=context,
+        )
+    ):
+        return True
+
+    all_windows = await tmux_manager.list_windows() if config.bind_picker else []
     bound_ids = {bound_wid for _, _, bound_wid in thread_router.iter_thread_bindings()}
     bound_lookup = {canonical_window_id(wid) for wid in bound_ids}
     unbound = [
@@ -339,9 +377,10 @@ async def _handle_unbound_topic(
             await safe_reply(message, PENDING_DELIVERY_NOTICE)
         return True
 
-    # No unbound windows — offer the quick-start defaults prompt as the first
-    # step. "Yes" launches with Alexander's defaults; "No" falls through to the
-    # directory browser and the full wizard.  # CCGRAM-HOTFIX:quickstart-defaults
+    # No typed plan and no window to adopt — offer the quick-start defaults
+    # prompt as the first step. "Yes" launches with Alexander's defaults; "No"
+    # falls through to the directory browser and the full wizard.
+    # CCGRAM-HOTFIX:quickstart-defaults
     logger.info(
         "Unbound topic: showing quick-start defaults prompt (user=%d, thread=%d)",
         user_id,
@@ -520,7 +559,7 @@ async def _handle_dead_window(
             cleanup_eligible=True,
         )
         lifecycle_strategy.clear_dead_notification(user_id, thread_id)
-        start_path = str(Path.cwd())
+        start_path = _browser_start_path()
         msg_text, keyboard, subdirs = build_directory_browser(
             start_path, user_id=user_id
         )
@@ -765,6 +804,59 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await handle_text_message(update, context)
 
 
+async def _handle_menu_reply(
+    user_id: int,
+    thread_id: int | None,
+    text: str,
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    # Lazy: menu rendering imports handlers during callback registration.
+    from ..interactive.pi_controls import (
+        MENU_EXPIRED,
+        is_menu_reply,
+    )
+
+    if not is_menu_reply(message):
+        return False
+    # Lazy: callback dispatch shares the renderer; load only for actual menu input.
+    from ..interactive.interactive_callbacks import handle_menu_reply
+
+    # A retired menu reply is never a new session plan, a rename, or shell input.
+    window_id = (
+        thread_router.get_window_for_thread(user_id, thread_id, message.chat.id)
+        if thread_id is not None
+        else None
+    )
+    if thread_id is None or window_id is None:
+        await safe_reply(message, MENU_EXPIRED)
+        return True
+    await handle_menu_reply(
+        PTBTelegramClient(context.bot),
+        user_id,
+        window_id,
+        thread_id,
+        text,
+        message,
+        protocol_adapter_for(context.bot_data),
+    )
+    return True
+
+
+async def _reply_without_topic(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, message: Message
+) -> None:
+    if update.effective_chat and is_general_topic(message):
+        await handle_general_topic_message(
+            context.bot, message, update.effective_chat.id
+        )
+    else:
+        await safe_reply(
+            message,
+            "\u274c Please use a named topic. Create a new topic to start a session.",
+        )
+
+
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -786,6 +878,9 @@ async def handle_text_message(
         text if text.startswith("!") else entities_to_markdown(text, message.entities)
     )
 
+    if await _handle_menu_reply(user.id, thread_id, text, message, context):
+        return
+
     # Store group chat_id for forum topic message routing
     chat = message.chat
     if chat.type in ("group", "supergroup") and thread_id is not None:
@@ -806,20 +901,12 @@ async def handle_text_message(
 
     # Must be in a named topic
     if thread_id is None:
-        if message and update.effective_chat and is_general_topic(message):
-            await handle_general_topic_message(
-                context.bot, message, update.effective_chat.id
-            )
-        else:
-            await safe_reply(
-                message,
-                "\u274c Please use a named topic. Create a new topic to start a session.",
-            )
+        await _reply_without_topic(update, context, message)
         return
 
-    # Unbound topic — show picker or browser
+    # Unbound topic — typed plan, picker, or browser
     if await _handle_unbound_topic(
-        user.id, thread_id, agent_text, context.user_data, message
+        user.id, thread_id, agent_text, context.user_data, message, context
     ):
         return
 

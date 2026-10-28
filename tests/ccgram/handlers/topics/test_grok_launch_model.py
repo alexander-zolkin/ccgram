@@ -8,6 +8,7 @@ honour ``CCGRAM_GROK_MODEL`` as the grok default when no model was picked.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -52,6 +53,13 @@ async def _run_launch(
     context = _make_context()
     adapter = MagicMock()
     adapter.create = AsyncMock(return_value=MagicMock(target_id="@5", title="win"))
+    # Upstream v4.18+ waits for a live foreground of the intended provider.
+    adapter.resolve = AsyncMock(
+        return_value=(
+            SimpleNamespace(foreground_argv=("grok",), provider="grok", available=True),
+            None,
+        )
+    )
     with (
         patch(
             "ccgram.handlers.topics.window_launch_service.adapter_for",

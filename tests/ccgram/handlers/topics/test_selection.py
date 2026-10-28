@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,12 +26,31 @@ from ccgram.handlers.user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
 _ALL_PROVIDERS = ["claude", "codex", "gemini", "pi", "grok", "shell"]
 
 
+def _buttons(keyboard: InlineKeyboardMarkup) -> list:
+    return [btn for row in keyboard.inline_keyboard for btn in row]
+
+
 class TestBuildProviderPicker:
+    @pytest.fixture(autouse=True)
+    def _installed_providers(self):
+        """Pin the picker list: the real one probes PATH for each CLI."""
+        with patch(
+            "ccgram.providers.picker_provider_names",
+            return_value=["claude", "codex", "grok", "pi", "shell"],
+        ):
+            yield
+
     def test_returns_text_and_keyboard(self) -> None:
         text, keyboard = build_provider_picker(
             "/home/user/project", available=_ALL_PROVIDERS
         )
         assert "Select Provider" in text
+        assert isinstance(keyboard, InlineKeyboardMarkup)
+
+    def test_header_names_the_selected_directory(self) -> None:
+        text, keyboard = build_provider_picker("/home/user/my-project")
+        assert "Select Provider" in text
+        assert "my-project" in text
         assert isinstance(keyboard, InlineKeyboardMarkup)
 
     def test_shows_all_available_providers(self) -> None:
@@ -61,6 +81,22 @@ class TestBuildProviderPicker:
         assert any(label in btn.text for btn in buttons)
         assert f"{CB_PROV_SELECT}{provider}" in [btn.callback_data for btn in buttons]
 
+    @pytest.mark.parametrize(
+        ("provider", "label"),
+        [
+            ("claude", "Claude"),
+            ("codex", "Codex"),
+            ("pi", "Pi"),
+            ("grok", "Grok"),
+            ("shell", "Term"),
+        ],
+    )
+    def test_offers_every_enabled_provider(self, provider: str, label: str) -> None:
+        _text, keyboard = build_provider_picker("/tmp/test")
+        buttons = _buttons(keyboard)
+        assert any(label in btn.text for btn in buttons)
+        assert f"{CB_PROV_SELECT}{provider}" in [btn.callback_data for btn in buttons]
+
     def test_hides_unavailable_providers(self) -> None:
         # Only grok/codex/claude/shell installed → gemini/pi absent from picker.
         _text, keyboard = build_provider_picker(
@@ -73,6 +109,10 @@ class TestBuildProviderPicker:
         assert f"{CB_PROV_SELECT}gemini" not in callbacks
         assert f"{CB_PROV_SELECT}pi" not in callbacks
 
+    def test_gemini_is_not_offered(self) -> None:
+        _text, keyboard = build_provider_picker("/tmp/test")
+        callbacks = [btn.callback_data for btn in _buttons(keyboard)]
+        assert f"{CB_PROV_SELECT}gemini" not in callbacks
 
     def test_claude_marked_as_default(self) -> None:
         _text, keyboard = build_provider_picker("/tmp/test", available=_ALL_PROVIDERS)
@@ -147,7 +187,14 @@ def _session_adapter(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
         foreground_argv=("codex",),
     )
     adapter = MagicMock()
-    adapter.create = AsyncMock(return_value=target)
+
+    async def create(data, **_kwargs):
+        target.provider = data["provider"]
+        target.available = True
+        target.foreground_argv = (data["provider"],)
+        return target
+
+    adapter.create = AsyncMock(side_effect=create)
     adapter.resolve = AsyncMock(return_value=(target, MagicMock()))
     adapter.send_keys = AsyncMock(return_value=(True, "ok"))
     monkeypatch.setattr(
@@ -239,25 +286,22 @@ class TestHandleConfirmShowsProviderPicker:
 
 class TestHandleProviderSelect:
     @patch(
-        "ccgram.handlers.topics.provider_mode_callbacks.safe_edit",
+        "ccgram.handlers.topics.provider_mode_callbacks.launch_window",
         new_callable=AsyncMock,
     )
-    @patch("ccgram.handlers.topics.window_launch_service.tmux_manager")
-    @patch("ccgram.handlers.topics.provider_mode_callbacks.provider_registry")
     @patch("ccgram.handlers.topics.provider_mode_callbacks.thread_router")
-    async def test_shows_mode_picker(
+    @patch("ccgram.handlers.topics.provider_mode_callbacks.provider_registry")
+    async def test_launches_in_the_default_mode_without_a_mode_picker(
         self,
-        mock_tr: MagicMock,
         mock_registry: MagicMock,
-        mock_tmux: MagicMock,
-        mock_edit: AsyncMock,
+        mock_tr: MagicMock,
+        mock_launch: AsyncMock,
     ) -> None:
         mock_registry.is_valid.return_value = True
-        # Codex has no model picker → provider select goes straight to the mode
-        # picker (claude/grok would show the model step first).
+        # A provider without a model picker launches straight away in the
+        # default mode (claude/grok/codex show the fork's model step first).
         mock_registry.get.return_value.capabilities.supports_model_picker = False
         mock_tr.get_window_for_thread.return_value = None
-        mock_tmux.create_window = AsyncMock()
 
         user_data = {"browse_path": "/tmp/test", PENDING_THREAD_ID: 42}
         query = _make_query(data=f"{CB_PROV_SELECT}codex")
@@ -268,10 +312,10 @@ class TestHandleProviderSelect:
             query, 100, f"{CB_PROV_SELECT}codex", update, context
         )
 
-        mock_tmux.create_window.assert_not_called()
-        mock_edit.assert_called_once()
-        text = mock_edit.call_args[0][1]
-        assert "Select Session Mode" in text
+        mock_launch.assert_awaited_once()
+        request = mock_launch.call_args[0][2]
+        assert request.provider_name == "codex"
+        assert request.mode == "yolo"
 
     @patch("ccgram.handlers.topics.provider_mode_callbacks.provider_registry")
     async def test_rejects_unknown_provider(self, mock_registry: MagicMock) -> None:
@@ -421,6 +465,12 @@ class TestHandleModeSelect:
         mock_sm.get_window_state.return_value = MagicMock()
         mock_sms.wait_for_session_map_entry = AsyncMock(return_value=True)
         mock_accept_yolo.return_value = True
+        _session_adapter.resolve.return_value = (
+            SimpleNamespace(
+                foreground_argv=("claude",), provider="claude", available=True
+            ),
+            None,
+        )
 
         user_data = {"browse_path": "/tmp/proj", PENDING_THREAD_ID: 42}
         query = _make_query(data=f"{CB_MODE_SELECT}claude:yolo")
@@ -432,6 +482,7 @@ class TestHandleModeSelect:
         )
 
         mock_accept_yolo.assert_awaited_once_with("@5", _session_adapter)
+        mock_tr.commit_topic_provisioning.assert_called_once()
         mock_sms.wait_for_session_map_entry.assert_awaited_once_with(
             "@5", resolve_window_id=ANY
         )

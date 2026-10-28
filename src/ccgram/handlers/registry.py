@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import TypeAlias
 
 import structlog
-from telegram import Update
+from telegram import Message, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -25,6 +25,7 @@ from telegram.ext import (
 from telegram.ext._utils.types import HandlerCallback
 
 from ..config import config
+from .interactive.pi_controls import is_menu_reply
 from .callback_registry import dispatch as _dispatch_callback
 from .callback_registry import load_handlers as _load_callback_handlers
 from .agent_command import agent_command
@@ -49,6 +50,7 @@ from .split_command import split_command
 from .sync_command import sync_command
 from .text.text_handler import text_handler
 from .topics import new_command
+from .topics.bind_command import bind_command
 from .topics.topic_lifecycle import (
     topic_closed_handler,
     topic_created_handler,  # CCGRAM-HOTFIX:sticky-create-name
@@ -86,6 +88,11 @@ class CommandSpec:
     handler: HandlerFn
 
 
+class _MenuReplyFilter(filters.MessageFilter):
+    def filter(self, message: Message) -> bool:
+        return is_menu_reply(message)
+
+
 def register_all(
     application: Application,
     group_filter: filters.BaseFilter,
@@ -94,10 +101,12 @@ def register_all(
 ) -> None:
     """Register every command, callback, message and inline-query handler.
 
-    Order is significant: PTB dispatches the first matching handler, so
-    explicit CommandHandlers must precede the COMMAND-fallback
-    MessageHandler, which must precede the TEXT MessageHandler.
+    Pi menu replies are literal input, even if Telegram marks them as commands.
+    Otherwise explicit commands precede the COMMAND fallback and ordinary TEXT.
     """
+    application.add_handler(
+        MessageHandler(filters.TEXT & group_filter & _MenuReplyFilter(), text_handler)
+    )
     command_specs: list[CommandSpec] = [
         CommandSpec("start", new_command),
         CommandSpec("history", history_command),
@@ -106,6 +115,7 @@ def register_all(
         CommandSpec("dashboard", dashboard_command),
         CommandSpec("resume", resume_command),
         CommandSpec("unbind", unbind_command),
+        CommandSpec("bind", bind_command),
         CommandSpec("rollback", rollback_command),
         CommandSpec("upgrade", upgrade_command),
         CommandSpec("recall", recall_command),
@@ -205,6 +215,7 @@ COMMAND_NAMES: tuple[str, ...] = (
     "dashboard",
     "resume",
     "unbind",
+    "bind",
     "rollback",
     "upgrade",
     "recall",

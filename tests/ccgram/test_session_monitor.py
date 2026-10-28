@@ -724,9 +724,14 @@ class TestSettledPrefixWatermarkCommit:
                         "type": "user",
                         "uuid": "result-message",
                         "message": {
-                            "role": "toolResult",
-                            "toolCallId": "tool-1",
-                            "content": "read complete",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-1",
+                                    "content": "read complete",
+                                }
+                            ],
                         },
                     }
                 )
@@ -789,9 +794,14 @@ class TestSettledPrefixWatermarkCommit:
             "type": "user",
             "uuid": "result-message",
             "message": {
-                "role": "toolResult",
-                "toolCallId": "tool-1",
-                "content": "read complete",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "read complete",
+                    }
+                ],
             },
         }
         session_file.write_text(json.dumps(tool_call) + "\n")
@@ -1155,9 +1165,10 @@ class TestSettledPrefixWatermarkCommit:
             {
                 "type": "user",
                 "message": {
-                    "role": "toolResult",
-                    "toolCallId": "t1",
-                    "content": "done",
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "done"}
+                    ],
                 },
             },
         )
@@ -1228,9 +1239,14 @@ class TestSettledPrefixWatermarkCommit:
             "type": "user",
             "uuid": "result-message",
             "message": {
-                "role": "toolResult",
-                "toolCallId": "tool-1",
-                "content": "skipped result",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "skipped result",
+                    }
+                ],
             },
         }
         fresh_output = {
@@ -1487,9 +1503,14 @@ class TestSettledPrefixWatermarkCommit:
                         "type": "user",
                         "uuid": "result-message",
                         "message": {
-                            "role": "toolResult",
-                            "toolCallId": "tool-1",
-                            "content": "replayed result",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-1",
+                                    "content": "replayed result",
+                                }
+                            ],
                         },
                     }
                 )
@@ -1580,9 +1601,14 @@ class TestSettledPrefixWatermarkCommit:
             "type": "user",
             "uuid": "result-message",
             "message": {
-                "role": "toolResult",
-                "toolCallId": "tool-1",
-                "content": "read complete",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "read complete",
+                    }
+                ],
             },
         }
         later_text = {
@@ -3623,6 +3649,35 @@ class TestTheLoopPassesTheEligibleSubset:
         assert received == [{"KEEP"}], (
             "the loop must hand over the eligible subset, not every live window"
         )
+
+    async def test_an_unavailable_listing_goes_through_the_throttle(
+        self, monitor: SessionMonitor, monkeypatch
+    ) -> None:
+        notices: list[tuple[str, str]] = []
+
+        def spy(log, key, msg, *args, **kwargs):
+            notices.append((key, msg))
+
+        async def stop(raw=None, *, adoptable_window_ids):
+            monitor._running = False
+            return {}
+
+        monkeypatch.setattr(
+            "ccgram.session_monitor.list_windows_for_reconciliation",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("ccgram.session_monitor.log_throttled", spy)
+        monkeypatch.setattr(
+            "ccgram.session_monitor.read_session_map_raw", AsyncMock(return_value={})
+        )
+        monkeypatch.setattr(monitor, "_read_hook_events", AsyncMock())
+        monkeypatch.setattr(monitor, "_cleanup_all_stale_sessions", AsyncMock())
+        monkeypatch.setattr(monitor, "_detect_and_cleanup_changes", stop)
+        monitor._running = True
+
+        await monitor._monitor_loop()
+
+        assert [key for key, _ in notices] == ["monitor-window-reconciliation-listing"]
 
 
 class TestAdoptionIdentityFoldsCaseInTheMonitor:
